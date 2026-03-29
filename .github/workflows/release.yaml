@@ -1,0 +1,236 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump type"
+        required: true
+        type: choice
+        options:
+          - none
+          - patch
+          - minor
+          - major
+          - stable
+        default: none
+      prerelease:
+        description: "Prerelease label (or 'no' for stable)"
+        required: true
+        type: choice
+        options:
+          - "no"
+          - alpha
+          - beta
+          - rc
+        default: beta
+
+permissions:
+  contents: write
+
+jobs:
+  prepare-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.compute.outputs.version }}
+      commit_sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute new version
+        id: compute
+        run: |
+          # Read current version from nimble file
+          CURRENT=$(grep '^version' chapulin.nimble | sed 's/version *= *"\(.*\)"/\1/')
+          echo "Current version: $CURRENT"
+
+          # Parse semantic version
+          BASE=$(echo "$CURRENT" | sed 's/-.*//')
+          MAJOR=$(echo "$BASE" | cut -d. -f1)
+          MINOR=$(echo "$BASE" | cut -d. -f2)
+          PATCH=$(echo "$BASE" | cut -d. -f3)
+
+          # Parse prerelease if present
+          PRE_LABEL=""
+          PRE_NUM=0
+          if echo "$CURRENT" | grep -q '-'; then
+            PRE_PART=$(echo "$CURRENT" | sed 's/[^-]*-//')
+            PRE_LABEL=$(echo "$PRE_PART" | sed 's/\..*//')
+            PRE_NUM=$(echo "$PRE_PART" | sed 's/.*\.//')
+          fi
+
+          # Apply bump
+          case "${{ inputs.bump }}" in
+            major)
+              MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0
+              ;;
+            minor)
+              MINOR=$((MINOR + 1)); PATCH=0
+              ;;
+            patch)
+              PATCH=$((PATCH + 1))
+              ;;
+            stable)
+              # Remove prerelease suffix
+              ;;
+            none)
+              # Only increment prerelease number if applicable
+              ;;
+          esac
+
+          NEW_BASE="${MAJOR}.${MINOR}.${PATCH}"
+
+          # Apply prerelease label
+          if [ "${{ inputs.prerelease }}" = "no" ]; then
+            NEW_VERSION="$NEW_BASE"
+          else
+            LABEL="${{ inputs.prerelease }}"
+            if [ "${{ inputs.bump }}" = "none" ] && [ "$PRE_LABEL" = "$LABEL" ]; then
+              # Same label, increment number
+              PRE_NUM=$((PRE_NUM + 1))
+            else
+              # New label or new base, start at 1
+              PRE_NUM=1
+            fi
+            NEW_VERSION="${NEW_BASE}-${LABEL}.${PRE_NUM}"
+          fi
+
+          echo "New version: $NEW_VERSION"
+          echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Update version in nimble file
+        run: |
+          VERSION="${{ steps.compute.outputs.version }}"
+          sed -i "s/^version *=.*/version       = \"$VERSION\"/" chapulin.nimble
+
+      - name: Commit version bump
+        id: commit
+        run: |
+          VERSION="${{ steps.compute.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add chapulin.nimble
+          git commit -m "Release v${VERSION}"
+          git tag "v${VERSION}"
+          git push origin main --tags
+          echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+  build:
+    needs: prepare-version
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            binary: chapulin
+            cc: clang
+          - os: macos-latest
+            platform: macos-aarch64
+            binary: chapulin
+            cc: clang
+          - os: windows-latest
+            platform: windows-x86_64
+            binary: chapulin.exe
+            cc: clang
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-version.outputs.commit_sha }}
+
+      - name: Install Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: stable
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install LLVM/Clang (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang lld
+
+      - name: Install dependencies
+        run: nimble install -d -y
+
+      - name: Build release binary (LLVM/Clang + LTO)
+        run: >
+          nim c
+          -d:release
+          --cc:clang
+          --passC:"-flto"
+          --passL:"-flto"
+          --opt:speed
+          -o:${{ matrix.binary }}
+          src/chapulin.nim
+
+      - name: Strip binary (Unix)
+        if: runner.os != 'Windows'
+        run: strip ${{ matrix.binary }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          VERSION="${{ needs.prepare-version.outputs.version }}"
+          ARCHIVE="chapulin-${VERSION}-${{ matrix.platform }}.tar.gz"
+          tar czf "$ARCHIVE" ${{ matrix.binary }}
+          sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
+          echo "ARCHIVE=$ARCHIVE" >> $GITHUB_ENV
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $VERSION = "${{ needs.prepare-version.outputs.version }}"
+          $ARCHIVE = "chapulin-${VERSION}-${{ matrix.platform }}.zip"
+          Compress-Archive -Path ${{ matrix.binary }} -DestinationPath $ARCHIVE
+          $HASH = (Get-FileHash $ARCHIVE -Algorithm SHA256).Hash.ToLower()
+          "$HASH  $ARCHIVE" | Out-File -Encoding ASCII "${ARCHIVE}.sha256"
+          "ARCHIVE=$ARCHIVE" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chapulin-${{ matrix.platform }}
+          path: |
+            chapulin-*.tar.gz
+            chapulin-*.tar.gz.sha256
+            chapulin-*.zip
+            chapulin-*.zip.sha256
+
+  release:
+    needs: [prepare-version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-version.outputs.commit_sha }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Determine if prerelease
+        id: prerelease
+        run: |
+          VERSION="${{ needs.prepare-version.outputs.version }}"
+          if echo "$VERSION" | grep -qE '-(alpha|beta|rc)'; then
+            echo "flag=--prerelease" >> $GITHUB_OUTPUT
+          else
+            echo "flag=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create GitHub release
+        run: |
+          VERSION="${{ needs.prepare-version.outputs.version }}"
+          gh release create "v${VERSION}" \
+            --title "chapulin v${VERSION}" \
+            --generate-notes \
+            ${{ steps.prerelease.outputs.flag }} \
+            chapulin-*.tar.gz \
+            chapulin-*.tar.gz.sha256 \
+            chapulin-*.zip \
+            chapulin-*.zip.sha256
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

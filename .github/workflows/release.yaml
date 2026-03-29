@@ -153,24 +153,38 @@ jobs:
       - name: Install dependencies
         run: nimble install -d -y
 
-      - name: Build release binary (Clang+LTO on Unix, MSVC on Windows)
-        if: runner.os != 'Windows'
+      - name: Build release binary (Linux — Clang + LTO)
+        if: runner.os == 'Linux'
         run: >
           nim c
           -d:release
           --cc:clang
-          --passC:"-flto"
+          --passC:"-flto -O2 -march=x86-64-v2"
+          --passL:"-flto -fuse-ld=lld"
+          --opt:speed
+          -o:${{ matrix.binary }}
+          src/chapulin.nim
+
+      - name: Build release binary (macOS — Clang + LTO)
+        if: runner.os == 'macOS'
+        run: >
+          nim c
+          -d:release
+          --cc:clang
+          --passC:"-flto -O2"
           --passL:"-flto"
           --opt:speed
           -o:${{ matrix.binary }}
           src/chapulin.nim
 
-      - name: Build release binary (MSVC)
+      - name: Build release binary (Windows — MSVC + LTCG)
         if: runner.os == 'Windows'
         run: >
           nim c
           -d:release
           --cc:vcc
+          --passC:"/GL /O2"
+          --passL:"/LTCG"
           --opt:speed
           -o:${{ matrix.binary }}
           src/chapulin.nim

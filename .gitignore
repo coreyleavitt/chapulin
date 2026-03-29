@@ -1,0 +1,31 @@
+# Nim
+nimcache/
+nimblecache/
+*.exe
+*.out
+*.o
+*.so
+*.dylib
+
+# Binaries (in root only, not src/chapulin/)
+/chapulin
+/chapulin_gui
+/nimtftp
+/nimtftp_gui
+
+# Test artifacts
+test-files/large.bin
+/tmp/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude
+.claude/

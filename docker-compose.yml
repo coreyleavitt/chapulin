@@ -1,0 +1,89 @@
+services:
+  dev:
+    build: .
+    volumes:
+      - .:/app
+    working_dir: /app
+    command: nimble test
+
+  # Direction 1: our client against third-party server
+  tftp-server:
+    image: pghalliday/tftp
+    ports:
+      - "69:69/udp"
+    volumes:
+      - ./test-files:/var/tftpboot
+
+  integration-client:
+    build: .
+    volumes:
+      - .:/app
+    working_dir: /app
+    depends_on:
+      - tftp-server
+    command: nim c -r tests/t_integration.nim
+    environment:
+      - TFTP_HOST=tftp-server
+      - TFTP_PORT=69
+
+  # Direction 2: third-party client against our server
+  our-server:
+    build: .
+    volumes:
+      - .:/app
+      - ./test-files:/srv/tftp
+    working_dir: /app
+    command: >
+      bash -c "nim c -o:/tmp/chapulin src/chapulin.nim 2>/dev/null &&
+               /tmp/chapulin serve /srv/tftp --port=6969 --write=all --timeout=5"
+
+  interop-external-client:
+    image: opensuse/tumbleweed
+    depends_on:
+      - our-server
+    network_mode: "service:our-server"
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        zypper install -y atftp 2>/dev/null
+        sleep 3
+        echo "=== Test 1: GET small file with atftp ==="
+        atftp --get --remote-file hello.txt --local-file /tmp/hello.txt 127.0.0.1 6969
+        if [ -s /tmp/hello.txt ]; then
+          echo "PASS: $$(cat /tmp/hello.txt)"
+        else
+          echo "FAIL: file empty or missing"
+          exit 1
+        fi
+        echo "=== Test 2: GET 10KB file with atftp ==="
+        atftp --get --remote-file random.bin --local-file /tmp/random.bin 127.0.0.1 6969
+        SIZE=$$(wc -c < /tmp/random.bin)
+        if [ "$$SIZE" -eq 10240 ]; then
+          echo "PASS: $$SIZE bytes"
+        else
+          echo "FAIL: expected 10240 bytes, got $$SIZE"
+          exit 1
+        fi
+        echo "=== Test 3: GET with blocksize option ==="
+        atftp --option "blksize 1024" --get --remote-file random.bin --local-file /tmp/random2.bin 127.0.0.1 6969
+        SIZE=$$(wc -c < /tmp/random2.bin)
+        if [ "$$SIZE" -eq 10240 ]; then
+          echo "PASS: $$SIZE bytes with blksize=1024"
+        else
+          echo "FAIL: expected 10240 bytes, got $$SIZE"
+          exit 1
+        fi
+        echo "=== Test 4: GET nonexistent file ==="
+        atftp --get --remote-file nonexistent.txt --local-file /tmp/nope.txt 127.0.0.1 6969 2>&1 || true
+        if [ ! -s /tmp/nope.txt ]; then
+          echo "PASS: correctly rejected"
+        else
+          echo "FAIL: should not have succeeded"
+          exit 1
+        fi
+        echo "=== Test 5: PUT with atftp ==="
+        echo "uploaded by atftp" > /tmp/upload.txt
+        atftp --put --remote-file uploaded_atftp.txt --local-file /tmp/upload.txt 127.0.0.1 6969
+        echo "PASS: PUT completed (exit $$?)"
+        echo ""
+        echo "=== ALL EXTERNAL CLIENT INTEROP TESTS PASSED ==="

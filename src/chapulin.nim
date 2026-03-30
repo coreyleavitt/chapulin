@@ -44,6 +44,7 @@ proc usage() =
   echo "  --blocksize=N    Max blocksize (default: 65464)"
   echo "  --timeout=N      Timeout in seconds (default: 5)"
   echo "  --port-range=S:E Transfer port range for firewall (e.g., 6881:6889)"
+  echo "  --pxe-compat     Only negotiate tsize option (for buggy PXE ROMs)"
   echo ""
   echo "General options:"
   echo "  --verbose        Show detailed output (debug level)"
@@ -66,6 +67,7 @@ when isMainModule:
     maxClients = 10
     portRangeStart = 0
     portRangeEnd = 0
+    pxeCompat = false
 
   var p = initOptParser(commandLineParams())
   while true:
@@ -115,6 +117,7 @@ when isMainModule:
           stderr.writeLine "Invalid port-range: " & p.val; quit(2)
         if portRangeStart <= 0 or portRangeEnd < portRangeStart:
           stderr.writeLine "Invalid port-range: start must be > 0 and end >= start"; quit(2)
+      of "pxe-compat": pxeCompat = true
       else: stderr.writeLine "Unknown option: " & p.key; quit(2)
     of cmdArgument:
       case positionalIdx
@@ -201,6 +204,7 @@ when isMainModule:
     config.retries = retries
     config.portRangeStart = portRangeStart
     config.portRangeEnd = portRangeEnd
+    config.pxeCompat = pxeCompat
 
     let serverLogger = newLogger(logLevel, stdoutOutput)
     let srv = newTftpServer(config, logger = serverLogger)

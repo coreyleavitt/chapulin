@@ -40,6 +40,12 @@ proc serverOptionLimits(config: ServerConfig): ServerOptionLimits =
     minWindowsize: config.minWindowsize
   )
 
+proc filterOptionsForPxe(opts: seq[(string, string)]): seq[(string, string)] =
+  ## PXE compatibility: only allow tsize option, strip everything else.
+  for (key, val) in opts:
+    if key.toLowerAscii == "tsize":
+      result.add (key, val)
+
 proc sendError(transport: Transport, host: string, port: int,
                code: TftpErrorCode, msg: string) {.async.} =
   let errPkt = TftpPacket(opcode: opError, errorCode: code, errorMsg: msg)
@@ -79,12 +85,14 @@ proc handleRrq*(config: ServerConfig, request: TftpPacket,
   )
   let peer = newPeer(clientHost, clientPort, locked = true)
 
-  if request.options.len > 0:
+  let clientOpts = if config.pxeCompat: filterOptionsForPxe(request.options)
+                   else: request.options
+  if clientOpts.len > 0:
     let limits = serverOptionLimits(config)
     var neg: NegotiatedOptions
     var oackOpts: seq[(string, string)]
     try:
-      (neg, oackOpts) = negotiateServerOptions(request.options, limits,
+      (neg, oackOpts) = negotiateServerOptions(clientOpts, limits,
                                                 fileSize = fileSize)
     except ValueError:
       await sendError(transport, clientHost, clientPort, errIllegalOperation,
@@ -141,12 +149,14 @@ proc handleWrq*(config: ServerConfig, request: TftpPacket,
   )
   let peer = newPeer(clientHost, clientPort, locked = true)
 
-  if request.options.len > 0:
+  let wrqClientOpts = if config.pxeCompat: filterOptionsForPxe(request.options)
+                      else: request.options
+  if wrqClientOpts.len > 0:
     let limits = serverOptionLimits(config)
     var neg: NegotiatedOptions
     var oackOpts: seq[(string, string)]
     try:
-      (neg, oackOpts) = negotiateServerOptions(request.options, limits)
+      (neg, oackOpts) = negotiateServerOptions(wrqClientOpts, limits)
     except ValueError:
       await sendError(transport, clientHost, clientPort, errIllegalOperation,
                       "Invalid option value")

@@ -23,6 +23,7 @@ type
     minWindowsize*: int
     portRangeStart*: int  ## 0 = OS-assigned ephemeral ports (default)
     portRangeEnd*: int    ## 0 = OS-assigned ephemeral ports (default)
+    pxeCompat*: bool      ## Only negotiate tsize (no blksize/windowsize/timeout)
     allowedHosts*: seq[string]
     deniedHosts*: seq[string]
 
@@ -44,6 +45,7 @@ proc newDefaultServerConfig*(rootDir: string): ServerConfig =
     minWindowsize: MinWindowsize,
     portRangeStart: 0,
     portRangeEnd: 0,
+    pxeCompat: false,
     allowedHosts: @[],
     deniedHosts: @[]
   )

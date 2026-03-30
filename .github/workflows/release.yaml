@@ -198,8 +198,8 @@ jobs:
           -o:${{ matrix.binary }}
           src/chapulin.nim
 
-      - name: Build release binary (Windows — MSVC + LTCG)
-        if: runner.os == 'Windows'
+      - name: Build release binary (Windows — MSVC + LTCG, stable)
+        if: runner.os == 'Windows' && !contains(needs.prepare-version.outputs.version, '-')
         run: >
           nim c
           -d:release -d:withGui
@@ -212,8 +212,21 @@ jobs:
           -o:${{ matrix.binary }}
           src/chapulin.nim
 
-      - name: Strip binary (Unix)
-        if: runner.os != 'Windows'
+      - name: Build release binary (Windows — MSVC + LTCG, prerelease)
+        if: runner.os == 'Windows' && contains(needs.prepare-version.outputs.version, '-')
+        run: >
+          nim c
+          -d:release -d:withGui
+          --threads:on
+          --cc:vcc
+          --passC:"/GL /O2"
+          --passL:"/LTCG"
+          --opt:speed
+          -o:${{ matrix.binary }}
+          src/chapulin.nim
+
+      - name: Strip binary (Unix, stable releases only)
+        if: runner.os != 'Windows' && !contains(needs.prepare-version.outputs.version, '-')
         run: strip ${{ matrix.binary }}
 
       - name: Package (Unix)

@@ -250,23 +250,17 @@ jobs:
         with:
           merge-multiple: true
 
-      - name: Determine if prerelease
-        id: prerelease
-        run: |
-          VERSION="${{ needs.prepare-version.outputs.version }}"
-          if echo "$VERSION" | grep -qE '-(alpha|beta|rc)'; then
-            echo "flag=--prerelease" >> $GITHUB_OUTPUT
-          else
-            echo "flag=" >> $GITHUB_OUTPUT
-          fi
-
       - name: Create GitHub release
         run: |
           VERSION="${{ needs.prepare-version.outputs.version }}"
+          PRERELEASE_FLAG=""
+          if echo "$VERSION" | grep -q '-'; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
           gh release create "v${VERSION}" \
             --title "chapulin v${VERSION}" \
             --generate-notes \
-            ${{ steps.prerelease.outputs.flag }} \
+            $PRERELEASE_FLAG \
             chapulin-*.tar.gz \
             chapulin-*.tar.gz.sha256 \
             chapulin-*.zip \

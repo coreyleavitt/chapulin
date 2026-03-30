@@ -119,32 +119,35 @@ proc serverWorker() {.thread.} =
 proc launchGui*() =
   app.init()
 
-  var window = newWindow("chapulin")
-  window.width = 600
-  window.height = 520
+  var window = newWindow("chapulin — TFTP Client & Server")
+  window.width = 680
+  window.height = 620
 
   let rootContainer = newLayoutContainer(Layout_Vertical)
-  rootContainer.padding = 8
-  rootContainer.spacing = 4
+  rootContainer.padding = 12
+  rootContainer.spacing = 8
   window.add(rootContainer)
 
   # === Tab buttons ===
   let tabRow = newLayoutContainer(Layout_Horizontal)
-  tabRow.spacing = 4
+  tabRow.spacing = 8
   rootContainer.add(tabRow)
-  let clientTabBtn = newButton("Client")
-  let serverTabBtn = newButton("Server")
+  let clientTabBtn = newButton("  Client  ")
+  let serverTabBtn = newButton("  Server  ")
+  clientTabBtn.fontSize = 12
+  serverTabBtn.fontSize = 12
   tabRow.add(clientTabBtn)
   tabRow.add(serverTabBtn)
 
   # === Client panel ===
   let clientPanel = newLayoutContainer(Layout_Vertical)
-  clientPanel.spacing = 6
+  clientPanel.spacing = 8
+  clientPanel.padding = 4
   rootContainer.add(clientPanel)
 
   # Connection
   let connRow = newLayoutContainer(Layout_Horizontal)
-  connRow.spacing = 6
+  connRow.spacing = 8
   clientPanel.add(connRow)
   connRow.add(newLabel("Host:"))
   let hostInput = newTextBox("192.168.1.1")
@@ -152,12 +155,12 @@ proc launchGui*() =
   connRow.add(hostInput)
   connRow.add(newLabel("Port:"))
   let portInput = newTextBox("69")
-  portInput.width = 60
+  portInput.width = 70
   connRow.add(portInput)
 
   # Remote file
   let fileRow = newLayoutContainer(Layout_Horizontal)
-  fileRow.spacing = 6
+  fileRow.spacing = 8
   clientPanel.add(fileRow)
   fileRow.add(newLabel("Remote file:"))
   let remoteFileInput = newTextBox("")
@@ -166,7 +169,7 @@ proc launchGui*() =
 
   # Local file
   let localRow = newLayoutContainer(Layout_Horizontal)
-  localRow.spacing = 6
+  localRow.spacing = 8
   clientPanel.add(localRow)
   localRow.add(newLabel("Local file:"))
   let localFileInput = newTextBox("")
@@ -177,7 +180,7 @@ proc launchGui*() =
 
   # Options
   let optRow = newLayoutContainer(Layout_Horizontal)
-  optRow.spacing = 6
+  optRow.spacing = 8
   clientPanel.add(optRow)
   optRow.add(newLabel("Direction:"))
   let dirCombo = newComboBox(@["GET (Download)", "PUT (Upload)"])
@@ -188,7 +191,7 @@ proc launchGui*() =
 
   # Client actions
   let clientActionRow = newLayoutContainer(Layout_Horizontal)
-  clientActionRow.spacing = 6
+  clientActionRow.spacing = 8
   clientPanel.add(clientActionRow)
   let startBtn = newButton("Start Transfer")
   startBtn.widthMode = WidthMode_Expand
@@ -207,17 +210,19 @@ proc launchGui*() =
   let clientLog = newTextArea("")
   clientLog.editable = false
   clientLog.heightMode = HeightMode_Expand
+  clientLog.minHeight = 150
   clientPanel.add(clientLog)
 
   # === Server panel (hidden by default) ===
   let serverPanel = newLayoutContainer(Layout_Vertical)
-  serverPanel.spacing = 6
+  serverPanel.spacing = 8
+  serverPanel.padding = 4
   serverPanel.visible = false
   rootContainer.add(serverPanel)
 
   # Server config
   let srvRow1 = newLayoutContainer(Layout_Horizontal)
-  srvRow1.spacing = 6
+  srvRow1.spacing = 8
   serverPanel.add(srvRow1)
   srvRow1.add(newLabel("Root dir:"))
   let rootDirInput = newTextBox("")
@@ -227,11 +232,11 @@ proc launchGui*() =
   srvRow1.add(rootBrowseBtn)
 
   let srvRow2 = newLayoutContainer(Layout_Horizontal)
-  srvRow2.spacing = 6
+  srvRow2.spacing = 8
   serverPanel.add(srvRow2)
   srvRow2.add(newLabel("Port:"))
   let srvPortInput = newTextBox("69")
-  srvPortInput.width = 60
+  srvPortInput.width = 70
   srvRow2.add(srvPortInput)
   srvRow2.add(newLabel("Write policy:"))
   let writePolicyCombo = newComboBox(@["deny", "create", "overwrite", "all"])
@@ -243,7 +248,7 @@ proc launchGui*() =
 
   # Server actions
   let srvActionRow = newLayoutContainer(Layout_Horizontal)
-  srvActionRow.spacing = 6
+  srvActionRow.spacing = 8
   serverPanel.add(srvActionRow)
   let srvStartBtn = newButton("Start Server")
   srvStartBtn.widthMode = WidthMode_Expand
@@ -259,6 +264,7 @@ proc launchGui*() =
   let serverLog = newTextArea("")
   serverLog.editable = false
   serverLog.heightMode = HeightMode_Expand
+  serverLog.minHeight = 200
   serverPanel.add(serverLog)
 
   # === State ===

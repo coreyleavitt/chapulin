@@ -21,6 +21,7 @@ type
 
   ServerCallbacks* = object
     onTransferStart*: proc(info: TransferInfo) {.closure.}
+    onTransferProgress*: proc(info: TransferInfo) {.closure.}
     onTransferComplete*: proc(info: TransferInfo) {.closure.}
     onTransferError*: proc(info: TransferInfo, msg: string) {.closure.}
 
@@ -80,7 +81,8 @@ proc generateDirListing(rootDir: string): string =
 
 proc handleRrq*(config: ServerConfig, request: TftpPacket,
                 transport: Transport, clientHost: string,
-                clientPort: int): Future[TransferResult] {.async.} =
+                clientPort: int,
+                onProgress: ProgressCallback = nil): Future[TransferResult] {.async.} =
   # Check for directory listing request
   if config.dirListFile.len > 0 and request.filename == config.dirListFile:
     let listing = generateDirListing(config.rootDir)
@@ -161,7 +163,7 @@ proc handleRrq*(config: ServerConfig, request: TftpPacket,
     buf.setLen(bytesRead)
     return buf
 
-  let xferResult = await sendBlocks(transport, xferConfig, peer, 1, readData)
+  let xferResult = await sendBlocks(transport, xferConfig, peer, 1, readData, onProgress)
 
   if xferResult.success and config.checksumMode.len > 0:
     discard generateChecksum(resolvedPath, config.checksumMode)
@@ -172,7 +174,8 @@ proc handleRrq*(config: ServerConfig, request: TftpPacket,
 
 proc handleWrq*(config: ServerConfig, request: TftpPacket,
                 transport: Transport, clientHost: string,
-                clientPort: int): Future[TransferResult] {.async.} =
+                clientPort: int,
+                onProgress: ProgressCallback = nil): Future[TransferResult] {.async.} =
   let (valid, resolvedPath, pathErr) = validatePath(config.rootDir, request.filename)
   if not valid:
     await sendError(transport, clientHost, clientPort, errAccessViolation, pathErr)
@@ -234,7 +237,7 @@ proc handleWrq*(config: ServerConfig, request: TftpPacket,
   let cancelOnWriteError: CancelCheck = proc(): bool = writeError.len > 0
 
   var xferResult = await recvBlocks(transport, xferConfig, peer, 1, onData,
-                                     cancelCheck = cancelOnWriteError)
+                                     onProgress, cancelOnWriteError)
 
   if writeError.len > 0:
     xferResult = failResult(writeError)
@@ -291,14 +294,25 @@ proc handleRequest*(server: TftpServer, data: seq[byte],
     if xferTransport.close != nil: xferTransport.close()
     server.activeTransfers.dec
 
+  # Per-transfer progress callback
+  let progressCb: ProgressCallback = if server.callbacks.onTransferProgress != nil:
+    proc(bytes: int64, total: int64) =
+      let info = TransferInfo(
+        clientHost: clientHost, clientPort: clientPort,
+        filename: pkt.filename, direction: direction,
+        bytesTransferred: bytes)
+      server.callbacks.onTransferProgress(info)
+  else:
+    nil
+
   var xferResult: TransferResult
   case pkt.opcode
   of opRrq:
     xferResult = await handleRrq(server.config, pkt, xferTransport,
-                                  clientHost, clientPort)
+                                  clientHost, clientPort, progressCb)
   of opWrq:
     xferResult = await handleWrq(server.config, pkt, xferTransport,
-                                  clientHost, clientPort)
+                                  clientHost, clientPort, progressCb)
   else:
     server.logger.warn("Unexpected opcode from " & clientHost)
     await sendError(xferTransport, clientHost, clientPort,

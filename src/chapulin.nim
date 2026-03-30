@@ -36,6 +36,7 @@ proc usage() =
   echo "  --timeout=N      Timeout in seconds (default: 5)"
   echo "  --retries=N      Max retransmit attempts (default: 3)"
   echo "  --output=PATH    Local file path (default: filename for get)"
+  echo "  --mode=MODE      Transfer mode: octet or netascii (default: octet)"
   echo ""
   echo "Server options:"
   echo "  --port=N         Listen port (default: 69)"
@@ -67,6 +68,7 @@ when isMainModule:
     timeout = DefaultTimeout
     retries = DefaultRetries
     logLevel = llInfo
+    transferMode = tmOctet
     notify = false
     writePolicy = wpDeny
     maxClients = 10
@@ -86,6 +88,11 @@ when isMainModule:
       case p.key.toLowerAscii
       of "help", "h": usage(); quit(0)
       of "notify": notify = true
+      of "mode":
+        case p.val.toLowerAscii
+        of "octet": transferMode = tmOctet
+        of "netascii": transferMode = tmNetascii
+        else: stderr.writeLine "Invalid mode: " & p.val & " (octet or netascii)"; quit(2)
       of "verbose": logLevel = llDebug
       of "quiet", "q": logLevel = llError
       of "version", "v": echo "chapulin v" & Version; quit(0)
@@ -191,6 +198,7 @@ when isMainModule:
     var req = newTransferRequest(host, port, filename, localPath, direction)
     req.options.blocksize = blocksize
     req.options.windowsize = windowsize
+    req.options.mode = transferMode
     req.options.timeout = timeout
     req.options.retries = retries
 

@@ -3,9 +3,11 @@
 
 import std/asyncdispatch
 import engine
+import protocol
 export Transport, CancelCheck, TransportTimeoutError, TransportCloseProc,
        TransferResult, ProgressCallback, DefaultBlocksize, DefaultTimeout,
-       DefaultRetries, MinBlocksize, MaxBlocksize, validateBlocksize
+       DefaultRetries, MinBlocksize, MaxBlocksize, validateBlocksize,
+       TransferMode
 import std/os
 
 type
@@ -18,6 +20,7 @@ type
     timeout*: int
     retries*: int
     windowsize*: int
+    mode*: TransferMode
 
   TransferRequest* = object
     host*: string
@@ -42,7 +45,8 @@ proc newTransferRequest*(host: string, port: int, filename: string,
     host: host, port: port, filename: filename,
     localPath: localPath, direction: direction,
     options: TransferOptions(blocksize: DefaultBlocksize, timeout: DefaultTimeout,
-                             retries: DefaultRetries, windowsize: DefaultWindowsize)
+                             retries: DefaultRetries, windowsize: DefaultWindowsize,
+                             mode: tmOctet)
   )
 
 proc failResult(msg: string): TransferResult =
@@ -56,6 +60,7 @@ proc executeTransfer*(req: TransferRequest, callbacks: TransferCallbacks,
     retries: req.options.retries,
     blocksize: validateBlocksize(req.options.blocksize),
     windowsize: max(MinWindowsize, min(MaxWindowsize, req.options.windowsize)),
+    mode: req.options.mode,
     requestTsize: true,
     tsize: -1
   )

@@ -15,13 +15,14 @@ type
     retries*: int
     blocksize*: int
     windowsize*: int
+    mode*: TransferMode
     requestTsize*: bool
     tsize*: int64
 
 proc newDefaultConfig*(): TftpClientConfig =
   TftpClientConfig(timeout: DefaultTimeout, retries: DefaultRetries,
                    blocksize: DefaultBlocksize, windowsize: DefaultWindowsize,
-                   requestTsize: false, tsize: -1)
+                   mode: tmOctet, requestTsize: false, tsize: -1)
 
 proc toTransferConfig(config: TftpClientConfig): TransferConfig =
   newTransferConfig(blocksize = config.blocksize, timeout = config.timeout,
@@ -46,7 +47,7 @@ proc getFile*(transport: Transport, config: TftpClientConfig,
               onProgress: ProgressCallback = nil,
               cancelCheck: CancelCheck = nil): Future[TransferResult] {.async.} =
   let opts = clientBuildOptions(config)
-  let rrq = TftpPacket(opcode: opRrq, filename: filename, mode: tmOctet, options: opts)
+  let rrq = TftpPacket(opcode: opRrq, filename: filename, mode: config.mode, options: opts)
   await transport.send(encode(rrq), host, port)
 
   var xferConfig = toTransferConfig(config)
@@ -145,7 +146,7 @@ proc putFile*(transport: Transport, config: TftpClientConfig,
               onProgress: ProgressCallback = nil,
               cancelCheck: CancelCheck = nil): Future[TransferResult] {.async.} =
   let opts = clientBuildOptions(config)
-  let wrq = TftpPacket(opcode: opWrq, filename: filename, mode: tmOctet, options: opts)
+  let wrq = TftpPacket(opcode: opWrq, filename: filename, mode: config.mode, options: opts)
   await transport.send(encode(wrq), host, port)
 
   var xferConfig = toTransferConfig(config)

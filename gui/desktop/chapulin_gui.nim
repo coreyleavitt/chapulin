@@ -126,16 +126,16 @@ proc launchGui*() =
   let rootContainer = newLayoutContainer(Layout_Vertical)
   rootContainer.padding = 12
   rootContainer.spacing = 8
+  rootContainer.widthMode = WidthMode_Expand
+  rootContainer.heightMode = HeightMode_Expand
   window.add(rootContainer)
 
   # === Tab buttons ===
   let tabRow = newLayoutContainer(Layout_Horizontal)
   tabRow.spacing = 8
   rootContainer.add(tabRow)
-  let clientTabBtn = newButton("  Client  ")
-  let serverTabBtn = newButton("  Server  ")
-  clientTabBtn.fontSize = 12
-  serverTabBtn.fontSize = 12
+  let clientTabBtn = newButton("    Client    ")
+  let serverTabBtn = newButton("    Server    ")
   tabRow.add(clientTabBtn)
   tabRow.add(serverTabBtn)
 
@@ -143,6 +143,8 @@ proc launchGui*() =
   let clientPanel = newLayoutContainer(Layout_Vertical)
   clientPanel.spacing = 8
   clientPanel.padding = 4
+  clientPanel.widthMode = WidthMode_Expand
+  clientPanel.heightMode = HeightMode_Expand
   rootContainer.add(clientPanel)
 
   # Connection
@@ -217,6 +219,8 @@ proc launchGui*() =
   let serverPanel = newLayoutContainer(Layout_Vertical)
   serverPanel.spacing = 8
   serverPanel.padding = 4
+  serverPanel.widthMode = WidthMode_Expand
+  serverPanel.heightMode = HeightMode_Expand
   serverPanel.visible = false
   rootContainer.add(serverPanel)
 

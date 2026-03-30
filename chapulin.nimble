@@ -2,7 +2,7 @@
 version       = "0.1.0"
 author        = "corey"
 description   = "Cross-platform TFTP client and server"
-license       = "MIT"
+license       = "Apache-2.0"
 srcDir        = "src"
 bin           = @["chapulin"]
 

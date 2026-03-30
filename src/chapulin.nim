@@ -46,6 +46,7 @@ proc usage() =
   echo "  --port-range=S:E Transfer port range for firewall (e.g., 6881:6889)"
   echo "  --pxe-compat     Only negotiate tsize option (for buggy PXE ROMs)"
   echo "  --bind=ADDR      Bind to specific IP address (default: 0.0.0.0)"
+  echo "  --dir-list=FILE  Serve directory listing as this filename (e.g., dir.txt)"
   echo ""
   echo "General options:"
   echo "  --verbose        Show detailed output (debug level)"
@@ -70,6 +71,7 @@ when isMainModule:
     portRangeEnd = 0
     pxeCompat = false
     bindAddr = "0.0.0.0"
+    dirListFile = ""
 
   var p = initOptParser(commandLineParams())
   while true:
@@ -121,6 +123,7 @@ when isMainModule:
           stderr.writeLine "Invalid port-range: start must be > 0 and end >= start"; quit(2)
       of "pxe-compat": pxeCompat = true
       of "bind": bindAddr = p.val
+      of "dir-list": dirListFile = p.val
       else: stderr.writeLine "Unknown option: " & p.key; quit(2)
     of cmdArgument:
       case positionalIdx
@@ -209,6 +212,7 @@ when isMainModule:
     config.portRangeEnd = portRangeEnd
     config.pxeCompat = pxeCompat
     config.listenAddr = bindAddr
+    config.dirListFile = dirListFile
 
     let serverLogger = newLogger(logLevel, stdoutOutput)
     let srv = newTftpServer(config, logger = serverLogger)

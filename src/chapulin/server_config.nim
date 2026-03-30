@@ -24,6 +24,7 @@ type
     portRangeStart*: int  ## 0 = OS-assigned ephemeral ports (default)
     portRangeEnd*: int    ## 0 = OS-assigned ephemeral ports (default)
     pxeCompat*: bool      ## Only negotiate tsize (no blksize/windowsize/timeout)
+    dirListFile*: string  ## Filename that triggers directory listing ("" = disabled)
     allowedHosts*: seq[string]
     deniedHosts*: seq[string]
 
@@ -46,6 +47,7 @@ proc newDefaultServerConfig*(rootDir: string): ServerConfig =
     portRangeStart: 0,
     portRangeEnd: 0,
     pxeCompat: false,
+    dirListFile: "",
     allowedHosts: @[],
     deniedHosts: @[]
   )

@@ -56,9 +56,35 @@ proc failResult(msg: string): TransferResult =
 
 # --- RRQ handler: serve file to client ---
 
+proc generateDirListing(rootDir: string): string =
+  ## Generate a directory listing of the TFTP root.
+  for kind, path in walkDir(rootDir):
+    let name = extractFilename(path)
+    case kind
+    of pcFile:
+      let size = getFileSize(path)
+      result.add name & "\t" & $size & "\n"
+    of pcDir:
+      result.add name & "/\n"
+    else: discard
+
 proc handleRrq*(config: ServerConfig, request: TftpPacket,
                 transport: Transport, clientHost: string,
                 clientPort: int): Future[TransferResult] {.async.} =
+  # Check for directory listing request
+  if config.dirListFile.len > 0 and request.filename == config.dirListFile:
+    let listing = generateDirListing(config.rootDir)
+    let listingBytes = cast[seq[byte]](listing)
+    var offset = 0
+    let xferConfig = newTransferConfig(timeout = config.timeout, retries = config.retries)
+    let peer = newPeer(clientHost, clientPort, locked = true)
+    let readData = proc(blockNum: uint16, blocksize: int): seq[byte] =
+      let start = int(blockNum - 1) * blocksize
+      if start >= listingBytes.len: return @[]
+      let endPos = min(start + blocksize, listingBytes.len)
+      return listingBytes[start ..< endPos]
+    return await sendBlocks(transport, xferConfig, peer, 1, readData)
+
   let (valid, resolvedPath, pathErr) = validatePath(config.rootDir, request.filename)
   if not valid:
     await sendError(transport, clientHost, clientPort, errAccessViolation, pathErr)

@@ -103,18 +103,25 @@ jobs:
       - name: Update version in nimble file
         run: |
           VERSION="${{ steps.compute.outputs.version }}"
-          sed -i "s/^version *=.*/version       = \"$VERSION\"/" chapulin.nimble
+          # Nimble only supports X.Y.Z — strip prerelease suffix for nimble
+          NIMBLE_VERSION=$(echo "$VERSION" | sed 's/-.*//')
+          sed -i "s/^version *=.*/version       = \"$NIMBLE_VERSION\"/" chapulin.nimble
 
-      - name: Commit version bump
+      - name: Commit version bump and tag
         id: commit
         run: |
           VERSION="${{ steps.compute.outputs.version }}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add chapulin.nimble
-          git commit -m "Release v${VERSION}"
+          if git diff --quiet chapulin.nimble; then
+            echo "No version change in nimble file"
+          else
+            git add chapulin.nimble
+            git commit -m "Release v${VERSION}"
+            git push origin main
+          fi
           git tag "v${VERSION}"
-          git push origin main --tags
+          git push origin "v${VERSION}"
           echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
 
   build:

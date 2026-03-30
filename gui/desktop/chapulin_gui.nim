@@ -1,4 +1,6 @@
 ## chapulin NiGui desktop GUI — client and server with log viewer
+## Layout follows NiCalc pattern: no explicit widthMode/heightMode on containers,
+## TextBoxes expand by default, labels use minWidth for alignment.
 
 import nigui
 import std/os
@@ -53,7 +55,8 @@ var
 clientChannel.open()
 serverChannel.open()
 
-# --- Client transfer worker ---
+const LabelWidth = 80
+
 proc transferWorker() {.thread.} =
   {.gcsafe.}:
     let params = transferParams
@@ -77,7 +80,6 @@ proc transferWorker() {.thread.} =
     discard waitFor executeTransfer(req, callbacks, udpTransport,
       cancelCheck = proc(): bool = cancelRequested.load())
 
-# --- Server worker ---
 proc serverWorker() {.thread.} =
   {.gcsafe.}:
     let params = srvParams
@@ -93,9 +95,6 @@ proc serverWorker() {.thread.} =
     let listener = newUdpListener(port = params.port)
     serverChannel.send(TransferMsg(kind: mkLog,
                                     logMsg: "[INFO]  Server started on port " & $params.port))
-    # Run until stopped — poll serverStopRequested via a custom check
-    # Since server.run is async and blocks, we run it in waitFor
-    # and check the stop flag periodically
     proc runUntilStopped() {.async.} =
       srv.running = true
       while srv.running and not serverStopRequested.load():
@@ -119,24 +118,19 @@ proc serverWorker() {.thread.} =
 proc launchGui*() =
   app.init()
 
-  var window = newWindow("chapulin — TFTP Client & Server")
+  var window = newWindow("chapulin")
   window.width = 680
-  window.height = 620
-  window.minWidth = 620
-  window.minHeight = 480
+  window.height = 580
 
-  let rootContainer = newLayoutContainer(Layout_Vertical)
-  rootContainer.padding = 12
-  rootContainer.spacing = 8
-  rootContainer.widthMode = WidthMode_Expand
-  rootContainer.heightMode = HeightMode_Expand
-  window.add(rootContainer)
+  let mainContainer = newLayoutContainer(Layout_Vertical)
+  mainContainer.padding = 8
+  mainContainer.spacing = 6
+  window.add(mainContainer)
 
   # === Tab buttons ===
   let tabRow = newLayoutContainer(Layout_Horizontal)
   tabRow.spacing = 8
-  tabRow.widthMode = WidthMode_Expand
-  rootContainer.add(tabRow)
+  mainContainer.add(tabRow)
   let clientTabBtn = newButton("    Client    ")
   let serverTabBtn = newButton("    Server    ")
   tabRow.add(clientTabBtn)
@@ -144,64 +138,70 @@ proc launchGui*() =
 
   # === Client panel ===
   let clientPanel = newLayoutContainer(Layout_Vertical)
-  clientPanel.spacing = 8
-  clientPanel.padding = 4
-  clientPanel.widthMode = WidthMode_Expand
-  clientPanel.heightMode = HeightMode_Expand
-  rootContainer.add(clientPanel)
+  clientPanel.spacing = 6
+  mainContainer.add(clientPanel)
 
   # Connection
   let connRow = newLayoutContainer(Layout_Horizontal)
-  connRow.spacing = 8
-  connRow.widthMode = WidthMode_Expand
+  connRow.spacing = 6
   clientPanel.add(connRow)
-  connRow.add(newLabel("Host:"))
+  let hostLabel = newLabel("Host:")
+  hostLabel.minWidth = LabelWidth
+  hostLabel.heightMode = HeightMode_Fill
+  connRow.add(hostLabel)
   let hostInput = newTextBox("192.168.1.1")
-  hostInput.widthMode = WidthMode_Expand
   connRow.add(hostInput)
-  connRow.add(newLabel("Port:"))
+  let portLabel = newLabel("Port:")
+  portLabel.heightMode = HeightMode_Fill
+  connRow.add(portLabel)
   let portInput = newTextBox("69")
-  portInput.width = 70
+  portInput.width = 65
   connRow.add(portInput)
 
   # Remote file
   let fileRow = newLayoutContainer(Layout_Horizontal)
-  fileRow.spacing = 8
-  fileRow.widthMode = WidthMode_Expand
+  fileRow.spacing = 6
   clientPanel.add(fileRow)
-  fileRow.add(newLabel("Remote file:"))
+  let remoteLabel = newLabel("Remote file:")
+  remoteLabel.minWidth = LabelWidth
+  remoteLabel.heightMode = HeightMode_Fill
+  fileRow.add(remoteLabel)
   let remoteFileInput = newTextBox("")
-  remoteFileInput.widthMode = WidthMode_Expand
   fileRow.add(remoteFileInput)
 
   # Local file
   let localRow = newLayoutContainer(Layout_Horizontal)
-  localRow.spacing = 8
-  localRow.widthMode = WidthMode_Expand
+  localRow.spacing = 6
   clientPanel.add(localRow)
-  localRow.add(newLabel("Local file:"))
+  let localLabel = newLabel("Local file:")
+  localLabel.minWidth = LabelWidth
+  localLabel.heightMode = HeightMode_Fill
+  localRow.add(localLabel)
   let localFileInput = newTextBox("")
-  localFileInput.widthMode = WidthMode_Expand
   localRow.add(localFileInput)
   let browseBtn = newButton("Browse...")
+  browseBtn.heightMode = HeightMode_Fill
   localRow.add(browseBtn)
 
   # Options
   let optRow = newLayoutContainer(Layout_Horizontal)
-  optRow.spacing = 8
-  optRow.widthMode = WidthMode_Expand
+  optRow.spacing = 6
   clientPanel.add(optRow)
-  optRow.add(newLabel("Direction:"))
+  let dirLabel = newLabel("Direction:")
+  dirLabel.minWidth = LabelWidth
+  dirLabel.heightMode = HeightMode_Fill
+  optRow.add(dirLabel)
   let dirCombo = newComboBox(@["GET (Download)", "PUT (Upload)"])
   optRow.add(dirCombo)
-  optRow.add(newLabel("Block size:"))
+  let bsLabel = newLabel("Block size:")
+  bsLabel.heightMode = HeightMode_Fill
+  optRow.add(bsLabel)
   let bsCombo = newComboBox(@["512", "1024", "1468", "4096", "8192"])
   optRow.add(bsCombo)
 
   # Client actions
   let clientActionRow = newLayoutContainer(Layout_Horizontal)
-  clientActionRow.spacing = 8
-  clientActionRow.widthMode = WidthMode_Expand
+  clientActionRow.spacing = 6
   clientPanel.add(clientActionRow)
   let startBtn = newButton("Start Transfer")
   startBtn.widthMode = WidthMode_Expand
@@ -219,51 +219,54 @@ proc launchGui*() =
   # Client log
   let clientLog = newTextArea("")
   clientLog.editable = false
-  clientLog.heightMode = HeightMode_Expand
-  clientLog.minHeight = 150
   clientPanel.add(clientLog)
 
   # === Server panel (hidden by default) ===
   let serverPanel = newLayoutContainer(Layout_Vertical)
-  serverPanel.spacing = 8
-  serverPanel.padding = 4
-  serverPanel.widthMode = WidthMode_Expand
-  serverPanel.heightMode = HeightMode_Expand
+  serverPanel.spacing = 6
   serverPanel.visible = false
-  rootContainer.add(serverPanel)
+  mainContainer.add(serverPanel)
 
-  # Server config
+  # Server root dir
   let srvRow1 = newLayoutContainer(Layout_Horizontal)
-  srvRow1.spacing = 8
-  srvRow1.widthMode = WidthMode_Expand
+  srvRow1.spacing = 6
   serverPanel.add(srvRow1)
-  srvRow1.add(newLabel("Root dir:"))
+  let rootDirLabel = newLabel("Root dir:")
+  rootDirLabel.minWidth = LabelWidth
+  rootDirLabel.heightMode = HeightMode_Fill
+  srvRow1.add(rootDirLabel)
   let rootDirInput = newTextBox("")
-  rootDirInput.widthMode = WidthMode_Expand
   srvRow1.add(rootDirInput)
   let rootBrowseBtn = newButton("Browse...")
+  rootBrowseBtn.heightMode = HeightMode_Fill
   srvRow1.add(rootBrowseBtn)
 
+  # Server options
   let srvRow2 = newLayoutContainer(Layout_Horizontal)
-  srvRow2.spacing = 8
-  srvRow2.widthMode = WidthMode_Expand
+  srvRow2.spacing = 6
   serverPanel.add(srvRow2)
-  srvRow2.add(newLabel("Port:"))
+  let srvPortLabel = newLabel("Port:")
+  srvPortLabel.minWidth = LabelWidth
+  srvPortLabel.heightMode = HeightMode_Fill
+  srvRow2.add(srvPortLabel)
   let srvPortInput = newTextBox("69")
-  srvPortInput.width = 70
+  srvPortInput.width = 65
   srvRow2.add(srvPortInput)
-  srvRow2.add(newLabel("Write policy:"))
+  let wpLabel = newLabel("Write policy:")
+  wpLabel.heightMode = HeightMode_Fill
+  srvRow2.add(wpLabel)
   let writePolicyCombo = newComboBox(@["deny", "create", "overwrite", "all"])
   srvRow2.add(writePolicyCombo)
-  srvRow2.add(newLabel("Max clients:"))
+  let mcLabel = newLabel("Max:")
+  mcLabel.heightMode = HeightMode_Fill
+  srvRow2.add(mcLabel)
   let maxClientsInput = newTextBox("10")
   maxClientsInput.width = 40
   srvRow2.add(maxClientsInput)
 
   # Server actions
   let srvActionRow = newLayoutContainer(Layout_Horizontal)
-  srvActionRow.spacing = 8
-  srvActionRow.widthMode = WidthMode_Expand
+  srvActionRow.spacing = 6
   serverPanel.add(srvActionRow)
   let srvStartBtn = newButton("Start Server")
   srvStartBtn.widthMode = WidthMode_Expand
@@ -278,8 +281,6 @@ proc launchGui*() =
   # Server log
   let serverLog = newTextArea("")
   serverLog.editable = false
-  serverLog.heightMode = HeightMode_Expand
-  serverLog.minHeight = 200
   serverPanel.add(serverLog)
 
   # === State ===
@@ -337,9 +338,8 @@ proc launchGui*() =
     cancelRequested.store(true)
     appendClientLog("Cancelling transfer...")
 
-  # === Client transfer timer ===
+  # === Poll channels ===
   discard startRepeatingTimer(50, proc(event: TimerEvent) =
-    # Poll client channel
     if transferActive:
       var recvResult = clientChannel.tryRecv()
       while recvResult.dataAvailable:
@@ -375,7 +375,6 @@ proc launchGui*() =
           appendClientLog(msg.logMsg)
         recvResult = clientChannel.tryRecv()
 
-    # Poll server channel
     if serverActive:
       var recvResult = serverChannel.tryRecv()
       while recvResult.dataAvailable:
@@ -468,12 +467,9 @@ proc launchGui*() =
     srvStopBtn.enabled = false
     srvStatusLabel.text = "Stopping..."
     appendServerLog("Stopping server...")
-    # Server thread will exit and post a log message
 
-  # === Server stop completion (check in timer) ===
   discard startRepeatingTimer(500, proc(event: TimerEvent) =
     if serverActive and serverStopRequested.load():
-      # Check if server thread finished
       try:
         joinThread(serverThread)
         serverActive = false
@@ -481,7 +477,7 @@ proc launchGui*() =
         srvStopBtn.enabled = false
         srvStatusLabel.text = "Server stopped"
       except:
-        discard  # not finished yet
+        discard
   )
 
   window.show()

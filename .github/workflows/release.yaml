@@ -205,8 +205,9 @@ jobs:
           -d:release -d:withGui
           --threads:on
           --cc:vcc
+          --debuginfo:off
           --passC:"/GL /O2"
-          --passL:"/LTCG"
+          --passL:"/LTCG /OPT:REF /OPT:ICF /DEBUG:NONE"
           --opt:speed
           -o:${{ matrix.binary }}
           src/chapulin.nim

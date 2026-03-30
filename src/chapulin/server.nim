@@ -1,7 +1,7 @@
 ## TFTP server — async request handlers and listener dispatch.
 ## No threads, no locks, no atomics. Concurrent transfers via asyncCheck.
 
-import std/[os, asyncdispatch, strutils, times]
+import std/[os, asyncdispatch, strutils, times, md5]
 import protocol
 import transfer
 import transport
@@ -55,6 +55,16 @@ proc failResult(msg: string): TransferResult =
   TransferResult(success: false, bytesTransferred: 0, errorMsg: msg, totalSize: -1)
 
 # --- RRQ handler: serve file to client ---
+
+proc generateChecksum(filePath: string, mode: string): string =
+  ## Generate a checksum sidecar file after a successful read transfer.
+  if mode == "md5":
+    let content = readFile(filePath)
+    let hash = $toMD5(content)
+    let sidecar = filePath & ".md5"
+    writeFile(sidecar, hash & "  " & extractFilename(filePath) & "\n")
+    return sidecar
+  return ""
 
 proc generateDirListing(rootDir: string): string =
   ## Generate a directory listing of the TFTP root.
@@ -151,7 +161,12 @@ proc handleRrq*(config: ServerConfig, request: TftpPacket,
     buf.setLen(bytesRead)
     return buf
 
-  return await sendBlocks(transport, xferConfig, peer, 1, readData)
+  let xferResult = await sendBlocks(transport, xferConfig, peer, 1, readData)
+
+  if xferResult.success and config.checksumMode.len > 0:
+    discard generateChecksum(resolvedPath, config.checksumMode)
+
+  return xferResult
 
 # --- WRQ handler: receive file from client ---
 

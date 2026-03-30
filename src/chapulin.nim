@@ -47,6 +47,7 @@ proc usage() =
   echo "  --pxe-compat     Only negotiate tsize option (for buggy PXE ROMs)"
   echo "  --bind=ADDR      Bind to specific IP address (default: 0.0.0.0)"
   echo "  --dir-list=FILE  Serve directory listing as this filename (e.g., dir.txt)"
+  echo "  --checksum=MODE  Generate checksum sidecar after read (md5 or none)"
   echo ""
   echo "General options:"
   echo "  --verbose        Show detailed output (debug level)"
@@ -72,6 +73,7 @@ when isMainModule:
     pxeCompat = false
     bindAddr = "0.0.0.0"
     dirListFile = ""
+    checksumMode = ""
 
   var p = initOptParser(commandLineParams())
   while true:
@@ -124,6 +126,7 @@ when isMainModule:
       of "pxe-compat": pxeCompat = true
       of "bind": bindAddr = p.val
       of "dir-list": dirListFile = p.val
+      of "checksum": checksumMode = p.val
       else: stderr.writeLine "Unknown option: " & p.key; quit(2)
     of cmdArgument:
       case positionalIdx
@@ -213,6 +216,7 @@ when isMainModule:
     config.pxeCompat = pxeCompat
     config.listenAddr = bindAddr
     config.dirListFile = dirListFile
+    config.checksumMode = checksumMode
 
     let serverLogger = newLogger(logLevel, stdoutOutput)
     let srv = newTftpServer(config, logger = serverLogger)

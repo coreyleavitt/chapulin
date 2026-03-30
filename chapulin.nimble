@@ -8,7 +8,7 @@ bin           = @["chapulin"]
 
 # Dependencies
 requires "nim >= 2.0.0"
-requires "nigui >= 0.2.8"
+requires "https://github.com/coreyleavitt/NiGui >= 0.2.8"
 
 task test, "Run unit tests":
   exec "nim c -r tests/t_protocol.nim"

@@ -1,5 +1,5 @@
 # Package
-version       = "0.1.0"
+version       = "0.1.0-beta.1"
 author        = "corey"
 description   = "Cross-platform TFTP client and server"
 license       = "MIT"

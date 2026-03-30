@@ -45,6 +45,7 @@ proc usage() =
   echo "  --timeout=N      Timeout in seconds (default: 5)"
   echo "  --port-range=S:E Transfer port range for firewall (e.g., 6881:6889)"
   echo "  --pxe-compat     Only negotiate tsize option (for buggy PXE ROMs)"
+  echo "  --bind=ADDR      Bind to specific IP address (default: 0.0.0.0)"
   echo ""
   echo "General options:"
   echo "  --verbose        Show detailed output (debug level)"
@@ -68,6 +69,7 @@ when isMainModule:
     portRangeStart = 0
     portRangeEnd = 0
     pxeCompat = false
+    bindAddr = "0.0.0.0"
 
   var p = initOptParser(commandLineParams())
   while true:
@@ -118,6 +120,7 @@ when isMainModule:
         if portRangeStart <= 0 or portRangeEnd < portRangeStart:
           stderr.writeLine "Invalid port-range: start must be > 0 and end >= start"; quit(2)
       of "pxe-compat": pxeCompat = true
+      of "bind": bindAddr = p.val
       else: stderr.writeLine "Unknown option: " & p.key; quit(2)
     of cmdArgument:
       case positionalIdx
@@ -205,6 +208,7 @@ when isMainModule:
     config.portRangeStart = portRangeStart
     config.portRangeEnd = portRangeEnd
     config.pxeCompat = pxeCompat
+    config.listenAddr = bindAddr
 
     let serverLogger = newLogger(logLevel, stdoutOutput)
     let srv = newTftpServer(config, logger = serverLogger)

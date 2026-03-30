@@ -15,16 +15,19 @@ proc validatePath*(rootDir: string, filename: string): tuple[
   if '\0' in filename:
     return (false, "", "Null byte in filename")
 
-  if filename.startsWith("/") or filename.startsWith("\\"):
-    return (false, "", "Absolute path not allowed")
+  # Virtual root: strip leading path separators (PXE clients send /tftpboot/file)
+  var cleanName = filename
+  cleanName = cleanName.strip(chars = {'/', '\\'}, trailing = false)
+  # Normalize backslashes to forward slashes
+  cleanName = cleanName.replace('\\', '/')
 
-  if ".." in filename:
+  if ".." in cleanName:
     return (false, "", "Path traversal not allowed")
 
-  if '\\' in filename:
-    return (false, "", "Backslash in filename not allowed")
+  if cleanName.len == 0:
+    return (false, "", "Empty filename after path normalization")
 
-  let resolved = absolutePath(rootDir / filename)
+  let resolved = absolutePath(rootDir / cleanName)
   let normalizedRoot = absolutePath(rootDir)
 
   # Verify the resolved path is still under the root

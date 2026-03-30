@@ -31,8 +31,23 @@ suite "validatePath":
     check valid == false
     check err.len > 0
 
-  test "rejects absolute path":
-    let (valid, _, err) = validatePath(testRoot, "/etc/passwd")
+  test "virtual root: strips leading slash (PXE compat)":
+    let (valid, resolved, _) = validatePath(testRoot, "/existing.txt")
+    check valid == true
+    check resolved == testRoot / "existing.txt"
+
+  test "virtual root: strips leading backslash":
+    let (valid, resolved, _) = validatePath(testRoot, "\\existing.txt")
+    check valid == true
+    check resolved == testRoot / "existing.txt"
+
+  test "virtual root: PXE-style absolute path":
+    let (valid, resolved, _) = validatePath(testRoot, "/subdir/nested.txt")
+    check valid == true
+    check resolved == testRoot / "subdir" / "nested.txt"
+
+  test "still rejects .. even with leading slash":
+    let (valid, _, err) = validatePath(testRoot, "/../../../etc/passwd")
     check valid == false
     check err.len > 0
 

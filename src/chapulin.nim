@@ -43,7 +43,7 @@ proc usage() =
   echo "  --max-clients=N  Max concurrent transfers (default: 10)"
   echo "  --blocksize=N    Max blocksize (default: 65464)"
   echo "  --timeout=N      Timeout in seconds (default: 5)"
-  echo ""
+  echo "  --port-range=S:E Transfer port range for firewall (e.g., 6881:6889)"
   echo ""
   echo "General options:"
   echo "  --verbose        Show detailed output (debug level)"
@@ -64,6 +64,8 @@ when isMainModule:
     logLevel = llInfo
     writePolicy = wpDeny
     maxClients = 10
+    portRangeStart = 0
+    portRangeEnd = 0
 
   var p = initOptParser(commandLineParams())
   while true:
@@ -102,6 +104,17 @@ when isMainModule:
       of "max-clients":
         try: maxClients = parseInt(p.val)
         except ValueError: stderr.writeLine "Invalid max-clients: " & p.val; quit(2)
+      of "port-range":
+        let parts = p.val.split(':')
+        if parts.len != 2:
+          stderr.writeLine "Invalid port-range format (expected START:END): " & p.val; quit(2)
+        try:
+          portRangeStart = parseInt(parts[0])
+          portRangeEnd = parseInt(parts[1])
+        except ValueError:
+          stderr.writeLine "Invalid port-range: " & p.val; quit(2)
+        if portRangeStart <= 0 or portRangeEnd < portRangeStart:
+          stderr.writeLine "Invalid port-range: start must be > 0 and end >= start"; quit(2)
       else: stderr.writeLine "Unknown option: " & p.key; quit(2)
     of cmdArgument:
       case positionalIdx
@@ -186,6 +199,8 @@ when isMainModule:
     config.maxBlocksize = blocksize
     config.timeout = timeout
     config.retries = retries
+    config.portRangeStart = portRangeStart
+    config.portRangeEnd = portRangeEnd
 
     let serverLogger = newLogger(logLevel, stdoutOutput)
     let srv = newTftpServer(config, logger = serverLogger)

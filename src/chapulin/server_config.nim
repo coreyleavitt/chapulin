@@ -21,8 +21,13 @@ type
     minBlocksize*: int
     maxWindowsize*: int
     minWindowsize*: int
+    portRangeStart*: int  ## 0 = OS-assigned ephemeral ports (default)
+    portRangeEnd*: int    ## 0 = OS-assigned ephemeral ports (default)
     allowedHosts*: seq[string]
     deniedHosts*: seq[string]
+
+proc hasPortRange*(config: ServerConfig): bool =
+  config.portRangeStart > 0 and config.portRangeEnd >= config.portRangeStart
 
 proc newDefaultServerConfig*(rootDir: string): ServerConfig =
   ServerConfig(
@@ -37,6 +42,8 @@ proc newDefaultServerConfig*(rootDir: string): ServerConfig =
     minBlocksize: MinBlocksize,
     maxWindowsize: MaxWindowsize,
     minWindowsize: MinWindowsize,
+    portRangeStart: 0,
+    portRangeEnd: 0,
     allowedHosts: @[],
     deniedHosts: @[]
   )

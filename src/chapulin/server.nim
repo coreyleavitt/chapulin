@@ -215,7 +215,26 @@ proc handleRequest*(server: TftpServer, data: seq[byte],
   server.logger.info(direction & " " & pkt.filename & " from " &
                      clientHost & ":" & $clientPort)
 
-  let xferTransport = newUdpTransport(0)
+  var xferTransport: Transport
+  if server.config.hasPortRange():
+    # Try ports in the configured range
+    var bound = false
+    for port in server.config.portRangeStart .. server.config.portRangeEnd:
+      try:
+        xferTransport = newUdpTransport(port)
+        bound = true
+        break
+      except OSError:
+        continue  # port in use, try next
+    if not bound:
+      server.logger.error("No available ports in range " &
+        $server.config.portRangeStart & ":" & $server.config.portRangeEnd)
+      await sendError(newUdpTransport(0), clientHost, clientPort,
+                      errNotDefined, "Server has no available transfer ports")
+      return
+  else:
+    xferTransport = newUdpTransport(0)
+
   let startTime = epochTime()
   defer:
     if xferTransport.close != nil: xferTransport.close()

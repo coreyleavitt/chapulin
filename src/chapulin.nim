@@ -12,6 +12,9 @@ import chapulin/tftp_uri
 import chapulin/logging
 import std/[os, parseopt, strutils, times, asyncdispatch]
 
+when defined(withGui):
+  import ../gui/desktop/chapulin_gui
+
 const Version = "0.1.0"
 
 proc usage() =
@@ -23,6 +26,8 @@ proc usage() =
   echo "  chapulin put <host> <filename> [options]"
   echo "  chapulin put tftp://<host>[:<port>]/<filename> [options]"
   echo "  chapulin serve <rootdir> [options]"
+  when defined(withGui):
+    echo "  chapulin gui"
   echo ""
   echo "Client options:"
   echo "  --port=N         Server port (default: 69)"
@@ -196,6 +201,13 @@ when isMainModule:
                                    ipv6 = isIPv6(config.listenAddr))
     waitFor srv.run(listener)
     listener.close()
+
+  of "gui":
+    when defined(withGui):
+      launchGui()
+    else:
+      stderr.writeLine "GUI not available (build with -d:withGui)"
+      quit(1)
 
   else:
     if command.len == 0:

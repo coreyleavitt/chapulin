@@ -44,7 +44,7 @@ proc makeCallbacks(err: ErrorRef): TransferCallbacks =
 suite "Integration - GET":
   test "download small file":
     skipIfNoServer()
-    let outPath = "/tmp/chapulin_int_hello.txt"
+    let outPath = getTempDir() / "chapulin_int_hello.txt"
     defer: removeFile(outPath)
 
     let errRef = newErrorRef()
@@ -63,7 +63,7 @@ suite "Integration - GET":
 
   test "download 10KB binary file":
     skipIfNoServer()
-    let outPath = "/tmp/chapulin_int_random.bin"
+    let outPath = getTempDir() / "chapulin_int_random.bin"
     defer: removeFile(outPath)
 
     let errRef = newErrorRef()
@@ -79,7 +79,7 @@ suite "Integration - GET":
 
   test "download nonexistent file":
     skipIfNoServer()
-    let outPath = "/tmp/chapulin_int_missing.txt"
+    let outPath = getTempDir() / "chapulin_int_missing.txt"
     defer: removeFile(outPath)
 
     let errRef = newErrorRef()
@@ -93,7 +93,7 @@ suite "Integration - GET":
 
   test "download with custom blocksize":
     skipIfNoServer()
-    let outPath = "/tmp/chapulin_int_bs.bin"
+    let outPath = getTempDir() / "chapulin_int_bs.bin"
     defer: removeFile(outPath)
 
     let errRef = newErrorRef()
@@ -110,11 +110,11 @@ suite "Integration - GET":
 
 suite "Integration - PUT":
   setup:
-    let uploadFile = "/tmp/chapulin_int_upload.txt"
+    let uploadFile = getTempDir() / "chapulin_int_upload.txt"
     writeFile(uploadFile, "Test upload content from chapulin integration test\n")
 
   teardown:
-    removeFile("/tmp/chapulin_int_upload.txt")
+    removeFile(getTempDir() / "chapulin_int_upload.txt")
 
   test "upload small file":
     skipIfNoServer()
@@ -134,7 +134,7 @@ suite "Integration - PUT":
 suite "Integration - Progress":
   test "progress callback fires during multi-block download":
     skipIfNoServer()
-    let outPath = "/tmp/chapulin_int_progress.bin"
+    let outPath = getTempDir() / "chapulin_int_progress.bin"
     defer: removeFile(outPath)
 
     let progressCount = new int
@@ -160,7 +160,7 @@ suite "Integration - Progress":
 suite "Integration - Large file (>128KB, block numbers >255)":
   test "download 256KB file — proves byte order works for block >255":
     skipIfNoServer()
-    let outPath = "/tmp/chapulin_int_large.bin"
+    let outPath = getTempDir() / "chapulin_int_large.bin"
     defer: removeFile(outPath)
 
     let errRef3 = newErrorRef()
@@ -209,7 +209,7 @@ suite "Self-hosted server setup":
 
 suite "Self-hosted - Client GET from our server":
   test "download small file":
-    let outPath = "/tmp/chapulin_self_get.txt"
+    let outPath = getTempDir() / "chapulin_self_get.txt"
     defer: removeFile(outPath)
     let errRef = newErrorRef()
     let callbacks = makeCallbacks(errRef)
@@ -225,7 +225,7 @@ suite "Self-hosted - Client GET from our server":
     check readFile(outPath) == "Self-test file content"
 
   test "download multi-block file":
-    let outPath = "/tmp/chapulin_self_multi.bin"
+    let outPath = getTempDir() / "chapulin_self_multi.bin"
     defer: removeFile(outPath)
     let errRef = newErrorRef()
     let callbacks = makeCallbacks(errRef)
@@ -240,7 +240,7 @@ suite "Self-hosted - Client GET from our server":
     check result.bytesTransferred == 2000
 
   test "file not found":
-    let outPath = "/tmp/chapulin_self_missing.txt"
+    let outPath = getTempDir() / "chapulin_self_missing.txt"
     defer: removeFile(outPath)
     let errRef = newErrorRef()
     let callbacks = makeCallbacks(errRef)
@@ -252,7 +252,7 @@ suite "Self-hosted - Client GET from our server":
     check result.success == false
 
   test "path traversal rejected":
-    let outPath = "/tmp/chapulin_self_traversal.txt"
+    let outPath = getTempDir() / "chapulin_self_traversal.txt"
     defer: removeFile(outPath)
     let errRef = newErrorRef()
     let callbacks = makeCallbacks(errRef)
@@ -265,7 +265,7 @@ suite "Self-hosted - Client GET from our server":
 
 suite "Self-hosted - Client PUT to our server":
   test "upload small file":
-    let uploadPath = "/tmp/chapulin_self_upload_src.txt"
+    let uploadPath = getTempDir() / "chapulin_self_upload_src.txt"
     writeFile(uploadPath, "Uploaded via self-test")
     defer: removeFile(uploadPath)
     let clientConfig = TftpClientConfig(
@@ -292,7 +292,7 @@ suite "Self-hosted - Client PUT to our server":
     check readFile(selfTestRoot / "writable.txt") == "Uploaded via self-test"
 
   test "upload with options (tsize)":
-    let uploadPath = "/tmp/chapulin_self_upload_opt.txt"
+    let uploadPath = getTempDir() / "chapulin_self_upload_opt.txt"
     writeFile(uploadPath, "Options upload test")
     defer: removeFile(uploadPath)
     let errRef = newErrorRef()
@@ -313,13 +313,13 @@ suite "Self-hosted - Concurrent transfers":
       let errRef1 = newErrorRef()
       let cb1 = makeCallbacks(errRef1)
       let req1 = newTransferRequest("127.0.0.1", selfTestPort,
-                                     "multiblock.bin", "/tmp/chapulin_conc1.bin", tdGet)
+                                     "multiblock.bin", getTempDir() / "chapulin_conc1.bin", tdGet)
       let udp1 = newUdpTransport()
 
       let errRef2 = newErrorRef()
       let cb2 = makeCallbacks(errRef2)
       let req2 = newTransferRequest("127.0.0.1", selfTestPort,
-                                     "readme.txt", "/tmp/chapulin_conc2.txt", tdGet)
+                                     "readme.txt", getTempDir() / "chapulin_conc2.txt", tdGet)
       let udp2 = newUdpTransport()
 
       # Launch both transfers concurrently on the event loop
@@ -335,8 +335,8 @@ suite "Self-hosted - Concurrent transfers":
 
     let (result1, result2) = waitFor twoGets()
     defer:
-      removeFile("/tmp/chapulin_conc1.bin")
-      removeFile("/tmp/chapulin_conc2.txt")
+      removeFile(getTempDir() / "chapulin_conc1.bin")
+      removeFile(getTempDir() / "chapulin_conc2.txt")
 
     if not result1.success:
       echo "  Concurrent GET 1 error: " & result1.errorMsg
@@ -345,7 +345,7 @@ suite "Self-hosted - Concurrent transfers":
     check result1.success == true
     check result2.success == true
     check result1.bytesTransferred == 2000
-    check readFile("/tmp/chapulin_conc2.txt") == "Self-test file content"
+    check readFile(getTempDir() / "chapulin_conc2.txt") == "Self-test file content"
 
 suite "Self-hosted server teardown":
   test "stop server and clean up":

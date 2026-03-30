@@ -116,7 +116,7 @@ proc serverWorker() {.thread.} =
     serverChannel.send(TransferMsg(kind: mkLog,
                                     logMsg: "[INFO]  Server stopped"))
 
-when isMainModule:
+proc launchGui*() =
   app.init()
 
   var window = newWindow("chapulin")

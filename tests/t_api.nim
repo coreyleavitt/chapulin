@@ -24,7 +24,7 @@ suite "API - startGetTransfer":
       onError: proc(code: int, msg: string) = errorCalled = true
     )
 
-    let req = newTransferRequest("127.0.0.1", 69, "test.txt", "/tmp/test_out.bin", tdGet)
+    let req = newTransferRequest("127.0.0.1", 69, "test.txt", getTempDir() / "test_out.bin", tdGet)
     let result = waitFor executeTransfer(req, callbacks, mt.toTransport)
 
     check result.success == true
@@ -48,7 +48,7 @@ suite "API - startGetTransfer":
       onError: proc(code: int, msg: string) = errorCalled = true; errorMessage = msg
     )
 
-    let req = newTransferRequest("127.0.0.1", 69, "missing.txt", "/tmp/test_out.bin", tdGet)
+    let req = newTransferRequest("127.0.0.1", 69, "missing.txt", getTempDir() / "test_out.bin", tdGet)
     let result = waitFor executeTransfer(req, callbacks, mt.toTransport)
 
     check result.success == false
@@ -59,11 +59,11 @@ suite "API - startGetTransfer":
 suite "API - startPutTransfer":
   setup:
     # Create a small temp file for upload tests
-    let testFile = "/tmp/chapulin_test_upload.bin"
+    let testFile = getTempDir() / "chapulin_test_upload.bin"
     writeFile(testFile, "hello world")
 
   teardown:
-    removeFile("/tmp/chapulin_test_upload.bin")
+    removeFile(getTempDir() / "chapulin_test_upload.bin")
 
   test "successful upload invokes progress and complete":
     let mt = newMockState()
@@ -80,7 +80,7 @@ suite "API - startPutTransfer":
     )
 
     let req = newTransferRequest("127.0.0.1", 69, "upload.txt",
-                                  "/tmp/chapulin_test_upload.bin", tdPut)
+                                  getTempDir() / "chapulin_test_upload.bin", tdPut)
     let result = waitFor executeTransfer(req, callbacks, mt.toTransport)
 
     check result.success == true
@@ -89,7 +89,7 @@ suite "API - startPutTransfer":
 
 suite "API - TransferRequest defaults":
   test "default options are sensible":
-    let req = newTransferRequest("10.0.0.1", 69, "config.bin", "/tmp/out", tdGet)
+    let req = newTransferRequest("10.0.0.1", 69, "config.bin", getTempDir() / "out", tdGet)
     check req.host == "10.0.0.1"
     check req.port == 69
     check req.options.blocksize == 512
@@ -113,7 +113,7 @@ suite "API - cancellation":
       onError: proc(code: int, msg: string) = errorCalled = true
     )
 
-    let req = newTransferRequest("127.0.0.1", 69, "big.bin", "/tmp/out", tdGet)
+    let req = newTransferRequest("127.0.0.1", 69, "big.bin", getTempDir() / "out", tdGet)
 
     # Cancel after 3 progress callbacks
     let cancelAfter = 3
@@ -163,7 +163,7 @@ suite "API - file I/O error handling":
     )
 
     let req = newTransferRequest("127.0.0.1", 69, "upload.txt",
-                                  "/tmp/this_file_does_not_exist.bin", tdPut)
+                                  getTempDir() / "this_file_does_not_exist.bin", tdPut)
     try:
       let result = waitFor executeTransfer(req, callbacks, mt.toTransport)
       check result.success == false

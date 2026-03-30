@@ -146,9 +146,13 @@ jobs:
           nim-version: stable
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install LLVM/Clang (Linux)
+      - name: Install LLVM/Clang + GTK3 (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y clang lld
+        run: sudo apt-get update && sudo apt-get install -y clang lld libgtk-3-dev
+
+      - name: Install GTK3 (macOS)
+        if: runner.os == 'macOS'
+        run: brew install gtk+3
 
       - name: Install dependencies
         run: nimble install -d -y
@@ -157,7 +161,8 @@ jobs:
         if: runner.os == 'Linux'
         run: >
           nim c
-          -d:release
+          -d:release -d:withGui
+          --threads:on
           --cc:clang
           --passC:"-flto -O2 -march=x86-64-v2"
           --passL:"-flto -fuse-ld=lld"
@@ -169,7 +174,8 @@ jobs:
         if: runner.os == 'macOS'
         run: >
           nim c
-          -d:release
+          -d:release -d:withGui
+          --threads:on
           --cc:clang
           --passC:"-flto -O2"
           --passL:"-flto"
@@ -181,7 +187,8 @@ jobs:
         if: runner.os == 'Windows'
         run: >
           nim c
-          -d:release
+          -d:release -d:withGui
+          --threads:on
           --cc:vcc
           --passC:"/GL /O2"
           --passL:"/LTCG"

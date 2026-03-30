@@ -36,12 +36,8 @@ jobs:
       - name: Run unit tests
         run: nimble test
 
-      - name: Build CLI
-        run: nim c -d:release -o:chapulin src/chapulin.nim
-
-      - name: Build GUI (Linux/macOS)
-        if: runner.os != 'Windows'
-        run: nim c --threads:on -d:release -o:chapulin_gui gui/desktop/chapulin_gui.nim
+      - name: Build (with GUI)
+        run: nim c --threads:on -d:withGui -d:release -o:chapulin src/chapulin.nim
 
   lint:
     runs-on: ubuntu-latest

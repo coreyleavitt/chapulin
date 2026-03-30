@@ -135,6 +135,7 @@ proc launchGui*() =
   # === Tab buttons ===
   let tabRow = newLayoutContainer(Layout_Horizontal)
   tabRow.spacing = 8
+  tabRow.widthMode = WidthMode_Expand
   rootContainer.add(tabRow)
   let clientTabBtn = newButton("    Client    ")
   let serverTabBtn = newButton("    Server    ")
@@ -152,6 +153,7 @@ proc launchGui*() =
   # Connection
   let connRow = newLayoutContainer(Layout_Horizontal)
   connRow.spacing = 8
+  connRow.widthMode = WidthMode_Expand
   clientPanel.add(connRow)
   connRow.add(newLabel("Host:"))
   let hostInput = newTextBox("192.168.1.1")
@@ -165,6 +167,7 @@ proc launchGui*() =
   # Remote file
   let fileRow = newLayoutContainer(Layout_Horizontal)
   fileRow.spacing = 8
+  fileRow.widthMode = WidthMode_Expand
   clientPanel.add(fileRow)
   fileRow.add(newLabel("Remote file:"))
   let remoteFileInput = newTextBox("")
@@ -174,6 +177,7 @@ proc launchGui*() =
   # Local file
   let localRow = newLayoutContainer(Layout_Horizontal)
   localRow.spacing = 8
+  localRow.widthMode = WidthMode_Expand
   clientPanel.add(localRow)
   localRow.add(newLabel("Local file:"))
   let localFileInput = newTextBox("")
@@ -185,6 +189,7 @@ proc launchGui*() =
   # Options
   let optRow = newLayoutContainer(Layout_Horizontal)
   optRow.spacing = 8
+  optRow.widthMode = WidthMode_Expand
   clientPanel.add(optRow)
   optRow.add(newLabel("Direction:"))
   let dirCombo = newComboBox(@["GET (Download)", "PUT (Upload)"])
@@ -196,6 +201,7 @@ proc launchGui*() =
   # Client actions
   let clientActionRow = newLayoutContainer(Layout_Horizontal)
   clientActionRow.spacing = 8
+  clientActionRow.widthMode = WidthMode_Expand
   clientPanel.add(clientActionRow)
   let startBtn = newButton("Start Transfer")
   startBtn.widthMode = WidthMode_Expand
@@ -229,6 +235,7 @@ proc launchGui*() =
   # Server config
   let srvRow1 = newLayoutContainer(Layout_Horizontal)
   srvRow1.spacing = 8
+  srvRow1.widthMode = WidthMode_Expand
   serverPanel.add(srvRow1)
   srvRow1.add(newLabel("Root dir:"))
   let rootDirInput = newTextBox("")
@@ -239,6 +246,7 @@ proc launchGui*() =
 
   let srvRow2 = newLayoutContainer(Layout_Horizontal)
   srvRow2.spacing = 8
+  srvRow2.widthMode = WidthMode_Expand
   serverPanel.add(srvRow2)
   srvRow2.add(newLabel("Port:"))
   let srvPortInput = newTextBox("69")
@@ -255,6 +263,7 @@ proc launchGui*() =
   # Server actions
   let srvActionRow = newLayoutContainer(Layout_Horizontal)
   srvActionRow.spacing = 8
+  srvActionRow.widthMode = WidthMode_Expand
   serverPanel.add(srvActionRow)
   let srvStartBtn = newButton("Start Server")
   srvStartBtn.widthMode = WidthMode_Expand

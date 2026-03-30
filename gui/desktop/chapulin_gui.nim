@@ -122,6 +122,8 @@ proc launchGui*() =
   var window = newWindow("chapulin — TFTP Client & Server")
   window.width = 680
   window.height = 620
+  window.minWidth = 620
+  window.minHeight = 480
 
   let rootContainer = newLayoutContainer(Layout_Vertical)
   rootContainer.padding = 12

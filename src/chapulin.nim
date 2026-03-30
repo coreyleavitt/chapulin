@@ -50,6 +50,7 @@ proc usage() =
   echo "  --checksum=MODE  Generate checksum sidecar after read (md5 or none)"
   echo ""
   echo "General options:"
+  echo "  --notify         Audible bell on transfer completion"
   echo "  --verbose        Show detailed output (debug level)"
   echo "  --quiet          Suppress all output except errors"
   echo "  --help           Show this help"
@@ -66,6 +67,7 @@ when isMainModule:
     timeout = DefaultTimeout
     retries = DefaultRetries
     logLevel = llInfo
+    notify = false
     writePolicy = wpDeny
     maxClients = 10
     portRangeStart = 0
@@ -83,6 +85,7 @@ when isMainModule:
     of cmdShortOption, cmdLongOption:
       case p.key.toLowerAscii
       of "help", "h": usage(); quit(0)
+      of "notify": notify = true
       of "verbose": logLevel = llDebug
       of "quiet", "q": logLevel = llError
       of "version", "v": echo "chapulin v" & Version; quit(0)
@@ -179,6 +182,7 @@ when isMainModule:
     let completeCb = proc() =
       let elapsed = epochTime() - startTime
       echo "\nTransfer complete (" & elapsed.formatFloat(ffDecimal, 2) & "s)"
+      if notify: stdout.write "\a"; stdout.flushFile
     let errorCb = proc(code: int, msg: string) =
       stderr.writeLine "\nError: " & msg
     let callbacks = TransferCallbacks(
@@ -218,7 +222,12 @@ when isMainModule:
     config.dirListFile = dirListFile
     config.checksumMode = checksumMode
 
-    let serverLogger = newLogger(logLevel, stdoutOutput)
+    let serverOutput: LogOutput = proc(level: LogLevel, msg: string) =
+      echo formatLogMessage(level, msg)
+      # Bell on transfer completion (info messages containing "OK")
+      if notify and level == llInfo and " OK " in msg:
+        stdout.write "\a"; stdout.flushFile
+    let serverLogger = newLogger(logLevel, serverOutput)
     let srv = newTftpServer(config, logger = serverLogger)
 
     serverLogger.info("chapulin server v" & Version)

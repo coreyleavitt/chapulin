@@ -27,5 +27,16 @@ test-files/large.bin
 .DS_Store
 Thumbs.db
 
+# Fuzz artifacts (crash inputs are security-sensitive)
+fuzz/fuzz_decode
+fuzz/fuzz_validate_path
+fuzz/fuzz_parse_uri
+fuzz/fuzz_parse_options
+fuzz/fuzz_roundtrip
+crash-*
+leak-*
+timeout-*
+oom-*
+
 # Claude
 .claude/

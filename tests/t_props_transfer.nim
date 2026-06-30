@@ -1,14 +1,13 @@
 ## Property-based tests for the transfer state machines (transfer.nim).
 ##
 ## Connects the REAL sendBlocks and recvBlocks over an in-memory async wire and
-## asserts the receiver reconstructs the sender's bytes for arbitrary file
-## sizes, block sizes, and window sizes. Running both real implementations
-## against each other (rather than a scripted mock) exercises the actual
-## window / final-block / ACK logic on both sides.
+## asserts invariants across arbitrary file sizes, block sizes, window sizes,
+## and — via a generated per-packet schedule — adversarial networks (drops,
+## duplicates, reordering). Running both real implementations against each
+## other exercises the actual window / final-block / ACK / retransmit logic.
 ##
-## This is the harness the scriptable-mock-network work (issue #15) extends:
-## this first slice uses a lossless wire; a generated NetworkSchedule (drops,
-## duplicates, reordering) plugs into `makeTransport` next.
+## This is the scriptable-mock-network harness (issue #15): the NetworkSchedule
+## is plain data (seq[WireAction]), so proptest generates and shrinks it.
 ##
 ## Run in the nim devtools container (deps resolved on the host by milpa):
 ##   docker run --rm -v ${PWD}:C:\app ghcr.io/coreyleavitt/nim:2.2.10 \
@@ -22,35 +21,61 @@ proc toByteSeq(xs: seq[int]): seq[byte] =
   result = newSeq[byte](xs.len)
   for i, x in xs: result[i] = byte(x and 0xFF)
 
-type Wire = ref object
-  a2b: Deque[seq[byte]]   # sender -> receiver
-  b2a: Deque[seq[byte]]   # receiver -> sender
-  dups: seq[bool]         # per-send: deliver the packet twice? (empty = never)
-  dupIdx: int
+type
+  WireAction = enum
+    waPass    ## deliver normally
+    waDrop    ## drop the packet
+    waDup     ## deliver twice
+    waDelay   ## hold; release after the next delivered packet (reorder)
 
-proc newWire(dups: seq[bool] = @[]): Wire =
-  Wire(a2b: initDeque[seq[byte]](), b2a: initDeque[seq[byte]](), dups: dups)
+  Wire = ref object
+    a2b: Deque[seq[byte]]    # sender -> receiver
+    b2a: Deque[seq[byte]]    # receiver -> sender
+    actions: seq[WireAction] # consumed per send; empty = always waPass
+    idx: int
+    pendA: seq[seq[byte]]    # held sender->receiver packet (0/1)
+    pendB: seq[seq[byte]]    # held receiver->sender packet (0/1)
 
-proc nextDup(w: Wire): bool =
-  if w.dups.len == 0: return false
-  result = w.dups[w.dupIdx mod w.dups.len]
-  inc w.dupIdx
+proc newWire(actions: seq[WireAction] = @[]): Wire =
+  Wire(a2b: initDeque[seq[byte]](), b2a: initDeque[seq[byte]](), actions: actions)
 
-proc deliver(w: Wire, isSender: bool, data: seq[byte]) =
-  let twice = w.nextDup()
-  if isSender:
-    w.a2b.addLast(data)
-    if twice: w.a2b.addLast(data)
-  else:
-    w.b2a.addLast(data)
-    if twice: w.b2a.addLast(data)
+proc nextAction(w: Wire): WireAction =
+  if w.actions.len == 0: return waPass
+  result = w.actions[w.idx mod w.actions.len]
+  inc w.idx
+
+# Apply the next scheduled action to a packet sent in one direction.
+proc wireSend(w: Wire, isSender: bool, data: seq[byte]) =
+  case w.nextAction()
+  of waPass:
+    if isSender:
+      w.a2b.addLast(data)
+      if w.pendA.len > 0: w.a2b.addLast(w.pendA[0]); w.pendA = @[]
+    else:
+      w.b2a.addLast(data)
+      if w.pendB.len > 0: w.b2a.addLast(w.pendB[0]); w.pendB = @[]
+  of waDup:
+    if isSender:
+      w.a2b.addLast(data)
+      w.a2b.addLast(data)
+    else:
+      w.b2a.addLast(data)
+      w.b2a.addLast(data)
+  of waDrop:
+    discard
+  of waDelay:
+    if isSender:
+      if w.pendA.len == 0: w.pendA = @[data] else: w.a2b.addLast(data)
+    else:
+      if w.pendB.len == 0: w.pendB = @[data] else: w.b2a.addLast(data)
 
 # A transport over one direction of the wire. `recv` yields to the dispatcher
-# until a packet is available, bounded by a spin budget so a stall fails fast
-# (TransportTimeoutError) instead of hanging the test.
+# until a packet is available, bounded by a spin budget so a stall raises
+# TransportTimeoutError (which the transfer treats as a lost packet) instead of
+# hanging.
 proc makeTransport(w: Wire, isSender: bool): Transport =
   proc doSend(data: seq[byte], host: string, port: int): Future[void] {.async.} =
-    w.deliver(isSender, data)
+    w.wireSend(isSender, data)
 
   proc doRecv(bufSize: int, timeoutMs: int): Future[tuple[data: seq[byte],
               host: string, port: int]] {.async.} =
@@ -61,7 +86,7 @@ proc makeTransport(w: Wire, isSender: bool): Transport =
       else:
         if w.a2b.len > 0: return (w.a2b.popFirst(), "peer", 0)
       inc spins
-      if spins > 5000:
+      if spins > 500:
         raise newException(TransportTimeoutError, "wire idle")
       await sleepAsync(0)
 
@@ -69,11 +94,11 @@ proc makeTransport(w: Wire, isSender: bool): Transport =
 
   Transport(send: doSend, recv: doRecv, close: doClose)
 
-# Drive a real sender and receiver to completion over a lossless wire.
-# Returns (both succeeded, received bytes, receiver's reported byte count).
+# Drive a real sender and receiver to completion over the wire.
 proc runTransfer(content: seq[byte], blocksize, windowsize: int,
-                 dups: seq[bool] = @[]): (bool, seq[byte], int64) =
-  let w = newWire(dups)
+                 actions: seq[WireAction] = @[]):
+    tuple[terminated, ok: bool, received: seq[byte], n: int64] =
+  let w = newWire(actions)
   let cfg = newTransferConfig(blocksize = blocksize, timeout = 5, retries = 3,
                               windowsize = windowsize,
                               totalSize = content.len.int64)
@@ -97,30 +122,51 @@ proc runTransfer(content: seq[byte], blocksize, windowsize: int,
     if not hasPendingOperations(): break
     poll()
     inc steps
-    if steps > 500_000: break
+    if steps > 100_000: break
 
-  if not (sf.finished and rf.finished):
-    return (false, received, -1)
+  let terminated = sf.finished and rf.finished
+  if not terminated:
+    return (false, false, received, -1'i64)
   let sres = sf.read()
   let rres = rf.read()
-  return (sres.success and rres.success, received, rres.bytesTransferred)
+  return (terminated, sres.success and rres.success, received, rres.bytesTransferred)
 
-proc fileContents(): Strategy[seq[byte]] =
-  lists(integers(0, 255), minLen = 0, maxLen = 2048).map(toByteSeq)
+proc fileContents(maxLen = 2048): Strategy[seq[byte]] =
+  lists(integers(0, 255), minLen = 0, maxLen = maxLen).map(toByteSeq)
 
-suite "transfer state-machine properties (lossless wire)":
+proc dupActions(): Strategy[seq[WireAction]] =
+  # Pass-biased, duplicates only — recovery is not needed, so success is required.
+  lists(sampledFrom(@[waPass, waPass, waDup]), minLen = 1, maxLen = 32)
 
-  property "receiver reconstructs sender's bytes across block/window sizes":
+proc anyActions(): Strategy[seq[WireAction]] =
+  lists(sampledFrom(@[waPass, waPass, waPass, waDrop, waDup, waDelay]),
+        minLen = 1, maxLen = 20)
+
+suite "transfer state-machine properties":
+
+  property "lossless: receiver reconstructs sender's bytes across block/window sizes":
     given content in fileContents(),
           blocksize in integers(8, 512),
           windowsize in integers(1, 8)
-    let (ok, received, n) = runTransfer(content, blocksize, windowsize)
-    ensure ok and received == content and n == content.len.int64
+    let r = runTransfer(content, blocksize, windowsize)
+    ensure r.terminated and r.ok and r.received == content and
+           r.n == content.len.int64
 
   property "duplicated packets do not corrupt the transfer (Sorcerer's Apprentice)":
-    given content in lists(integers(0, 255), minLen = 0, maxLen = 1024).map(toByteSeq),
+    given content in fileContents(1024),
           blocksize in integers(8, 256),
           windowsize in integers(1, 4),
-          dups in lists(booleans(), minLen = 1, maxLen = 32)
-    let (ok, received, n) = runTransfer(content, blocksize, windowsize, dups)
-    ensure ok and received == content and n == content.len.int64
+          actions in dupActions()
+    let r = runTransfer(content, blocksize, windowsize, actions)
+    ensure r.terminated and r.ok and r.received == content and
+           r.n == content.len.int64
+
+  property "any drop/dup/reorder schedule terminates; bytes correct on success":
+    # Robustness: no schedule may crash, hang, or deliver wrong bytes. Recovery
+    # (success) is NOT required — drops beyond the retry budget fail cleanly.
+    given content in fileContents(384),
+          blocksize in integers(8, 256),
+          windowsize in integers(1, 4),
+          actions in anyActions()
+    let r = runTransfer(content, blocksize, windowsize, actions)
+    ensure r.terminated and (not r.ok or r.received == content)

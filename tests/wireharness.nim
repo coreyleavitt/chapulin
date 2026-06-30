@@ -128,3 +128,18 @@ proc driveBoth*[T](a, b: Future[T], maxSteps = 100_000): bool =
     inc steps
     if steps > maxSteps: break
   a.finished and b.finished
+
+proc driveAll*[T](futs: seq[Future[T]], maxSteps = 200_000): bool =
+  ## Pump the dispatcher until every future finishes or the cap is hit. Used to
+  ## interleave several concurrent transfers on the one event loop.
+  proc allDone(): bool =
+    for f in futs:
+      if not f.finished: return false
+    true
+  var steps = 0
+  while not allDone():
+    if not hasPendingOperations(): break
+    poll()
+    inc steps
+    if steps > maxSteps: break
+  allDone()

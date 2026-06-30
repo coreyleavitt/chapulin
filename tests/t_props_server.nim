@@ -2,14 +2,15 @@
 ##
 ## Connects the REAL client engine (getFile / putFile) to the REAL server
 ## handlers (handleRrq / handleWrq) over the shared in-memory wire, against real
-## temp files. Exercises path validation, the request->serve/store flow, and the
-## file I/O on both sides for arbitrary payloads.
+## temp files. Exercises path validation, the request->serve/store flow, file
+## I/O on both sides, and isolation of concurrent transfers interleaved on one
+## event loop.
 ##
 ## Run in the nim devtools container (deps resolved on the host by milpa):
 ##   docker run --rm -v ${PWD}:C:\app ghcr.io/coreyleavitt/nim:2.2.10 \
 ##     nim c -r tests/t_props_server.nim
 
-import std/[unittest, os]
+import std/[unittest, os, asyncdispatch]   # asyncdispatch: Future type only
 import proptest
 import ../src/chapulin/protocol
 import ../src/chapulin/engine          # getFile, putFile, newDefaultConfig
@@ -27,62 +28,100 @@ proc toBytes(s: string): seq[byte] =
   result = newSeq[byte](s.len)
   for i in 0 ..< s.len: result[i] = byte(s[i])
 
-# RRQ: server serves a file on disk to a real client. Server drives a2b (DATA),
-# client drives b2a (RRQ/ACK).
-proc serveRrq(content: seq[byte]): tuple[ok: bool, received: seq[byte]] =
-  createDir(serverRoot)
-  let fname = "served.bin"
-  writeFile(serverRoot / fname, toStr(content))
+proc clientConfig(): TftpClientConfig =
+  result = newDefaultConfig()
+  result.requestTsize = false
+
+# --- per-transfer setup (futures created, not yet driven) -------------------
+
+# RRQ: server serves `fname` (already on disk) to a real client. Server drives
+# a2b (DATA), client drives b2a (RRQ/ACK); the client's RRQ is swallowed (it
+# would reach the listener, not the per-transfer socket).
+proc setupRrq(w: Wire, fname: string):
+    tuple[sf, cf: Future[TransferResult], received: ref seq[byte]] =
   let cfg = newDefaultServerConfig(serverRoot)
   let request = TftpPacket(opcode: opRrq, filename: fname, mode: tmOctet,
                            options: @[])
-  var ccfg = newDefaultConfig()
-  ccfg.requestTsize = false
-  let w = newWire()
-  var received: seq[byte]
-  let onData = proc(blockNum: uint16, data: seq[byte]) = received.add data
-  let serverF = handleRrq(cfg, request, makeTransport(w, true), "peer", 0)
-  let clientF = getFile(makeTransport(w, false, swallowFirst = true), ccfg,
-                        "peer", 0, fname, onData)
-  if not driveBoth(serverF, clientF): return (false, received)
-  return (futVal(serverF).success and futVal(clientF).success, received)
+  var received: ref seq[byte]
+  new(received)
+  let onData = proc(blockNum: uint16, data: seq[byte]) = received[].add data
+  let sf = handleRrq(cfg, request, makeTransport(w, true), "peer", 0)
+  let cf = getFile(makeTransport(w, false, swallowFirst = true), clientConfig(),
+                   "peer", 0, fname, onData)
+  (sf, cf, received)
 
-# WRQ: client uploads to the server, which stores it on disk. Client drives a2b
-# (WRQ/DATA), server drives b2a (ACK).
-proc recvWrq(content: seq[byte]): tuple[ok: bool, written: seq[byte]] =
-  createDir(serverRoot)
-  let fname = "uploaded.bin"
+# WRQ: client uploads `content` to the server, stored at `fname`.
+proc setupWrq(w: Wire, fname: string, content: seq[byte]):
+    tuple[sf, cf: Future[TransferResult]] =
   var cfg = newDefaultServerConfig(serverRoot)
   cfg.writePolicy = wpCreateOrOverwrite
   let request = TftpPacket(opcode: opWrq, filename: fname, mode: tmOctet,
                            options: @[])
-  var ccfg = newDefaultConfig()
-  ccfg.requestTsize = false
   let readData = proc(blockNum: uint16, bs: int): seq[byte] =
     let start = (int(blockNum) - 1) * bs
     if start >= content.len: return @[]
     return content[start ..< min(start + bs, content.len)]
-  let w = newWire()
-  let clientF = putFile(makeTransport(w, true, swallowFirst = true), ccfg,
-                        "peer", 0, fname, readData)
-  let serverF = handleWrq(cfg, request, makeTransport(w, false), "peer", 0)
-  if not driveBoth(serverF, clientF): return (false, @[])
-  let ok = futVal(serverF).success and futVal(clientF).success
-  var written: seq[byte]
-  if fileExists(serverRoot / fname):
-    written = toBytes(readFile(serverRoot / fname))
-  return (ok, written)
+  let cf = putFile(makeTransport(w, true, swallowFirst = true), clientConfig(),
+                   "peer", 0, fname, readData)
+  let sf = handleWrq(cfg, request, makeTransport(w, false), "peer", 0)
+  (sf, cf)
 
-# RRQ for a filename the server must refuse to serve.
+# --- single-transfer runners ------------------------------------------------
+
+proc serveRrq(content: seq[byte]): tuple[ok: bool, received: seq[byte]] =
+  createDir(serverRoot)
+  writeFile(serverRoot / "served.bin", toStr(content))
+  let (sf, cf, received) = setupRrq(newWire(), "served.bin")
+  if not driveBoth(sf, cf): return (false, received[])
+  (futVal(sf).success and futVal(cf).success, received[])
+
+proc recvWrq(content: seq[byte]): tuple[ok: bool, written: seq[byte]] =
+  createDir(serverRoot)
+  let (sf, cf) = setupWrq(newWire(), "uploaded.bin", content)
+  if not driveBoth(sf, cf): return (false, @[])
+  let ok = futVal(sf).success and futVal(cf).success
+  var written: seq[byte]
+  if fileExists(serverRoot / "uploaded.bin"):
+    written = toBytes(readFile(serverRoot / "uploaded.bin"))
+  (ok, written)
+
 proc rrqServed(filename: string): bool =
   createDir(serverRoot)
   let cfg = newDefaultServerConfig(serverRoot)
   let request = TftpPacket(opcode: opRrq, filename: filename, mode: tmOctet,
                            options: @[])
-  let w = newWire()
-  let serverF = handleRrq(cfg, request, makeTransport(w, true), "peer", 0)
+  let serverF = handleRrq(cfg, request, makeTransport(newWire(), true), "peer", 0)
   let done = driveOne(serverF)
   done and futVal(serverF).success
+
+# --- concurrent runners (interleaved on one event loop) ---------------------
+
+proc serveTwoRrq(c1, c2: seq[byte]): tuple[ok: bool, r1, r2: seq[byte]] =
+  createDir(serverRoot)
+  writeFile(serverRoot / "c1.bin", toStr(c1))
+  writeFile(serverRoot / "c2.bin", toStr(c2))
+  let (sf1, cf1, rec1) = setupRrq(newWire(), "c1.bin")
+  let (sf2, cf2, rec2) = setupRrq(newWire(), "c2.bin")
+  if not driveAll(@[sf1, cf1, sf2, cf2]): return (false, rec1[], rec2[])
+  let ok = futVal(sf1).success and futVal(cf1).success and
+           futVal(sf2).success and futVal(cf2).success
+  (ok, rec1[], rec2[])
+
+proc serveGetAndPut(getContent, putContent: seq[byte]):
+    tuple[ok: bool, got, put: seq[byte]] =
+  createDir(serverRoot)
+  writeFile(serverRoot / "cget.bin", toStr(getContent))
+  let (gsf, gcf, got) = setupRrq(newWire(), "cget.bin")
+  let (psf, pcf) = setupWrq(newWire(), "cput.bin", putContent)
+  if not driveAll(@[gsf, gcf, psf, pcf]): return (false, got[], @[])
+  let ok = futVal(gsf).success and futVal(gcf).success and
+           futVal(psf).success and futVal(pcf).success
+  var put: seq[byte]
+  if fileExists(serverRoot / "cput.bin"):
+    put = toBytes(readFile(serverRoot / "cput.bin"))
+  (ok, got[], put)
+
+# --- strategies -------------------------------------------------------------
 
 proc fileBytes(maxLen = 1024): Strategy[seq[byte]] =
   lists(integers(0, 255), minLen = 0, maxLen = maxLen).map(toByteSeq)
@@ -92,6 +131,8 @@ proc traversalNames(): Strategy[string] =
     proc(cs: seq[char]): string =
       result = "../"
       for c in cs: result.add c)
+
+# --- properties -------------------------------------------------------------
 
 suite "server handler properties (end-to-end over the wire)":
 
@@ -108,3 +149,15 @@ suite "server handler properties (end-to-end over the wire)":
   property "RRQ for a path-traversal filename is refused, never served":
     given seg in traversalNames()
     ensure not rrqServed(seg)
+
+suite "server concurrency isolation":
+
+  property "two concurrent RRQ transfers complete independently":
+    given c1 in fileBytes(768), c2 in fileBytes(768)
+    let r = serveTwoRrq(c1, c2)
+    ensure r.ok and r.r1 == c1 and r.r2 == c2
+
+  property "a concurrent GET and PUT do not interfere":
+    given getContent in fileBytes(768), putContent in fileBytes(768)
+    let r = serveGetAndPut(getContent, putContent)
+    ensure r.ok and r.got == getContent and r.put == putContent

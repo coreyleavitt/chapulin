@@ -10,7 +10,7 @@
 ##   docker run --rm -v ${PWD}:C:\app ghcr.io/coreyleavitt/nim:2.2.10 \
 ##     nim c -r tests/t_props_server.nim
 
-import std/[unittest, os, asyncdispatch, strutils, md5]  # asyncdispatch: Future only
+import std/[unittest, os, asyncdispatch, strutils, md5, tables]  # asyncdispatch: Future only
 import proptest
 import ../src/chapulin/protocol
 import ../src/chapulin/engine          # getFile, putFile, newDefaultConfig
@@ -356,6 +356,77 @@ suite "server features (listing, checksum)":
     for (k, _) in pxeOackOptions(blksize, windowsize): keys.add k.toLowerAscii
     ensure ("tsize" in keys) and ("blksize" notin keys) and
            ("windowsize" notin keys)
+
+# --- model-based sequence testing -------------------------------------------
+# Replay a generated sequence of uploads/downloads against a fresh server root
+# and a reference model (filename -> expected bytes). proptest shrinks the
+# sequence to a minimal failing trace.
+
+type
+  OpKind = enum okPut, okGet
+  Op = object
+    kind: OpKind
+    name: string
+    content: seq[byte]
+
+proc opStrategy(): Strategy[Op] =
+  # Pass-biased toward Put so Gets land on existing files; small name set so
+  # operations collide (overwrite, get-after-put).
+  sampledFrom(@[okPut, okPut, okGet]).flatMap(proc(k: OpKind): Strategy[Op] =
+    sampledFrom(@["a.bin", "b.bin", "c.bin"]).flatMap(proc(n: string): Strategy[Op] =
+      fileBytes(256).map(proc(c: seq[byte]): Op =
+        Op(kind: k, name: n, content: c))))
+
+proc wrqTo(dir, name: string, content: seq[byte]): bool =
+  var cfg = newDefaultServerConfig(dir)
+  cfg.writePolicy = wpCreateOrOverwrite
+  let request = TftpPacket(opcode: opWrq, filename: name, mode: tmOctet,
+                           options: @[])
+  let readData = proc(blockNum: uint16, bs: int): seq[byte] =
+    let start = (int(blockNum) - 1) * bs
+    if start >= content.len: return @[]
+    return content[start ..< min(start + bs, content.len)]
+  let w = newWire()
+  let cf = putFile(makeTransport(w, true, swallowFirst = true), clientConfig(),
+                   "peer", 0, name, readData)
+  let sf = handleWrq(cfg, request, makeTransport(w, false), "peer", 0)
+  discard driveBoth(sf, cf)
+  futVal(sf).success and futVal(cf).success
+
+proc rrqFrom(dir, name: string): tuple[ok: bool, got: seq[byte]] =
+  let cfg = newDefaultServerConfig(dir)
+  let request = TftpPacket(opcode: opRrq, filename: name, mode: tmOctet,
+                           options: @[])
+  let w = newWire()
+  var received: seq[byte]
+  let onData = proc(blockNum: uint16, data: seq[byte]) = received.add data
+  let sf = handleRrq(cfg, request, makeTransport(w, true), "peer", 0)
+  let cf = getFile(makeTransport(w, false, swallowFirst = true), clientConfig(),
+                   "peer", 0, name, onData)
+  discard driveBoth(sf, cf)
+  (futVal(sf).success and futVal(cf).success, received)
+
+suite "server filesystem model (operation sequences)":
+
+  property "uploads and downloads stay consistent with a file model":
+    given ops in lists(opStrategy(), minLen = 0, maxLen = 12)
+    let dir = serverRoot / "model"
+    removeDir(dir)
+    createDir(dir)
+    var model = initTable[string, seq[byte]]()
+    var ok = true
+    for op in ops:
+      case op.kind
+      of okPut:
+        if wrqTo(dir, op.name, op.content): model[op.name] = op.content
+        else: ok = false
+      of okGet:
+        let (gok, got) = rrqFrom(dir, op.name)
+        if op.name in model:
+          if not (gok and got == model[op.name]): ok = false
+        elif gok:
+          ok = false        # downloading a never-uploaded file must fail
+    ensure ok
 
 # Known bug — https://github.com/coreyleavitt/chapulin/issues/16. The server
 # negotiates and OACKs a windowsize but never applies it (handleRrq sets only

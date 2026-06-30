@@ -19,6 +19,8 @@ import ../src/chapulin/protocol
 import ../src/chapulin/options
 import ../src/chapulin/security
 import ../src/chapulin/tftp_uri
+import ../src/chapulin/transfer       # newPeer, updateRtt, effectiveTimeout
+import ../src/chapulin/server_config  # ServerConfig, checkHostAccess inputs
 
 # Structural equality for the variant packet — Nim's auto-generated `==` uses a
 # parallel `fields` iterator that rejects case objects, so define it explicitly.
@@ -210,3 +212,37 @@ suite "uri parsing properties":
     let parsed = parseTftpUri(uri)
     ensure parsed.host == host and parsed.port == port and
            parsed.filename == file and parsed.mode == mode
+
+suite "adaptive timeout properties (RFC 1123 / Jacobson)":
+
+  property "adaptive timeout stays >= 1000ms after any RTT samples":
+    given samples in lists(integers(0, 100_000), minLen = 1, maxLen = 20)
+    let peer = newPeer("h", 1)
+    for s in samples: peer.updateRtt(float(s))
+    ensure peer.adaptiveTimeout >= 1000
+
+  property "effectiveTimeout uses the adaptive value once measured, else config":
+    given samples in lists(integers(0, 100_000), minLen = 0, maxLen = 10),
+          cfgTimeout in integers(1, 30_000)
+    let peer = newPeer("h", 1)
+    for s in samples: peer.updateRtt(float(s))
+    let eff = peer.effectiveTimeout(cfgTimeout)
+    ensure (if samples.len == 0: eff == cfgTimeout else: eff >= 1000)
+
+suite "host access control properties":
+
+  proc hostNames(): Strategy[string] =
+    sampledFrom(@["10.0.0.1", "10.0.0.2", "192.168.1.1", "::1", "127.0.0.1"])
+
+  property "checkHostAccess: denylist wins; empty allowlist allows all":
+    given host in hostNames(),
+          allowed in lists(hostNames(), minLen = 0, maxLen = 4),
+          denied in lists(hostNames(), minLen = 0, maxLen = 4)
+    var cfg = newDefaultServerConfig("root")
+    cfg.allowedHosts = allowed
+    cfg.deniedHosts = denied
+    let expected =
+      if host in denied: false
+      elif allowed.len == 0: true
+      else: host in allowed
+    ensure checkHostAccess(cfg, host) == expected

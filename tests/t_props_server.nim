@@ -428,24 +428,23 @@ suite "server filesystem model (operation sequences)":
           ok = false        # downloading a never-uploaded file must fail
     ensure ok
 
-# Known bug — https://github.com/coreyleavitt/chapulin/issues/16. The server
-# negotiates and OACKs a windowsize but never applies it (handleRrq sets only
-# blocksize/totalSize), so it sends lock-step. Transfers still COMPLETE — the
-# client's window never fills, the server times out and retransmits each block,
-# and the duplicate-re-ACK unblocks it — but every block costs a retransmit,
-# which is pathologically slow on a real network. This test pins the desired
-# efficiency and FAILS today (the server sends ~2 packets per block). Run
-## nim c -r -d:knownFailing tests/t_props_server.nim
-when defined(knownFailing):
-  suite "server windowsize efficiency (known-failing: issue #16)":
-    test "a windowed RRQ sends ~one DATA per block (no per-block retransmit)":
-      createDir(serverRoot)
-      var content = newSeq[byte](2000)       # blocksize 100 => 20 blocks + final
-      for i in 0 ..< content.len: content[i] = byte(i and 0xFF)
-      writeFile(serverRoot / "win.bin", toStr(content))
-      let w = newWire()
-      let (sf, cf, received) = setupRrqOpts(w, "win.bin", 100, 8)
-      discard driveBoth(sf, cf)
-      check received[] == content            # correctness holds today
-      # ~21 DATA + 1 OACK when windowsize is applied; ~2x that with the bug.
-      check w.aSends() <= 25
+# Regression guard for https://github.com/coreyleavitt/chapulin/issues/16. The
+# server negotiates and OACKs a windowsize; before the fix it never APPLIED it
+# (handleRrq set only blocksize/totalSize), so it sent lock-step. Transfers still
+# completed — the client's window never filled, the server timed out and
+# retransmitted each block, and the duplicate-re-ACK unblocked it — but every
+# block cost a retransmit (~2 packets/block), pathologically slow on a real
+# network. handleRrq now copies neg.windowsize into xferConfig, so a windowed
+# RRQ sends ~one DATA per block.
+suite "server windowsize efficiency (issue #16)":
+  test "a windowed RRQ sends ~one DATA per block (no per-block retransmit)":
+    createDir(serverRoot)
+    var content = newSeq[byte](2000)       # blocksize 100 => 20 blocks + final
+    for i in 0 ..< content.len: content[i] = byte(i and 0xFF)
+    writeFile(serverRoot / "win.bin", toStr(content))
+    let w = newWire()
+    let (sf, cf, received) = setupRrqOpts(w, "win.bin", 100, 8)
+    discard driveBoth(sf, cf)
+    check received[] == content            # correctness still holds
+    # ~21 DATA + 1 OACK when windowsize is applied; ~2x that with the bug.
+    check w.aSends() <= 25

@@ -138,6 +138,7 @@ proc handleRrq*(config: ServerConfig, request: TftpPacket,
       return failResult("Invalid option in request")
 
     xferConfig.blocksize = neg.blocksize
+    xferConfig.windowsize = neg.windowsize
     if neg.totalSize >= 0:
       xferConfig.totalSize = neg.totalSize
 
@@ -207,6 +208,7 @@ proc handleWrq*(config: ServerConfig, request: TftpPacket,
       return failResult("Invalid option in request")
 
     xferConfig.blocksize = neg.blocksize
+    xferConfig.windowsize = neg.windowsize
     if neg.totalSize >= 0:
       xferConfig.totalSize = neg.totalSize
 

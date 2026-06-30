@@ -22,6 +22,7 @@ task test, "Run unit tests":
   exec "nim c -r tests/t_api.nim"
   exec "nim c -r tests/t_props.nim"
   exec "nim c -r tests/t_props_transfer.nim"
+  exec "nim c -r tests/t_props_server.nim"
 
 task gui, "Build with GUI support":
   exec "nim c --threads:on -d:withGui -d:release -o:chapulin src/chapulin.nim"

@@ -1,150 +1,46 @@
 ## Property-based tests for the transfer state machines (transfer.nim).
 ##
-## Connects the REAL sendBlocks and recvBlocks over an in-memory async wire and
-## asserts invariants across arbitrary file sizes, block sizes, window sizes,
-## and — via a generated per-packet schedule — adversarial networks (drops,
-## duplicates, reordering). Running both real implementations against each
-## other exercises the actual window / final-block / ACK / retransmit logic.
-##
-## This is the scriptable-mock-network harness (issue #15): the NetworkSchedule
-## is plain data (seq[WireAction]), so proptest generates and shrinks it.
+## Runs the REAL sendBlocks and recvBlocks against each other over the shared
+## in-memory wire (tests/wireharness.nim) across arbitrary file sizes, block
+## sizes, window sizes, and — via a generated schedule — adversarial networks
+## (drops, duplicates, reordering).
 ##
 ## Run in the nim devtools container (deps resolved on the host by milpa):
 ##   docker run --rm -v ${PWD}:C:\app ghcr.io/coreyleavitt/nim:2.2.10 \
 ##     nim c -r tests/t_props_transfer.nim
 
-import std/[unittest, deques, asyncdispatch]
+import std/unittest
 import proptest
 import ../src/chapulin/transfer
+import ./wireharness
 
-proc toByteSeq(xs: seq[int]): seq[byte] =
-  result = newSeq[byte](xs.len)
-  for i, x in xs: result[i] = byte(x and 0xFF)
-
-type
-  WireAction = enum
-    waPass    ## deliver normally
-    waDrop    ## drop the packet
-    waDup     ## deliver twice
-    waDelay   ## hold; release after the next delivered packet (reorder)
-
-  Wire = ref object
-    a2b: Deque[seq[byte]]    # sender -> receiver
-    b2a: Deque[seq[byte]]    # receiver -> sender
-    actions: seq[WireAction] # consumed per send; empty = always waPass
-    idx: int
-    pendA: seq[seq[byte]]    # held sender->receiver packet (0/1)
-    pendB: seq[seq[byte]]    # held receiver->sender packet (0/1)
-    # Deterministic single-packet drop by per-direction occurrence (-1 = none).
-    dropSenderOcc, dropReceiverOcc: int
-    senderSent, receiverSent: int
-
-proc newWire(actions: seq[WireAction] = @[],
-             dropSenderOcc = -1, dropReceiverOcc = -1): Wire =
-  Wire(a2b: initDeque[seq[byte]](), b2a: initDeque[seq[byte]](),
-       actions: actions,
-       dropSenderOcc: dropSenderOcc, dropReceiverOcc: dropReceiverOcc)
-
-proc nextAction(w: Wire): WireAction =
-  if w.actions.len == 0: return waPass
-  result = w.actions[w.idx mod w.actions.len]
-  inc w.idx
-
-# Apply the next scheduled action to a packet sent in one direction.
-proc wireSend(w: Wire, isSender: bool, data: seq[byte]) =
-  # Targeted single-packet drop (deterministic recovery tests) takes precedence
-  # over the action schedule.
-  if isSender:
-    let occ = w.senderSent; inc w.senderSent
-    if occ == w.dropSenderOcc: return
-  else:
-    let occ = w.receiverSent; inc w.receiverSent
-    if occ == w.dropReceiverOcc: return
-  case w.nextAction()
-  of waPass:
-    if isSender:
-      w.a2b.addLast(data)
-      if w.pendA.len > 0: w.a2b.addLast(w.pendA[0]); w.pendA = @[]
-    else:
-      w.b2a.addLast(data)
-      if w.pendB.len > 0: w.b2a.addLast(w.pendB[0]); w.pendB = @[]
-  of waDup:
-    if isSender:
-      w.a2b.addLast(data)
-      w.a2b.addLast(data)
-    else:
-      w.b2a.addLast(data)
-      w.b2a.addLast(data)
-  of waDrop:
-    discard
-  of waDelay:
-    if isSender:
-      if w.pendA.len == 0: w.pendA = @[data] else: w.a2b.addLast(data)
-    else:
-      if w.pendB.len == 0: w.pendB = @[data] else: w.b2a.addLast(data)
-
-# A transport over one direction of the wire. `recv` yields to the dispatcher
-# until a packet is available, bounded by a spin budget so a stall raises
-# TransportTimeoutError (which the transfer treats as a lost packet) instead of
-# hanging.
-proc makeTransport(w: Wire, isSender: bool): Transport =
-  proc doSend(data: seq[byte], host: string, port: int): Future[void] {.async.} =
-    w.wireSend(isSender, data)
-
-  proc doRecv(bufSize: int, timeoutMs: int): Future[tuple[data: seq[byte],
-              host: string, port: int]] {.async.} =
-    var spins = 0
-    while true:
-      if isSender:
-        if w.b2a.len > 0: return (w.b2a.popFirst(), "peer", 0)
-      else:
-        if w.a2b.len > 0: return (w.a2b.popFirst(), "peer", 0)
-      inc spins
-      if spins > 500:
-        raise newException(TransportTimeoutError, "wire idle")
-      await sleepAsync(0)
-
-  proc doClose() = discard
-
-  Transport(send: doSend, recv: doRecv, close: doClose)
-
-# Drive a real sender and receiver to completion over the wire.
+# Drive a real sender (side A) and receiver (side B) to completion over the wire.
 proc runTransfer(content: seq[byte], blocksize, windowsize: int,
                  actions: seq[WireAction] = @[],
-                 dropSenderOcc = -1, dropReceiverOcc = -1):
+                 dropAOcc = -1, dropBOcc = -1):
     tuple[terminated, ok: bool, received: seq[byte], n: int64] =
-  let w = newWire(actions, dropSenderOcc, dropReceiverOcc)
+  let w = newWire(actions, dropAOcc, dropBOcc)
   let cfg = newTransferConfig(blocksize = blocksize, timeout = 5, retries = 3,
                               windowsize = windowsize,
                               totalSize = content.len.int64)
-  let senderPeer = newPeer("peer", 0, locked = true)
-  let receiverPeer = newPeer("peer", 0, locked = true)
-
   let readData = proc(blockNum: uint16, bs: int): seq[byte] =
     let start = (int(blockNum) - 1) * bs
     if start >= content.len: return @[]
     return content[start ..< min(start + bs, content.len)]
-
   var received: seq[byte]
   let onData = proc(blockNum: uint16, data: seq[byte]) =
     received.add data
 
-  let sf = sendBlocks(makeTransport(w, true), cfg, senderPeer, 1, readData)
-  let rf = recvBlocks(makeTransport(w, false), cfg, receiverPeer, 1, onData)
+  let sf = sendBlocks(makeTransport(w, true), cfg, newPeer("peer", 0, true),
+                      1, readData)
+  let rf = recvBlocks(makeTransport(w, false), cfg, newPeer("peer", 0, true),
+                      1, onData)
 
-  var steps = 0
-  while not (sf.finished and rf.finished):
-    if not hasPendingOperations(): break
-    poll()
-    inc steps
-    if steps > 100_000: break
-
-  let terminated = sf.finished and rf.finished
-  if not terminated:
+  if not driveBoth(sf, rf):
     return (false, false, received, -1'i64)
-  let sres = sf.read()
-  let rres = rf.read()
-  return (terminated, sres.success and rres.success, received, rres.bytesTransferred)
+  let sres = futVal(sf)
+  let rres = futVal(rf)
+  return (true, sres.success and rres.success, received, rres.bytesTransferred)
 
 proc fileContents(maxLen = 2048): Strategy[seq[byte]] =
   lists(integers(0, 255), minLen = 0, maxLen = maxLen).map(toByteSeq)
@@ -197,5 +93,5 @@ when defined(knownFailing):
       var content = newSeq[byte](25)        # 25 bytes / blocksize 10 => 3 blocks
       for i in 0 ..< content.len: content[i] = byte(i)
       let r = runTransfer(content, blocksize = 10, windowsize = 1,
-                          dropSenderOcc = 1)  # drop DATA(2)'s first transmission
+                          dropAOcc = 1)       # drop DATA(2)'s first transmission
       check r.ok and r.received == content

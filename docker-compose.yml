@@ -1,10 +1,19 @@
 services:
+  # Unit + property suite. Precondition: run `milpa fetch` on the host first so
+  # the bind-mounted tree contains nim.cfg + _deps/ (deps are not resolved in
+  # the image). Mirrors scripts/dev-test.ps1 and the nimble `test` task; runs
+  # nim directly rather than nimble so the milpa-generated nim.cfg is the single
+  # source of dependency paths. ($$ escapes compose interpolation.)
   dev:
     build: .
     volumes:
       - .:/app
     working_dir: /app
-    command: nimble test
+    command: >
+      sh -c "for t in t_protocol t_transfer t_options t_security t_server
+                      t_logging t_uri t_client t_api t_props; do
+               nim c -r --hints:off tests/$$t.nim || exit 1;
+             done"
 
   # Direction 1: our client against third-party server
   tftp-server:

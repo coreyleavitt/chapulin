@@ -1,0 +1,19 @@
+// milpa manifest for chapulin — github.com/coreyleavitt/milpa
+// Resolves deps and emits nim.cfg; bypasses nimble's SAT solver for URL deps.
+
+name "chapulin"
+
+src_dir "src"
+
+kind "application"
+
+deps {
+    "NiGui" git=(url)"https://github.com/coreyleavitt/NiGui.git" ref="master"
+}
+
+// Test-only: property-based testing of the pure layers (protocol codec,
+// option parsing, validatePath, tftp_uri). Not a runtime dependency — milpa
+// resolves the root's dev-deps but never a transitive dep's dev-deps.
+dev-deps {
+    "proptest" git=(url)"https://github.com/coreyleavitt/proptest.git" ref="main"
+}

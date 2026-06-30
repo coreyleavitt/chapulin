@@ -28,6 +28,7 @@ type
     pendA, pendB: seq[seq[byte]]
     dropAOcc, dropBOcc: int    # deterministic single drop by occurrence (-1 none)
     aSent, bSent: int
+    aLog*, bLog*: seq[seq[byte]]  # every packet each side attempted to send
 
 proc newWire*(actions: seq[WireAction] = @[],
               dropAOcc = -1, dropBOcc = -1): Wire =
@@ -43,6 +44,7 @@ proc nextAction(w: Wire): WireAction =
   inc w.idx
 
 proc wireSend(w: Wire, sideA: bool, data: seq[byte]) =
+  if sideA: w.aLog.add data else: w.bLog.add data
   # Targeted single-packet drop takes precedence over the action schedule.
   if sideA:
     let occ = w.aSent; inc w.aSent

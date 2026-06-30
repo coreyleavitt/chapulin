@@ -221,6 +221,29 @@ proc serveWithChecksum(content: seq[byte]): tuple[ok: bool, sidecar: string] =
   if fileExists(dir / "f.bin.md5"): sidecar = readFile(dir / "f.bin.md5")
   (ok, sidecar)
 
+# Serve an RRQ with pxeCompat on; return the option keys the server put in its
+# OACK (the first packet it sends).
+proc pxeOackOptions(blksize, windowsize: int): seq[(string, string)] =
+  let dir = serverRoot / "pxe"
+  removeDir(dir)
+  createDir(dir)
+  writeFile(dir / "f.bin", "hello pxe world")
+  var cfg = newDefaultServerConfig(dir)
+  cfg.pxeCompat = true
+  let request = TftpPacket(opcode: opRrq, filename: "f.bin", mode: tmOctet,
+    options: @[("blksize", $blksize), ("windowsize", $windowsize), ("tsize", "0")])
+  let w = newWire()
+  var received: seq[byte]
+  let onData = proc(blockNum: uint16, data: seq[byte]) = received.add data
+  let sf = handleRrq(cfg, request, makeTransport(w, true), "peer", 0)
+  let cf = getFile(makeTransport(w, false, swallowFirst = true), clientConfig(),
+                   "peer", 0, "f.bin", onData)
+  discard driveBoth(sf, cf)
+  if w.aLog.len == 0: return @[]
+  let oack = decode(w.aLog[0])
+  if oack.opcode != opOack: return @[]
+  oack.oackOptions
+
 # --- strategies -------------------------------------------------------------
 
 proc fileBytes(maxLen = 1024): Strategy[seq[byte]] =
@@ -326,6 +349,13 @@ suite "server features (listing, checksum)":
     given content in fileBytes(512)
     let r = serveWithChecksum(content)
     ensure r.ok and r.sidecar.startsWith($toMD5(toStr(content)))
+
+  property "pxeCompat keeps only tsize in the OACK (blksize/windowsize stripped)":
+    given blksize in integers(16, 1024), windowsize in integers(2, 8)
+    var keys: seq[string]
+    for (k, _) in pxeOackOptions(blksize, windowsize): keys.add k.toLowerAscii
+    ensure ("tsize" in keys) and ("blksize" notin keys) and
+           ("windowsize" notin keys)
 
 # Known bug — https://github.com/coreyleavitt/chapulin/issues/16. The server
 # negotiates and OACKs a windowsize but never applies it (handleRrq sets only

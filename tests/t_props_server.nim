@@ -85,6 +85,36 @@ proc recvWrq(content: seq[byte]): tuple[ok: bool, written: seq[byte]] =
     written = toBytes(readFile(serverRoot / "uploaded.bin"))
   (ok, written)
 
+# RRQ where the client requests options (blksize/windowsize) so the OACK
+# handshake runs. The request packet mirrors the options getFile will send.
+proc setupRrqOpts(w: Wire, fname: string, blocksize, windowsize: int):
+    tuple[sf, cf: Future[TransferResult], received: ref seq[byte]] =
+  let opts = buildClientOptions(
+    newTransferConfig(blocksize = blocksize, windowsize = windowsize),
+    requestTsize = false)
+  let cfg = newDefaultServerConfig(serverRoot)
+  let request = TftpPacket(opcode: opRrq, filename: fname, mode: tmOctet,
+                           options: opts)
+  var ccfg = newDefaultConfig()
+  ccfg.blocksize = blocksize
+  ccfg.windowsize = windowsize
+  ccfg.requestTsize = false
+  var received: ref seq[byte]
+  new(received)
+  let onData = proc(blockNum: uint16, data: seq[byte]) = received[].add data
+  let sf = handleRrq(cfg, request, makeTransport(w, true), "peer", 0)
+  let cf = getFile(makeTransport(w, false, swallowFirst = true), ccfg,
+                   "peer", 0, fname, onData)
+  (sf, cf, received)
+
+proc serveRrqNegotiated(content: seq[byte], blocksize, windowsize: int):
+    tuple[ok: bool, received: seq[byte]] =
+  createDir(serverRoot)
+  writeFile(serverRoot / "neg.bin", toStr(content))
+  let (sf, cf, received) = setupRrqOpts(newWire(), "neg.bin", blocksize, windowsize)
+  if not driveBoth(sf, cf): return (false, received[])
+  (futVal(sf).success and futVal(cf).success, received[])
+
 proc rrqServed(filename: string): bool =
   createDir(serverRoot)
   let cfg = newDefaultServerConfig(serverRoot)
@@ -161,3 +191,40 @@ suite "server concurrency isolation":
     given getContent in fileBytes(768), putContent in fileBytes(768)
     let r = serveGetAndPut(getContent, putContent)
     ensure r.ok and r.got == getContent and r.put == putContent
+
+suite "server option negotiation (end-to-end)":
+
+  property "RRQ with a negotiated blocksize completes intact":
+    given content in fileBytes(1500),
+          blocksize in integers(16, 1024)
+    let r = serveRrqNegotiated(content, blocksize, 1)
+    ensure r.ok and r.received == content
+
+  property "RRQ with a negotiated window completes intact":
+    given content in fileBytes(1500),
+          blocksize in integers(64, 512),
+          windowsize in integers(1, 6)
+    let r = serveRrqNegotiated(content, blocksize, windowsize)
+    ensure r.ok and r.received == content
+
+# Known bug — https://github.com/coreyleavitt/chapulin/issues/16. The server
+# negotiates and OACKs a windowsize but never applies it (handleRrq sets only
+# blocksize/totalSize), so it sends lock-step. Transfers still COMPLETE — the
+# client's window never fills, the server times out and retransmits each block,
+# and the duplicate-re-ACK unblocks it — but every block costs a retransmit,
+# which is pathologically slow on a real network. This test pins the desired
+# efficiency and FAILS today (the server sends ~2 packets per block). Run
+## nim c -r -d:knownFailing tests/t_props_server.nim
+when defined(knownFailing):
+  suite "server windowsize efficiency (known-failing: issue #16)":
+    test "a windowed RRQ sends ~one DATA per block (no per-block retransmit)":
+      createDir(serverRoot)
+      var content = newSeq[byte](2000)       # blocksize 100 => 20 blocks + final
+      for i in 0 ..< content.len: content[i] = byte(i and 0xFF)
+      writeFile(serverRoot / "win.bin", toStr(content))
+      let w = newWire()
+      let (sf, cf, received) = setupRrqOpts(w, "win.bin", 100, 8)
+      discard driveBoth(sf, cf)
+      check received[] == content            # correctness holds today
+      # ~21 DATA + 1 OACK when windowsize is applied; ~2x that with the bug.
+      check w.aSends() <= 25

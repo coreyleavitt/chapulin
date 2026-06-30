@@ -34,6 +34,9 @@ proc newWire*(actions: seq[WireAction] = @[],
   Wire(a2b: initDeque[seq[byte]](), b2a: initDeque[seq[byte]](),
        actions: actions, dropAOcc: dropAOcc, dropBOcc: dropBOcc)
 
+proc aSends*(w: Wire): int = w.aSent   ## packets side A has sent (incl. dropped)
+proc bSends*(w: Wire): int = w.bSent   ## packets side B has sent (incl. dropped)
+
 proc nextAction(w: Wire): WireAction =
   if w.actions.len == 0: return waPass
   result = w.actions[w.idx mod w.actions.len]

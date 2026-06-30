@@ -82,16 +82,72 @@ suite "transfer state-machine properties":
     let r = runTransfer(content, blocksize, windowsize, actions)
     ensure r.terminated and (not r.ok or r.received == content)
 
-# Known bug — https://github.com/coreyleavitt/chapulin/issues/18. sendBlocks does
-# not retransmit a DATA packet lost after block 1, so a mid-stream loss truncates
-# the transfer. This test encodes the desired (recovered) behavior and FAILS
-# today. It is gated off the normal suite; run `nim c -r -d:knownFailing
-# tests/t_props_transfer.nim` to reproduce, and remove the gate when #18 is fixed.
-when defined(knownFailing):
-  suite "transfer recovery (known-failing: issue #18)":
-    test "a DATA packet lost mid-stream is retransmitted and the file completes":
-      var content = newSeq[byte](25)        # 25 bytes / blocksize 10 => 3 blocks
-      for i in 0 ..< content.len: content[i] = byte(i)
-      let r = runTransfer(content, blocksize = 10, windowsize = 1,
-                          dropAOcc = 1)       # drop DATA(2)'s first transmission
-      check r.ok and r.received == content
+# Regression guard for https://github.com/coreyleavitt/chapulin/issues/18. Before
+# the fix, sendBlocks ignored the duplicate ACKs a receiver sends after losing a
+# DATA packet, so a mid-stream loss deadlocked and the transfer truncated. The
+# dup-ACK fast-retransmit now recovers it.
+suite "transfer recovery (issue #18)":
+
+  test "a DATA packet lost mid-stream is retransmitted and the file completes":
+    var content = newSeq[byte](25)        # 25 bytes / blocksize 10 => 3 blocks
+    for i in 0 ..< content.len: content[i] = byte(i)
+    let r = runTransfer(content, blocksize = 10, windowsize = 1,
+                        dropAOcc = 1)       # drop DATA(2)'s first transmission
+    check r.terminated and r.ok and r.received == content
+
+  property "any single mid-stream DATA loss still completes intact":
+    # Generalises the regression test: dropping the first transmission of any one
+    # DATA packet (not just block 1) must still recover and reconstruct the file.
+    given content in fileContents(512),
+          blocksize in integers(8, 128),
+          dropIdx in integers(1, 6)
+    let nBlocks = (content.len + blocksize - 1) div blocksize
+    # Only meaningful when the drop targets an actual mid-stream block.
+    if nBlocks >= 2 and dropIdx < nBlocks:
+      let r = runTransfer(content, blocksize, windowsize = 1, dropAOcc = dropIdx)
+      ensure r.terminated and r.ok and r.received == content
+
+# Efficiency guards for the #18 dup-ACK retransmit. A lock-step (windowsize=1)
+# transfer sends exactly `len div blocksize + 1` DATA packets — one per block
+# plus the final short/empty block that signals end-of-file.
+proc senderPackets(content: seq[byte], blocksize, windowsize: int,
+                   actions: seq[WireAction]): tuple[ok: bool, sent: int] =
+  let w = newWire(actions)
+  let cfg = newTransferConfig(blocksize = blocksize, timeout = 5, retries = 3,
+                              windowsize = windowsize,
+                              totalSize = content.len.int64)
+  let readData = proc(blockNum: uint16, bs: int): seq[byte] =
+    let start = (int(blockNum) - 1) * bs
+    if start >= content.len: return @[]
+    return content[start ..< min(start + bs, content.len)]
+  var received: seq[byte]
+  let onData = proc(blockNum: uint16, data: seq[byte]) = received.add data
+  let sf = sendBlocks(makeTransport(w, true), cfg, newPeer("peer", 0, true),
+                      1, readData)
+  let rf = recvBlocks(makeTransport(w, false), cfg, newPeer("peer", 0, true),
+                      1, onData)
+  let done = driveBoth(sf, rf)
+  let ok = done and futVal(sf).success and futVal(rf).success and received == content
+  (ok, w.aSends())
+
+suite "transfer efficiency (no spurious or cascading retransmits)":
+
+  property "a clean lock-step transfer sends exactly one DATA per block":
+    # Teeth for the #18 fix: the dup-ACK retransmit must stay dormant when
+    # nothing is lost. A perturbation-free transfer sends each block exactly once
+    # (plus the final short block) — a spuriously firing retransmit would exceed
+    # this exact count.
+    given content in fileContents(512),
+          blocksize in integers(16, 128)
+    let r = senderPackets(content, blocksize, windowsize = 1, @[])
+    ensure r.ok and r.sent == content.len div blocksize + 1
+
+  property "duplication never cascades into resending the whole file":
+    # RFC 1123 4.2.3.1 Sorcerer's Apprentice: under a duplication-only network the
+    # sender must not roughly double its packet count.
+    given content in fileContents(512),
+          blocksize in integers(16, 128),
+          actions in dupActions()
+    let ideal = content.len div blocksize + 1
+    let r = senderPackets(content, blocksize, windowsize = 1, actions)
+    ensure r.ok and r.sent < 2 * ideal

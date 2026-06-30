@@ -163,7 +163,16 @@ proc sendBlocks*(transport: Transport, config: TransferConfig,
   var windowEnd: uint16 = 0        # highest block sent in current window
   var hitFinal = false              # whether we've sent a short (final) block
   var lastSentPacket: seq[byte]     # for retransmit on timeout
+  var dupAcks = 0                   # consecutive re-ACKs of lastAcked (loss signal)
   let ws = config.windowsize
+
+  # A receiver that loses a DATA packet keeps re-ACKing its last in-order block.
+  # Those duplicate ACKs arrive before our recv times out, so a timeout-only
+  # retransmit never fires and the transfer deadlocks (issue #18). Treat repeated
+  # duplicate ACKs as a retransmit request. RFC 1123 4.2.3.1: reacting to a
+  # *single* duplicate ACK causes the Sorcerer's Apprentice cascade, so only act
+  # once the loss is confirmed by a second duplicate — one echoed ACK is ignored.
+  const dupAckThreshold = 2
 
   template sendOneBlock(blkNum: uint16) =
     let blkData = readData(blkNum, config.blocksize)
@@ -204,6 +213,7 @@ proc sendBlocks*(transport: Transport, config: TransferConfig,
     if pkt.opcode == opAck:
       if pkt.ackBlockNum >= lastAcked + 1 and pkt.ackBlockNum <= windowEnd:
         lastAcked = pkt.ackBlockNum
+        dupAcks = 0                 # forward progress clears the loss signal
 
         # If final block was ACKed, transfer complete
         if hitFinal and lastAcked == windowEnd:
@@ -225,7 +235,19 @@ proc sendBlocks*(transport: Transport, config: TransferConfig,
           hitFinal = false  # re-read blocks, may hit final again
           # Re-send the un-ACKed portion + new blocks
           fillWindow()
-      # else: stale ACK for already-ACKed block — ignore
+      elif pkt.ackBlockNum == lastAcked and windowEnd > lastAcked:
+        # Duplicate ACK with data still outstanding: the receiver is stuck
+        # waiting for lastAcked+1, so a block in the window was lost. Once the
+        # loss is confirmed (see dupAckThreshold), resend the whole outstanding
+        # window — recvBlocks drops out-of-order blocks, so everything after the
+        # gap must be retransmitted, not just the missing block.
+        inc dupAcks
+        if dupAcks >= dupAckThreshold:
+          dupAcks = 0
+          nextBlock = lastAcked + 1
+          hitFinal = false
+          fillWindow()
+      # else: out-of-range / very stale ACK — ignore
     else:
       return TransferResult(success: false, bytesTransferred: bytesSent,
                             errorMsg: "Unexpected packet type: " & $pkt.opcode,

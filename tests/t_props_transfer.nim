@@ -35,9 +35,15 @@ type
     idx: int
     pendA: seq[seq[byte]]    # held sender->receiver packet (0/1)
     pendB: seq[seq[byte]]    # held receiver->sender packet (0/1)
+    # Deterministic single-packet drop by per-direction occurrence (-1 = none).
+    dropSenderOcc, dropReceiverOcc: int
+    senderSent, receiverSent: int
 
-proc newWire(actions: seq[WireAction] = @[]): Wire =
-  Wire(a2b: initDeque[seq[byte]](), b2a: initDeque[seq[byte]](), actions: actions)
+proc newWire(actions: seq[WireAction] = @[],
+             dropSenderOcc = -1, dropReceiverOcc = -1): Wire =
+  Wire(a2b: initDeque[seq[byte]](), b2a: initDeque[seq[byte]](),
+       actions: actions,
+       dropSenderOcc: dropSenderOcc, dropReceiverOcc: dropReceiverOcc)
 
 proc nextAction(w: Wire): WireAction =
   if w.actions.len == 0: return waPass
@@ -46,6 +52,14 @@ proc nextAction(w: Wire): WireAction =
 
 # Apply the next scheduled action to a packet sent in one direction.
 proc wireSend(w: Wire, isSender: bool, data: seq[byte]) =
+  # Targeted single-packet drop (deterministic recovery tests) takes precedence
+  # over the action schedule.
+  if isSender:
+    let occ = w.senderSent; inc w.senderSent
+    if occ == w.dropSenderOcc: return
+  else:
+    let occ = w.receiverSent; inc w.receiverSent
+    if occ == w.dropReceiverOcc: return
   case w.nextAction()
   of waPass:
     if isSender:
@@ -96,9 +110,10 @@ proc makeTransport(w: Wire, isSender: bool): Transport =
 
 # Drive a real sender and receiver to completion over the wire.
 proc runTransfer(content: seq[byte], blocksize, windowsize: int,
-                 actions: seq[WireAction] = @[]):
+                 actions: seq[WireAction] = @[],
+                 dropSenderOcc = -1, dropReceiverOcc = -1):
     tuple[terminated, ok: bool, received: seq[byte], n: int64] =
-  let w = newWire(actions)
+  let w = newWire(actions, dropSenderOcc, dropReceiverOcc)
   let cfg = newTransferConfig(blocksize = blocksize, timeout = 5, retries = 3,
                               windowsize = windowsize,
                               totalSize = content.len.int64)
@@ -170,3 +185,17 @@ suite "transfer state-machine properties":
           actions in anyActions()
     let r = runTransfer(content, blocksize, windowsize, actions)
     ensure r.terminated and (not r.ok or r.received == content)
+
+# Known bug — https://github.com/coreyleavitt/chapulin/issues/18. sendBlocks does
+# not retransmit a DATA packet lost after block 1, so a mid-stream loss truncates
+# the transfer. This test encodes the desired (recovered) behavior and FAILS
+# today. It is gated off the normal suite; run `nim c -r -d:knownFailing
+# tests/t_props_transfer.nim` to reproduce, and remove the gate when #18 is fixed.
+when defined(knownFailing):
+  suite "transfer recovery (known-failing: issue #18)":
+    test "a DATA packet lost mid-stream is retransmitted and the file completes":
+      var content = newSeq[byte](25)        # 25 bytes / blocksize 10 => 3 blocks
+      for i in 0 ..< content.len: content[i] = byte(i)
+      let r = runTransfer(content, blocksize = 10, windowsize = 1,
+                          dropSenderOcc = 1)  # drop DATA(2)'s first transmission
+      check r.ok and r.received == content

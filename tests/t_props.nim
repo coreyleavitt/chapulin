@@ -83,6 +83,23 @@ proc optionPair(): Strategy[(string, string)] =
 proc optionPairs(maxLen = 4): Strategy[seq[(string, string)]] =
   lists(optionPair(), minLen = 0, maxLen = maxLen)
 
+# Option pairs with numeric values (no parse failures) — for negotiation
+# invariants that should hold whenever the values actually parse.
+proc numericOptionPairs(maxLen = 4): Strategy[seq[(string, string)]] =
+  let pair = sampledFrom(@["blksize", "windowsize", "timeout", "tsize"]).flatMap(
+    proc(k: string): Strategy[(string, string)] =
+      integers(-100, 200_000).map(proc(n: int): (string, string) = (k, $n)))
+  lists(pair, minLen = 0, maxLen = maxLen)
+
+# Filenames guaranteed to contain a `..` segment.
+proc traversalNames(): Strategy[string] =
+  safeStrings(0, 6).flatMap(proc(a: string): Strategy[string] =
+    safeStrings(0, 6).map(proc(b: string): string = a & "/../" & b))
+
+const NegLimits = ServerOptionLimits(
+  maxBlocksize: 65464, minBlocksize: 8, timeout: 5,
+  maxWindowsize: 64, minWindowsize: 1)
+
 # --- properties ---------------------------------------------------------------
 
 suite "protocol codec properties":
@@ -141,6 +158,25 @@ suite "option negotiation properties":
         true
     ensure ok
 
+  property "negotiateServerOptions never OACKs an unsolicited option":
+    # RFC 2347: the server may only acknowledge options the client requested.
+    given opts in numericOptionPairs()
+    let (_, oack) = negotiateServerOptions(opts, NegLimits)
+    var requested: seq[string]
+    for (k, _) in opts: requested.add k.toLowerAscii
+    var ok = true
+    for (k, _) in oack:
+      if k.toLowerAscii notin requested: ok = false
+    ensure ok
+
+  property "negotiateServerOptions clamps blocksize/windowsize to server limits":
+    given opts in numericOptionPairs()
+    let (neg, _) = negotiateServerOptions(opts, NegLimits)
+    ensure neg.blocksize >= NegLimits.minBlocksize and
+           neg.blocksize <= NegLimits.maxBlocksize and
+           neg.windowsize >= NegLimits.minWindowsize and
+           neg.windowsize <= NegLimits.maxWindowsize
+
 suite "security properties":
 
   property "validatePath never escapes root, never crashes":
@@ -148,6 +184,11 @@ suite "security properties":
     const root = "tftproot"
     let (valid, resolved, _) = validatePath(root, fn)
     ensure (not valid) or resolved.startsWith(absolutePath(root))
+
+  property "validatePath rejects any path containing a .. segment":
+    given fn in traversalNames()
+    let (valid, _, _) = validatePath("tftproot", fn)
+    ensure not valid
 
 suite "uri parsing properties":
 
@@ -160,3 +201,12 @@ suite "uri parsing properties":
       except TftpUriError:
         true
     ensure ok
+
+  property "parseTftpUri round-trips host:port/file;mode":
+    given host in safeStrings(1, 10), port in integers(1, 65535),
+          file in safeStrings(1, 12), netascii in booleans()
+    let mode = if netascii: "netascii" else: "octet"
+    let uri = "tftp://" & host & ":" & $port & "/" & file & ";mode=" & mode
+    let parsed = parseTftpUri(uri)
+    ensure parsed.host == host and parsed.port == port and
+           parsed.filename == file and parsed.mode == mode

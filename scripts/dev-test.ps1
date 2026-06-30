@@ -25,7 +25,7 @@ if ($LASTEXITCODE -ne 0) { throw "milpa fetch failed" }
 
 $tests = if ($Only) { $Only } else {
   @("t_protocol", "t_transfer", "t_options", "t_security", "t_server",
-    "t_logging", "t_uri", "t_client", "t_api", "t_props")
+    "t_logging", "t_uri", "t_client", "t_api", "t_props", "t_props_transfer")
 }
 
 $failed = @()

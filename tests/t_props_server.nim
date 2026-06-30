@@ -10,7 +10,7 @@
 ##   docker run --rm -v ${PWD}:C:\app ghcr.io/coreyleavitt/nim:2.2.10 \
 ##     nim c -r tests/t_props_server.nim
 
-import std/[unittest, os, asyncdispatch]   # asyncdispatch: Future type only
+import std/[unittest, os, asyncdispatch, strutils, md5]  # asyncdispatch: Future only
 import proptest
 import ../src/chapulin/protocol
 import ../src/chapulin/engine          # getFile, putFile, newDefaultConfig
@@ -179,6 +179,48 @@ proc serveGetAndPut(getContent, putContent: seq[byte]):
     put = toBytes(readFile(serverRoot / "cput.bin"))
   (ok, got[], put)
 
+# Serve the directory-listing pseudo-file from a fresh root holding `files`.
+proc serveListing(files: seq[(string, seq[byte])]): seq[byte] =
+  let dir = serverRoot / "listing"
+  removeDir(dir)
+  createDir(dir)
+  for (name, content) in files: writeFile(dir / name, toStr(content))
+  var cfg = newDefaultServerConfig(dir)
+  cfg.dirListFile = "__list__"
+  let request = TftpPacket(opcode: opRrq, filename: "__list__", mode: tmOctet,
+                           options: @[])
+  let w = newWire()
+  var received: seq[byte]
+  let onData = proc(blockNum: uint16, data: seq[byte]) = received.add data
+  let sf = handleRrq(cfg, request, makeTransport(w, true), "peer", 0)
+  let cf = getFile(makeTransport(w, false, swallowFirst = true), clientConfig(),
+                   "peer", 0, "__list__", onData)
+  discard driveBoth(sf, cf)
+  received
+
+# Serve a file with md5 checksum mode on; return whether it succeeded and the
+# sidecar contents written to disk.
+proc serveWithChecksum(content: seq[byte]): tuple[ok: bool, sidecar: string] =
+  let dir = serverRoot / "checksum"
+  removeDir(dir)
+  createDir(dir)
+  writeFile(dir / "f.bin", toStr(content))
+  var cfg = newDefaultServerConfig(dir)
+  cfg.checksumMode = "md5"
+  let request = TftpPacket(opcode: opRrq, filename: "f.bin", mode: tmOctet,
+                           options: @[])
+  let w = newWire()
+  var received: seq[byte]
+  let onData = proc(blockNum: uint16, data: seq[byte]) = received.add data
+  let sf = handleRrq(cfg, request, makeTransport(w, true), "peer", 0)
+  let cf = getFile(makeTransport(w, false, swallowFirst = true), clientConfig(),
+                   "peer", 0, "f.bin", onData)
+  discard driveBoth(sf, cf)
+  let ok = futVal(sf).success and futVal(cf).success
+  var sidecar = ""
+  if fileExists(dir / "f.bin.md5"): sidecar = readFile(dir / "f.bin.md5")
+  (ok, sidecar)
+
 # --- strategies -------------------------------------------------------------
 
 proc fileBytes(maxLen = 1024): Strategy[seq[byte]] =
@@ -269,6 +311,21 @@ suite "server option negotiation (end-to-end)":
           windowsize in integers(1, 6)
     let r = serveRrqNegotiated(content, blocksize, windowsize)
     ensure r.ok and r.received == content
+
+suite "server features (listing, checksum)":
+
+  property "directory listing reports every file with its size":
+    given ca in fileBytes(300), cb in fileBytes(300), cc in fileBytes(300)
+    let listing = toStr(serveListing(@[("a.bin", ca), ("b.bin", cb),
+                                       ("c.bin", cc)]))
+    ensure ("a.bin\t" & $ca.len) in listing and
+           ("b.bin\t" & $cb.len) in listing and
+           ("c.bin\t" & $cc.len) in listing
+
+  property "RRQ with md5 checksum mode writes a correct sidecar":
+    given content in fileBytes(512)
+    let r = serveWithChecksum(content)
+    ensure r.ok and r.sidecar.startsWith($toMD5(toStr(content)))
 
 # Known bug — https://github.com/coreyleavitt/chapulin/issues/16. The server
 # negotiates and OACKs a windowsize but never applies it (handleRrq sets only

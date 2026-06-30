@@ -115,6 +115,34 @@ proc serveRrqNegotiated(content: seq[byte], blocksize, windowsize: int):
   if not driveBoth(sf, cf): return (false, received[])
   (futVal(sf).success and futVal(cf).success, received[])
 
+# WRQ under a given write policy, optionally against a pre-existing file.
+# Returns whether the server accepted, the bytes on disk afterward, and whether
+# the file exists.
+proc wrqUnderPolicy(policy: WritePolicy, content: seq[byte], fname: string,
+                    preExisting: seq[byte] = @[], hasPreExisting = false):
+    tuple[serverOk: bool, onDisk: seq[byte], existed: bool] =
+  createDir(serverRoot)
+  let path = serverRoot / fname
+  if hasPreExisting: writeFile(path, toStr(preExisting))
+  elif fileExists(path): removeFile(path)
+  var cfg = newDefaultServerConfig(serverRoot)
+  cfg.writePolicy = policy
+  let request = TftpPacket(opcode: opWrq, filename: fname, mode: tmOctet,
+                           options: @[])
+  let readData = proc(blockNum: uint16, bs: int): seq[byte] =
+    let start = (int(blockNum) - 1) * bs
+    if start >= content.len: return @[]
+    return content[start ..< min(start + bs, content.len)]
+  let w = newWire()
+  let cf = putFile(makeTransport(w, true, swallowFirst = true), clientConfig(),
+                   "peer", 0, fname, readData)
+  let sf = handleWrq(cfg, request, makeTransport(w, false), "peer", 0)
+  discard driveBoth(sf, cf)
+  let existed = fileExists(path)
+  var onDisk: seq[byte]
+  if existed: onDisk = toBytes(readFile(path))
+  (futVal(sf).success, onDisk, existed)
+
 proc rrqServed(filename: string): bool =
   createDir(serverRoot)
   let cfg = newDefaultServerConfig(serverRoot)
@@ -162,6 +190,13 @@ proc traversalNames(): Strategy[string] =
       result = "../"
       for c in cs: result.add c)
 
+proc missingNames(): Strategy[string] =
+  lists(sampledFrom(@['a', 'b', 'c', 'd', 'e', '0', '1', '2']),
+        minLen = 1, maxLen = 8).map(
+    proc(cs: seq[char]): string =
+      result = "missing_"
+      for c in cs: result.add c)
+
 # --- properties -------------------------------------------------------------
 
 suite "server handler properties (end-to-end over the wire)":
@@ -179,6 +214,34 @@ suite "server handler properties (end-to-end over the wire)":
   property "RRQ for a path-traversal filename is refused, never served":
     given seg in traversalNames()
     ensure not rrqServed(seg)
+
+  property "RRQ for a non-existent file is refused":
+    given name in missingNames()
+    if fileExists(serverRoot / name): removeFile(serverRoot / name)
+    ensure not rrqServed(name)
+
+suite "server write-policy enforcement (end-to-end)":
+
+  property "wpDeny refuses every upload and writes nothing":
+    given content in fileBytes(512)
+    let r = wrqUnderPolicy(wpDeny, content, "wp.bin")
+    ensure (not r.serverOk) and (not r.existed)
+
+  property "wpOverwrite refuses creating a new file":
+    given content in fileBytes(512)
+    let r = wrqUnderPolicy(wpOverwrite, content, "wp.bin")
+    ensure (not r.serverOk) and (not r.existed)
+
+  property "wpCreateOnly refuses overwriting; the original is preserved":
+    given original in fileBytes(512), attempt in fileBytes(512)
+    let r = wrqUnderPolicy(wpCreateOnly, attempt, "wp.bin", original, true)
+    ensure (not r.serverOk) and r.existed and r.onDisk == original
+
+  property "wpCreateOrOverwrite replaces an existing file":
+    given original in fileBytes(512), replacement in fileBytes(512)
+    let r = wrqUnderPolicy(wpCreateOrOverwrite, replacement, "wp.bin",
+                           original, true)
+    ensure r.serverOk and r.onDisk == replacement
 
 suite "server concurrency isolation":
 

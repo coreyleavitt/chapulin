@@ -1,15 +1,7 @@
 ## chapulin — TFTP client and server
 
 import chapulin/api
-import chapulin/transport
-import chapulin/format
-import chapulin/server
-import chapulin/server_config
-import chapulin/security
-import chapulin/protocol
-import chapulin/transfer
 import chapulin/tftp_uri
-import chapulin/logging
 import std/[os, parseopt, strutils, times, asyncdispatch]
 
 when defined(withGui):
@@ -91,7 +83,10 @@ when isMainModule:
       of "mode":
         case p.val.toLowerAscii
         of "octet": transferMode = tmOctet
-        of "netascii": transferMode = tmNetascii
+        of "netascii":
+          transferMode = tmNetascii
+          # TODO(#13): netascii byte transform is not applied — netascii.nim is orphaned;
+          # sets packet mode only.
         else: stderr.writeLine "Invalid mode: " & p.val & " (octet or netascii)"; quit(2)
       of "verbose": logLevel = llDebug
       of "quiet", "q": logLevel = llError
@@ -175,26 +170,7 @@ when isMainModule:
       filename & (if direction == tdGet: " from " else: " to ") &
       host & ":" & $port
 
-    let progressCb = proc(bytesTransferred: int64, totalBytes: int64) =
-      let elapsed = epochTime() - startTime
-      let speed = if elapsed > 0: float(bytesTransferred) / elapsed else: 0.0
-      var line = "\r  " & formatBytes(bytesTransferred)
-      if totalBytes > 0:
-        let pct = int(bytesTransferred * 100 div totalBytes)
-        line &= " / " & formatBytes(totalBytes) & " (" & $pct & "%)"
-      line &= " | " & formatSpeed(speed)
-      if line.len < 60: line &= ' '.repeat(60 - line.len)
-      stdout.write line
-      stdout.flushFile
-    let completeCb = proc() =
-      let elapsed = epochTime() - startTime
-      echo "\nTransfer complete (" & elapsed.formatFloat(ffDecimal, 2) & "s)"
-      if notify: stdout.write "\a"; stdout.flushFile
-    let errorCb = proc(code: int, msg: string) =
-      stderr.writeLine "\nError: " & msg
-    let callbacks = TransferCallbacks(
-      onProgress: progressCb, onComplete: completeCb, onError: errorCb)
-
+    let s = newSession(minLogLevel = logLevel)
     var req = newTransferRequest(host, port, filename, localPath, direction)
     req.options.blocksize = blocksize
     req.options.windowsize = windowsize
@@ -202,10 +178,39 @@ when isMainModule:
     req.options.timeout = timeout
     req.options.retries = retries
 
-    let udpTransport = newUdpTransport(ipv6 = isIPv6(host))
-    let result = waitFor executeTransfer(req, callbacks, udpTransport)
-    if udpTransport.close != nil: udpTransport.close()
-    quit(if result.success: 0 else: 1)
+    let id = s.startTransfer(req)
+    var exitCode = 0
+    var done = false
+    while not done:
+      for ev in s.poll(50):
+        if ev.xfrId != id: continue
+        case ev.kind
+        of evTransferProgress:
+          let elapsed = epochTime() - startTime
+          let speed = if elapsed > 0: float(ev.snap.bytes) / elapsed else: 0.0
+          var line = "\r  " & formatBytes(ev.snap.bytes)
+          let tot = ev.snap.total
+          if tot.isSome and tot.get > 0:
+            let pct = int(ev.snap.bytes * 100 div tot.get)
+            line &= " / " & formatBytes(tot.get) & " (" & $pct & "%)"
+          line &= " | " & formatSpeed(speed)
+          if line.len < 60: line &= ' '.repeat(60 - line.len)
+          stdout.write line
+          stdout.flushFile
+        of evTransferComplete:
+          let elapsed = epochTime() - startTime
+          echo "\nTransfer complete (" & elapsed.formatFloat(ffDecimal, 2) & "s)"
+          if notify: stdout.write "\a"; stdout.flushFile
+          exitCode = 0
+          done = true
+        of evTransferError:
+          stderr.writeLine "\nError: " & sanitizeForDisplay(ev.errorMsg)
+          exitCode = 1
+          done = true
+        else: discard
+      if not done and not hasPendingOperations(): done = true
+    s.close()
+    quit(exitCode)
 
   of "serve":
     if rootDir.len == 0:
@@ -228,27 +233,41 @@ when isMainModule:
     config.pxeCompat = pxeCompat
     config.listenAddr = bindAddr
     config.dirListFile = dirListFile
-    config.checksumMode = checksumMode
+    try:
+      config.checksumMode = parseChecksumMode(checksumMode)
+    except ValueError as e:
+      stderr.writeLine e.msg; quit(2)
 
-    let serverOutput: LogOutput = proc(level: LogLevel, msg: string) =
-      echo formatLogMessage(level, msg)
-      # Bell on transfer completion (info messages containing "OK")
-      if notify and level == llInfo and " OK " in msg:
-        stdout.write "\a"; stdout.flushFile
-    let serverLogger = newLogger(logLevel, serverOutput)
-    let srv = newTftpServer(config, logger = serverLogger)
+    let s = newSession(minLogLevel = logLevel)
 
-    serverLogger.info("chapulin server v" & Version)
-    serverLogger.info("Root: " & absolutePath(rootDir))
-    serverLogger.info("Port: " & $port)
-    serverLogger.info("Write policy: " & $writePolicy)
-    serverLogger.info("Max clients: " & $maxClients)
-    serverLogger.info("Listening...")
+    echo formatLogMessage(llInfo, "chapulin server v" & Version)
+    echo formatLogMessage(llInfo, "Root: " & absolutePath(rootDir))
+    echo formatLogMessage(llInfo, "Port: " & $port)
+    echo formatLogMessage(llInfo, "Write policy: " & $writePolicy)
+    echo formatLogMessage(llInfo, "Max clients: " & $maxClients)
 
-    let listener = newUdpListener(config.listenAddr, port,
-                                   ipv6 = isIPv6(config.listenAddr))
-    waitFor srv.run(listener)
-    listener.close()
+    discard s.startServer(config)
+
+    # Server poll loop — use poll(50) for real sockets (blocking is desirable;
+    # avoids a hot busy-spin while still pumping the dispatcher regularly).
+    while true:
+      for ev in s.poll(50):
+        case ev.kind
+        of evServerLog:
+          echo formatLogMessage(ev.sLevel, ev.sMessage)
+        of evServerStarted:
+          echo formatLogMessage(llInfo, "Listening on " & ev.boundAddr & ":" & $ev.boundPort)
+        of evServerStartFailed:
+          stderr.writeLine formatLogMessage(llError, "Start failed: " & sanitizeForDisplay(ev.startErr))
+          quit(1)
+        of evTransferComplete:
+          # Structural --notify: bell fires on the event, not on a log string match.
+          if notify: stdout.write "\a"; stdout.flushFile
+        of evTransferError:
+          stderr.writeLine formatLogMessage(llError, "transfer error: " & sanitizeForDisplay(ev.errorMsg))
+        of evTransferStarted, evTransferProgress,
+           evTransferLog, evServerStopped:
+          discard
 
   of "gui":
     when defined(withGui):

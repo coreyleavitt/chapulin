@@ -26,13 +26,13 @@ if ($LASTEXITCODE -ne 0) { throw "milpa fetch failed" }
 $tests = if ($Only) { $Only } else {
   @("t_protocol", "t_transfer", "t_options", "t_security", "t_server",
     "t_logging", "t_uri", "t_client", "t_api", "t_props", "t_props_transfer",
-    "t_props_server")
+    "t_props_server", "t_wireharness", "t_session")
 }
 
 $failed = @()
 foreach ($t in $tests) {
   Write-Host "==> $t (container)" -ForegroundColor Cyan
-  docker run --rm -v "${proj}:C:\app" $image nim c -r --hints:off --colors:off "tests\$t.nim"
+  docker run --rm -v "${proj}:C:\app" $image nim c -r --hints:off --colors:off -d:chapulinTest "tests\$t.nim"
   if ($LASTEXITCODE -ne 0) { $failed += $t }
 }
 

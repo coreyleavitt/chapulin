@@ -9,12 +9,9 @@ services:
     volumes:
       - .:/app
     working_dir: /app
-    command: >
-      sh -c "for t in t_protocol t_transfer t_options t_security t_server
-                      t_logging t_uri t_client t_api t_props t_props_transfer
-                      t_props_server; do
-               nim c -r --hints:off tests/$$t.nim || exit 1;
-             done"
+    # Single-line sh -c: a YAML '>' folded scalar preserves newlines on
+    # more-indented continuation lines, which breaks the `for ... in` list.
+    command: sh -c "for t in t_protocol t_transfer t_options t_security t_server t_logging t_uri t_client t_api t_props t_props_transfer t_props_server t_wireharness t_session; do nim c -r --hints:off -d:chapulinTest tests/$$t.nim || exit 1; done"
 
   # Direction 1: our client against third-party server
   tftp-server:

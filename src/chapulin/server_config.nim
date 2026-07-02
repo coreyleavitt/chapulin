@@ -1,6 +1,7 @@
 ## Server configuration types.
 
 import transfer
+import std/strutils
 
 type
   WritePolicy* = enum
@@ -8,6 +9,11 @@ type
     wpCreateOnly        ## Allow creating new files only
     wpOverwrite         ## Allow overwriting existing files
     wpCreateOrOverwrite ## Allow both create and overwrite
+
+  ChecksumMode* = enum
+    csNone   ## Disabled (default)
+    csMd5    ## Generate .md5 sidecar after successful RRQ
+    csSha256 ## Reserved; not yet implemented
 
   ServerConfig* = object
     rootDir*: string
@@ -25,7 +31,7 @@ type
     portRangeEnd*: int    ## 0 = OS-assigned ephemeral ports (default)
     pxeCompat*: bool      ## Only negotiate tsize (no blksize/windowsize/timeout)
     dirListFile*: string  ## Filename that triggers directory listing ("" = disabled)
-    checksumMode*: string ## "sha256", "md5", or "" (disabled)
+    checksumMode*: ChecksumMode ## Checksum sidecar mode (csNone = disabled)
     allowedHosts*: seq[string]
     deniedHosts*: seq[string]
 
@@ -49,7 +55,18 @@ proc newDefaultServerConfig*(rootDir: string): ServerConfig =
     portRangeEnd: 0,
     pxeCompat: false,
     dirListFile: "",
-    checksumMode: "",
+    checksumMode: csNone,
     allowedHosts: @[],
     deniedHosts: @[]
   )
+
+proc parseChecksumMode*(s: string): ChecksumMode =
+  ## Parse a checksum mode string from CLI/config.
+  ## Raises ValueError for unrecognised values.
+  case s.toLowerAscii
+  of "md5":    csMd5
+  of "sha256": raise newException(ValueError,
+      "checksum mode 'sha256' is not yet implemented (use md5 or none)")
+  of "", "none": csNone
+  else: raise newException(ValueError, "Invalid checksum mode: '" & s &
+      "' (expected md5 or none)")

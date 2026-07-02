@@ -40,14 +40,17 @@ proc newUdpTransport*(bindPort: int = 0, ipv6: bool = false): Transport =
 
 type
   UdpListener* = object
-    recv*: proc(timeoutMs: int): Future[tuple[data: seq[byte], host: string, port: int]] {.closure.}
-    close*: proc() {.closure.}
+    recv*:      proc(timeoutMs: int): Future[tuple[data: seq[byte], host: string, port: int]] {.closure.}
+    close*:     proc() {.closure.}
+    localPort*: proc(): int {.closure.}
 
 proc newUdpListener*(bindAddr: string = "0.0.0.0", port: int = 69,
                      ipv6: bool = false): UdpListener =
   let domain = if ipv6: AF_INET6 else: AF_INET
   let sock = newAsyncSocket(domain, SOCK_DGRAM, IPPROTO_UDP)
   sock.bindAddr(Port(port), bindAddr)
+  let (_, assignedPort) = sock.getLocalAddr()
+  result.localPort = proc(): int = int(assignedPort)
 
   # Single persistent recvFrom future — avoids orphaned pending reads on timeout.
   var pendingRecv: Future[tuple[data: string, address: string, port: Port]]

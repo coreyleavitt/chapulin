@@ -1,5 +1,5 @@
 ## TFTP server — async request handlers and listener dispatch.
-## No threads, no locks, no atomics. Concurrent transfers via asyncCheck.
+## No threads, no locks, no atomics. Concurrent transfers via addCallback.
 
 import std/[os, asyncdispatch, strutils, times, md5]
 import protocol
@@ -9,6 +9,7 @@ import options
 import security
 import server_config
 import logging
+import format
 export logging
 
 type
@@ -18,6 +19,12 @@ type
     filename*: string
     direction*: string
     bytesTransferred*: int64
+    totalBytes*: int64
+    startedAt*: float
+    blocksize*: int       ## negotiated (or default) blocksize for this transfer
+    windowsize*: int      ## negotiated (or default) windowsize for this transfer
+    mode*: TransferMode   ## transfer mode (tmOctet / tmNetascii)
+    reqId*: int           ## monotonic per-server request counter; unique within server lifetime
 
   ServerCallbacks* = object
     onTransferStart*: proc(info: TransferInfo) {.closure.}
@@ -31,6 +38,9 @@ type
     logger*: Logger
     running*: bool
     activeTransfers*: int
+    nextReqId*: int       ## incremented once per accepted request; never reset
+    transferFactory*: proc(port: int): Transport {.closure.}
+    cancelFactory*: proc(reqId: int): CancelCheck {.closure.}
 
 proc serverOptionLimits(config: ServerConfig): ServerOptionLimits =
   ServerOptionLimits(
@@ -57,9 +67,9 @@ proc failResult(msg: string): TransferResult =
 
 # --- RRQ handler: serve file to client ---
 
-proc generateChecksum(filePath: string, mode: string): string =
+proc generateChecksum(filePath: string, mode: ChecksumMode): string =
   ## Generate a checksum sidecar file after a successful read transfer.
-  if mode == "md5":
+  if mode == csMd5:
     let content = readFile(filePath)
     let hash = $toMD5(content)
     let sidecar = filePath & ".md5"
@@ -82,7 +92,11 @@ proc generateDirListing(rootDir: string): string =
 proc handleRrq*(config: ServerConfig, request: TftpPacket,
                 transport: Transport, clientHost: string,
                 clientPort: int,
-                onProgress: ProgressCallback = nil): Future[TransferResult] {.async.} =
+                onProgress: ProgressCallback = nil,
+                onStart: proc(info: TransferInfo) {.closure.} = nil,
+                startedAt: float = 0.0,
+                cancelCheck: CancelCheck = nil,
+                reqId: int = 0): Future[TransferResult] {.async.} =
   # Check for directory listing request
   if config.dirListFile.len > 0 and request.filename == config.dirListFile:
     let listing = generateDirListing(config.rootDir)
@@ -95,7 +109,7 @@ proc handleRrq*(config: ServerConfig, request: TftpPacket,
       if start >= listingBytes.len: return @[]
       let endPos = min(start + blocksize, listingBytes.len)
       return listingBytes[start ..< endPos]
-    return await sendBlocks(transport, xferConfig, peer, 1, readData)
+    return await sendBlocks(transport, xferConfig, peer, 1, readData, nil, cancelCheck)
 
   let (valid, resolvedPath, pathErr) = validatePath(config.rootDir, request.filename)
   if not valid:
@@ -157,6 +171,7 @@ proc handleRrq*(config: ServerConfig, request: TftpPacket,
         return failResult("Expected ACK(0) after OACK, got: " & $pkt.opcode)
 
   let readData = proc(blockNum: uint16, blocksize: int): seq[byte] =
+    if blockNum == 0: return @[]
     let offset = int64(blockNum - 1) * int64(blocksize)
     file.setFilePos(offset)
     var buf = newSeq[byte](blocksize)
@@ -164,9 +179,21 @@ proc handleRrq*(config: ServerConfig, request: TftpPacket,
     buf.setLen(bytesRead)
     return buf
 
-  let xferResult = await sendBlocks(transport, xferConfig, peer, 1, readData, onProgress)
+  if onStart != nil:
+    let startInfo = TransferInfo(
+      clientHost: clientHost, clientPort: clientPort,
+      filename: request.filename, direction: "RRQ",
+      bytesTransferred: 0, totalBytes: xferConfig.totalSize,
+      startedAt: startedAt,
+      blocksize: xferConfig.blocksize,
+      windowsize: xferConfig.windowsize,
+      mode: request.mode,
+      reqId: reqId)
+    onStart(startInfo)
 
-  if xferResult.success and config.checksumMode.len > 0:
+  let xferResult = await sendBlocks(transport, xferConfig, peer, 1, readData, onProgress, cancelCheck)
+
+  if xferResult.success and config.checksumMode != csNone:
     discard generateChecksum(resolvedPath, config.checksumMode)
 
   return xferResult
@@ -176,7 +203,11 @@ proc handleRrq*(config: ServerConfig, request: TftpPacket,
 proc handleWrq*(config: ServerConfig, request: TftpPacket,
                 transport: Transport, clientHost: string,
                 clientPort: int,
-                onProgress: ProgressCallback = nil): Future[TransferResult] {.async.} =
+                onProgress: ProgressCallback = nil,
+                onStart: proc(info: TransferInfo) {.closure.} = nil,
+                startedAt: float = 0.0,
+                cancelCheck: CancelCheck = nil,
+                reqId: int = 0): Future[TransferResult] {.async.} =
   let (valid, resolvedPath, pathErr) = validatePath(config.rootDir, request.filename)
   if not valid:
     await sendError(transport, clientHost, clientPort, errAccessViolation, pathErr)
@@ -228,6 +259,18 @@ proc handleWrq*(config: ServerConfig, request: TftpPacket,
     return failResult("Cannot open file for writing: " & e.msg)
   defer: file.close()
 
+  if onStart != nil:
+    let startInfo = TransferInfo(
+      clientHost: clientHost, clientPort: clientPort,
+      filename: request.filename, direction: "WRQ",
+      bytesTransferred: 0, totalBytes: xferConfig.totalSize,
+      startedAt: startedAt,
+      blocksize: xferConfig.blocksize,
+      windowsize: xferConfig.windowsize,
+      mode: request.mode,
+      reqId: reqId)
+    onStart(startInfo)
+
   var writeError = ""
   let onData = proc(blockNum: uint16, data: seq[byte]) =
     if writeError.len > 0: return
@@ -236,10 +279,11 @@ proc handleWrq*(config: ServerConfig, request: TftpPacket,
       if written != data.len:
         writeError = "Write failed"
 
-  let cancelOnWriteError: CancelCheck = proc(): bool = writeError.len > 0
+  let combinedCancel: CancelCheck = proc(): bool =
+    writeError.len > 0 or (cancelCheck != nil and cancelCheck())
 
   var xferResult = await recvBlocks(transport, xferConfig, peer, 1, onData,
-                                     onProgress, cancelOnWriteError)
+                                     onProgress, combinedCancel)
 
   if writeError.len > 0:
     xferResult = failResult(writeError)
@@ -253,13 +297,16 @@ proc newTftpServer*(config: ServerConfig,
                     logger: Logger = nil): TftpServer =
   let log = if logger != nil: logger else: newLogger(llInfo, nil)
   TftpServer(config: config, callbacks: callbacks, logger: log,
-             running: false, activeTransfers: 0)
+             running: false, activeTransfers: 0,
+             transferFactory: proc(port: int): Transport = newUdpTransport(port))
 
 proc stop*(server: TftpServer) =
   server.running = false
 
 proc handleRequest*(server: TftpServer, data: seq[byte],
                    clientHost: string, clientPort: int) {.async.} =
+  server.activeTransfers.inc
+  defer: server.activeTransfers.dec
   var pkt: TftpPacket
   try:
     pkt = decode(data)
@@ -267,8 +314,13 @@ proc handleRequest*(server: TftpServer, data: seq[byte],
     server.logger.debug("Malformed packet from " & clientHost & ":" & $clientPort)
     return
 
+  if pkt.opcode notin {opRrq, opWrq}:
+    server.logger.debug("Ignoring non-request opcode " & $pkt.opcode & " from " &
+                        clientHost & ":" & $clientPort)
+    return
+
   let direction = if pkt.opcode == opRrq: "RRQ" else: "WRQ"
-  server.logger.info(direction & " " & pkt.filename & " from " &
+  server.logger.info(direction & " " & sanitizeForDisplay(pkt.filename) & " from " &
                      clientHost & ":" & $clientPort)
 
   var xferTransport: Transport
@@ -277,7 +329,7 @@ proc handleRequest*(server: TftpServer, data: seq[byte],
     var bound = false
     for port in server.config.portRangeStart .. server.config.portRangeEnd:
       try:
-        xferTransport = newUdpTransport(port)
+        xferTransport = server.transferFactory(port)
         bound = true
         break
       except OSError:
@@ -285,47 +337,78 @@ proc handleRequest*(server: TftpServer, data: seq[byte],
     if not bound:
       server.logger.error("No available ports in range " &
         $server.config.portRangeStart & ":" & $server.config.portRangeEnd)
-      await sendError(newUdpTransport(0), clientHost, clientPort,
-                      errNotDefined, "Server has no available transfer ports")
+      try:
+        let errXfer = newUdpTransport(0)
+        await sendError(errXfer, clientHost, clientPort,
+                        errNotDefined, "Server has no available transfer ports")
+        if errXfer.close != nil: errXfer.close()
+      except OSError, CatchableError:
+        discard
       return
   else:
-    xferTransport = newUdpTransport(0)
+    xferTransport = server.transferFactory(0)
+
+  # Allocate a monotonic per-request id — unique within this server's lifetime.
+  inc server.nextReqId
+  let reqId = server.nextReqId
 
   let startTime = epochTime()
+  let reqCancel: CancelCheck =
+    if server.cancelFactory != nil: server.cancelFactory(reqId)
+    else: nil
   defer:
     if xferTransport.close != nil: xferTransport.close()
-    server.activeTransfers.dec
 
-  # Per-transfer progress callback
+  # Mutable negotiated params: set inside onStart (after OACK) so progressCb
+  # and the final complete/error info carry the actual negotiated values.
+  var effBlocksize = DefaultBlocksize
+  var effWindowsize = DefaultWindowsize
+  var effMode = tmOctet
+
+  # Per-transfer progress callback — captures effBlocksize/windowsize/mode by
+  # reference; by the time sendBlocks calls this, onStart has already run.
   let progressCb: ProgressCallback = if server.callbacks.onTransferProgress != nil:
     proc(bytes: int64, total: int64) =
       let info = TransferInfo(
         clientHost: clientHost, clientPort: clientPort,
         filename: pkt.filename, direction: direction,
-        bytesTransferred: bytes)
+        bytesTransferred: bytes, totalBytes: total,
+        startedAt: startTime,
+        blocksize: effBlocksize,
+        windowsize: effWindowsize,
+        mode: effMode,
+        reqId: reqId)
       server.callbacks.onTransferProgress(info)
   else:
     nil
+
+  # Per-transfer start callback — always non-nil so it captures negotiated params.
+  let onStart: proc(info: TransferInfo) {.closure.} =
+    proc(info: TransferInfo) =
+      effBlocksize = info.blocksize
+      effWindowsize = info.windowsize
+      effMode = info.mode
+      if server.callbacks.onTransferStart != nil:
+        server.callbacks.onTransferStart(info)
 
   var xferResult: TransferResult
   case pkt.opcode
   of opRrq:
     xferResult = await handleRrq(server.config, pkt, xferTransport,
-                                  clientHost, clientPort, progressCb)
+                                  clientHost, clientPort, progressCb,
+                                  onStart, startTime, reqCancel, reqId)
   of opWrq:
     xferResult = await handleWrq(server.config, pkt, xferTransport,
-                                  clientHost, clientPort, progressCb)
+                                  clientHost, clientPort, progressCb,
+                                  onStart, startTime, reqCancel, reqId)
   else:
-    server.logger.warn("Unexpected opcode from " & clientHost)
-    await sendError(xferTransport, clientHost, clientPort,
-                    errIllegalOperation, "Expected RRQ or WRQ")
-    return
+    discard  # unreachable: guard above returns for any non-RRQ/WRQ opcode
 
   let durationMs = (epochTime() - startTime) * 1000.0
   let logMsg = formatTransferLog(direction, clientHost, clientPort,
-                                  pkt.filename, xferResult.success,
+                                  sanitizeForDisplay(pkt.filename), xferResult.success,
                                   xferResult.bytesTransferred, durationMs,
-                                  xferResult.errorMsg)
+                                  sanitizeForDisplay(xferResult.errorMsg))
   if xferResult.success:
     server.logger.info(logMsg)
   else:
@@ -334,7 +417,13 @@ proc handleRequest*(server: TftpServer, data: seq[byte],
   let info = TransferInfo(
     clientHost: clientHost, clientPort: clientPort,
     filename: pkt.filename, direction: direction,
-    bytesTransferred: xferResult.bytesTransferred)
+    bytesTransferred: xferResult.bytesTransferred,
+    totalBytes: xferResult.totalSize,
+    startedAt: startTime,
+    blocksize: effBlocksize,
+    windowsize: effWindowsize,
+    mode: effMode,
+    reqId: reqId)
 
   if xferResult.success:
     if server.callbacks.onTransferComplete != nil:
@@ -350,7 +439,7 @@ proc isBroadcastOrMulticast*(host: string): bool =
   host.startsWith("ff")       # IPv6 multicast (ff00::/8)
 
 proc run*(server: TftpServer, listener: UdpListener) {.async.} =
-  ## Run the server main loop. Concurrent transfers via asyncCheck — no threads.
+  ## Run the server main loop. Concurrent transfers via addCallback — no threads.
   server.running = true
 
   while server.running:
@@ -361,6 +450,9 @@ proc run*(server: TftpServer, listener: UdpListener) {.async.} =
       (data, clientHost, clientPort) = await listener.recv(1000)
     except TransportTimeoutError:
       continue
+    except CatchableError as e:
+      server.logger.error("Listener error: " & e.msg)
+      break
 
     # RFC 1123 section 4.2: silently ignore broadcast/multicast requests
     if isBroadcastOrMulticast(clientHost):
@@ -368,18 +460,27 @@ proc run*(server: TftpServer, listener: UdpListener) {.async.} =
 
     if not checkHostAccess(server.config, clientHost):
       server.logger.warn("Access denied for " & clientHost)
-      let xfer = newUdpTransport(0)
-      await sendError(xfer, clientHost, clientPort, errAccessViolation, "Access denied")
-      if xfer.close != nil: xfer.close()
+      try:
+        let xfer = newUdpTransport(0)
+        await sendError(xfer, clientHost, clientPort, errAccessViolation, "Access denied")
+        if xfer.close != nil: xfer.close()
+      except OSError, CatchableError:
+        discard
       continue
 
     if server.activeTransfers >= server.config.maxConcurrent:
       server.logger.warn("Max concurrent transfers reached, rejecting " & clientHost)
-      let xfer = newUdpTransport(0)
-      await sendError(xfer, clientHost, clientPort, errNotDefined,
-                      "Server busy, max concurrent transfers reached")
-      if xfer.close != nil: xfer.close()
+      try:
+        let xfer = newUdpTransport(0)
+        await sendError(xfer, clientHost, clientPort, errNotDefined,
+                        "Server busy, max concurrent transfers reached")
+        if xfer.close != nil: xfer.close()
+      except OSError, CatchableError:
+        discard
       continue
 
-    server.activeTransfers.inc
-    asyncCheck server.handleRequest(data, clientHost, clientPort)
+    let hf = server.handleRequest(data, clientHost, clientPort)
+    hf.addCallback(proc() {.gcsafe.} =
+      {.cast(gcsafe).}:
+        if hf.failed:
+          server.logger.error("Unhandled transfer handler error: " & hf.readError.msg))

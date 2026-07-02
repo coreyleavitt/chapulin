@@ -16,6 +16,9 @@ nimblecache/
 # Test artifacts
 test-files/large.bin
 /tmp/
+# Compiled test binaries (nim c -r artifacts, no extension); keep the sources.
+tests/t_*
+!tests/t_*.nim
 
 # IDE
 .vscode/

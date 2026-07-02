@@ -45,7 +45,8 @@ proc getFile*(transport: Transport, config: TftpClientConfig,
               host: string, port: int, filename: string,
               onData: proc(blockNum: uint16, data: seq[byte]),
               onProgress: ProgressCallback = nil,
-              cancelCheck: CancelCheck = nil): Future[TransferResult] {.async.} =
+              cancelCheck: CancelCheck = nil,
+              onNegotiated: proc(blocksize: int, windowsize: int) {.closure.} = nil): Future[TransferResult] {.async.} =
   let opts = clientBuildOptions(config)
   let rrq = TftpPacket(opcode: opRrq, filename: filename, mode: config.mode, options: opts)
   await transport.send(encode(rrq), host, port)
@@ -87,6 +88,8 @@ proc getFile*(transport: Transport, config: TftpClientConfig,
         return TransferResult(success: false, bytesTransferred: 0,
                               errorMsg: "Invalid option value in OACK",
                               totalSize: xferConfig.totalSize)
+      if onNegotiated != nil:
+        onNegotiated(xferConfig.blocksize, xferConfig.windowsize)
       peer.lockTo(resp.host, resp.port)
       await transport.send(encode(TftpPacket(opcode: opAck, ackBlockNum: 0)),
                            peer.host, peer.port)
@@ -98,6 +101,8 @@ proc getFile*(transport: Transport, config: TftpClientConfig,
       if optionsRequested:
         xferConfig.blocksize = DefaultBlocksize
       if pkt.blockNum == 1:
+        if onNegotiated != nil:
+          onNegotiated(xferConfig.blocksize, xferConfig.windowsize)
         onData(1, pkt.data)
         let bytesFromFirst = int64(pkt.data.len)
         await transport.send(encode(TftpPacket(opcode: opAck, ackBlockNum: 1)),
@@ -144,7 +149,8 @@ proc putFile*(transport: Transport, config: TftpClientConfig,
               host: string, port: int, filename: string,
               readData: proc(blockNum: uint16, blocksize: int): seq[byte],
               onProgress: ProgressCallback = nil,
-              cancelCheck: CancelCheck = nil): Future[TransferResult] {.async.} =
+              cancelCheck: CancelCheck = nil,
+              onNegotiated: proc(blocksize: int, windowsize: int) {.closure.} = nil): Future[TransferResult] {.async.} =
   let opts = clientBuildOptions(config)
   let wrq = TftpPacket(opcode: opWrq, filename: filename, mode: config.mode, options: opts)
   await transport.send(encode(wrq), host, port)
@@ -182,6 +188,8 @@ proc putFile*(transport: Transport, config: TftpClientConfig,
         return TransferResult(success: false, bytesTransferred: 0,
                               errorMsg: "Invalid option value in OACK",
                               totalSize: xferConfig.totalSize)
+      if onNegotiated != nil:
+        onNegotiated(xferConfig.blocksize, xferConfig.windowsize)
       peer.lockTo(resp.host, resp.port)
       break
 
@@ -190,6 +198,8 @@ proc putFile*(transport: Transport, config: TftpClientConfig,
         peer.lockTo(resp.host, resp.port)
         if optionsRequested:
           xferConfig.blocksize = DefaultBlocksize
+        if onNegotiated != nil:
+          onNegotiated(xferConfig.blocksize, xferConfig.windowsize)
         break
       else:
         continue

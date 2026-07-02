@@ -168,6 +168,18 @@ suite "handleRrq — serve file to client":
     check oack.opcode == opOack
     check ("blksize", "1024") in oack.oackOptions
 
+  test "RRQ cancelled by cancelCheck returns failure":
+    let sm = newServerMock()
+    # No ACK responses needed — cancelCheck fires before any recv
+    let config = newDefaultServerConfig(testRoot)
+    let request = TftpPacket(opcode: opRrq, filename: "hello.txt",
+                              mode: tmOctet, options: @[])
+    let alwaysCancel: CancelCheck = proc(): bool = true
+    let result = waitFor handleRrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000, nil, nil, 0.0, alwaysCancel)
+    check result.success == false
+    check "cancel" in result.errorMsg.toLowerAscii
+
 suite "handleWrq — receive file from client":
   test "single block upload succeeds":
     let sm = newServerMock()
@@ -249,6 +261,102 @@ suite "handleWrq — receive file from client":
     check result.success == false
     let sent = decode(sm.sentPackets[0].data)
     check sent.opcode == opError
+
+suite "onTransferStart callback":
+  test "onTransferStart fires once with correct totalBytes for RRQ":
+    let sm = newServerMock()
+    sm.addResponse(makeAckPkt(1))
+
+    let config = newDefaultServerConfig(testRoot)
+    let request = TftpPacket(opcode: opRrq, filename: "hello.txt",
+                              mode: tmOctet, options: @[])
+
+    var startFired = 0
+    var startInfo: TransferInfo
+    let onStart = proc(info: TransferInfo) {.closure.} =
+      inc startFired
+      startInfo = info
+
+    let result = waitFor handleRrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000, nil, onStart, 0.0)
+
+    check result.success == true
+    check startFired == 1
+    check startInfo.totalBytes == getFileSize(testRoot / "hello.txt")
+
+  test "onTransferStart fires once with correct totalBytes for WRQ (tsize known)":
+    let sm = newServerMock()
+    # WRQ with tsize option so totalBytes is known; client ACKs OACK with DATA(1)
+    sm.addResponse(makeDataPkt(1, @[byte 10, 20, 30]))
+
+    var config = newDefaultServerConfig(testRoot)
+    config.writePolicy = wpCreateOrOverwrite
+    let request = TftpPacket(opcode: opWrq, filename: "start_wrq.bin",
+                              mode: tmOctet,
+                              options: @[("tsize", "3")])
+
+    var startFired = 0
+    var startInfo: TransferInfo
+    let onStart = proc(info: TransferInfo) {.closure.} =
+      inc startFired
+      startInfo = info
+
+    let result = waitFor handleWrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000, nil, onStart, 0.0)
+
+    check result.success == true
+    check startFired == 1
+    check startInfo.totalBytes == 3
+
+suite "transferFactory injection":
+  test "transferFactory is invoked for each request":
+    # Re-create the test file because cleanup may have run if suites share state
+    createDir(testRoot)
+    writeFile(testRoot / "hello.txt", "Hello from TFTP server")
+
+    let sm = newServerMock()
+    sm.addResponse(makeAckPkt(1))
+
+    var factoryCalled = 0
+    let config = newDefaultServerConfig(testRoot)
+    let server = newTftpServer(config)
+    server.transferFactory = proc(port: int): Transport =
+      inc factoryCalled
+      return sm.toTransport()
+
+    let rrqPkt = TftpPacket(opcode: opRrq, filename: "hello.txt",
+                             mode: tmOctet, options: @[])
+    waitFor server.handleRequest(encode(rrqPkt), "10.0.0.1", 5000)
+
+    check factoryCalled == 1
+
+suite "parseChecksumMode — FIX 10: sha256 raises ValueError":
+
+  test "md5 parses as csMd5":
+    check parseChecksumMode("md5") == csMd5
+    check parseChecksumMode("MD5") == csMd5
+
+  test "none and empty string parse as csNone":
+    check parseChecksumMode("none") == csNone
+    check parseChecksumMode("") == csNone
+
+  test "sha256 raises ValueError (not yet implemented)":
+    var raised = false
+    try:
+      discard parseChecksumMode("sha256")
+    except ValueError as e:
+      raised = true
+      check "sha256" in e.msg
+      check "not yet implemented" in e.msg
+    check raised
+
+  test "unknown value raises ValueError":
+    var raised = false
+    try:
+      discard parseChecksumMode("crc32")
+    except ValueError:
+      raised = true
+    check raised
 
 suite "Server test cleanup":
   test "remove test files":

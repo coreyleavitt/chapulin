@@ -3,7 +3,6 @@
 import unittest
 import std/[os, strutils, envvars, asyncdispatch]
 import ../src/chapulin/protocol
-import ../src/chapulin/engine
 import ../src/chapulin/transport
 import ../src/chapulin/api
 import ../src/chapulin/server
@@ -29,32 +28,16 @@ template skipIfNoServer() =
     echo "  (skipped - no TFTP server)"
     skip()
 
-type ErrorRef = ref object
-  msg: string
-
-proc newErrorRef(): ErrorRef = ErrorRef(msg: "")
-
-proc makeCallbacks(err: ErrorRef): TransferCallbacks =
-  TransferCallbacks(
-    onProgress: proc(b: int64, t: int64) = discard,
-    onComplete: proc() = discard,
-    onError: proc(code: int, msg: string) = err.msg = msg
-  )
-
 suite "Integration - GET":
   test "download small file":
     skipIfNoServer()
     let outPath = getTempDir() / "chapulin_int_hello.txt"
     defer: removeFile(outPath)
-
-    let errRef = newErrorRef()
-    let callbacks = makeCallbacks(errRef)
+    let s = newSession()
     let req = newTransferRequest(tftpHost, tftpPort, "hello.txt", outPath, tdGet)
-    let udp = newUdpTransport()
-    let result = waitFor executeTransfer(req, callbacks, udp)
-
+    let result = s.waitTransfer(s.startTransfer(req))
     if not result.success:
-      echo "  Error: " & errRef.msg
+      echo "  Error: " & result.errorMsg
     check result.success == true
     check result.bytesTransferred > 0
     check fileExists(outPath)
@@ -65,15 +48,11 @@ suite "Integration - GET":
     skipIfNoServer()
     let outPath = getTempDir() / "chapulin_int_random.bin"
     defer: removeFile(outPath)
-
-    let errRef = newErrorRef()
-    let callbacks = makeCallbacks(errRef)
+    let s = newSession()
     let req = newTransferRequest(tftpHost, tftpPort, "random.bin", outPath, tdGet)
-    let udp = newUdpTransport()
-    let result = waitFor executeTransfer(req, callbacks, udp)
-
+    let result = s.waitTransfer(s.startTransfer(req))
     if not result.success:
-      echo "  Error: " & errRef.msg
+      echo "  Error: " & result.errorMsg
     check result.success == true
     check result.bytesTransferred == 10240
 
@@ -81,35 +60,28 @@ suite "Integration - GET":
     skipIfNoServer()
     let outPath = getTempDir() / "chapulin_int_missing.txt"
     defer: removeFile(outPath)
-
-    let errRef = newErrorRef()
-    let callbacks = makeCallbacks(errRef)
+    let s = newSession()
     let req = newTransferRequest(tftpHost, tftpPort, "does_not_exist.txt", outPath, tdGet)
-    let udp = newUdpTransport()
-    let result = waitFor executeTransfer(req, callbacks, udp)
-
+    let result = s.waitTransfer(s.startTransfer(req))
     check result.success == false
-    check errRef.msg.len > 0
+    check result.errorMsg.len > 0
 
   test "download with custom blocksize":
     skipIfNoServer()
     let outPath = getTempDir() / "chapulin_int_bs.bin"
     defer: removeFile(outPath)
-
-    let errRef = newErrorRef()
-    let callbacks = makeCallbacks(errRef)
+    let s = newSession()
     var req = newTransferRequest(tftpHost, tftpPort, "random.bin", outPath, tdGet)
     req.options.blocksize = 1024
-    let udp = newUdpTransport()
-    let result = waitFor executeTransfer(req, callbacks, udp)
-
+    let result = s.waitTransfer(s.startTransfer(req))
     if not result.success:
-      echo "  Error: " & errRef.msg
+      echo "  Error: " & result.errorMsg
     check result.success == true
     check result.bytesTransferred == 10240
 
 suite "Integration - PUT":
   setup:
+    # Create a small temp file for upload tests
     let uploadFile = getTempDir() / "chapulin_int_upload.txt"
     writeFile(uploadFile, "Test upload content from chapulin integration test\n")
 
@@ -118,16 +90,11 @@ suite "Integration - PUT":
 
   test "upload small file":
     skipIfNoServer()
-
-    let errRef = newErrorRef()
-    let callbacks = makeCallbacks(errRef)
-    let req = newTransferRequest(tftpHost, tftpPort, "uploaded.txt",
-                                  uploadFile, tdPut)
-    let udp = newUdpTransport()
-    let result = waitFor executeTransfer(req, callbacks, udp)
-
+    let s = newSession()
+    let req = newTransferRequest(tftpHost, tftpPort, "uploaded.txt", uploadFile, tdPut)
+    let result = s.waitTransfer(s.startTransfer(req))
     if not result.success:
-      echo "  Error: " & errRef.msg
+      echo "  Error: " & result.errorMsg
     check result.success == true
     check result.bytesTransferred > 0
 
@@ -136,41 +103,42 @@ suite "Integration - Progress":
     skipIfNoServer()
     let outPath = getTempDir() / "chapulin_int_progress.bin"
     defer: removeFile(outPath)
-
-    let progressCount = new int
-    progressCount[] = 0
-    let errRef2 = newErrorRef()
-
-    let callbacks = TransferCallbacks(
-      onProgress: proc(b: int64, t: int64) =
-        progressCount[].inc,
-      onComplete: proc() = discard,
-      onError: proc(code: int, msg: string) = errRef2.msg = msg
-    )
-
+    let s = newSession()
     let req = newTransferRequest(tftpHost, tftpPort, "random.bin", outPath, tdGet)
-    let udp = newUdpTransport()
-    let result = waitFor executeTransfer(req, callbacks, udp)
-
+    let id = s.startTransfer(req)
+    var progressCount = 0
+    var result = TransferResult(success: false)
+    var done = false
+    while not done:
+      for ev in s.poll(0):
+        if ev.xfrId == id:
+          case ev.kind
+          of evTransferProgress: progressCount.inc
+          of evTransferComplete:
+            result = TransferResult(success: true, bytesTransferred: ev.snap.bytes,
+                                    totalSize: ev.snap.total.get(-1))
+            done = true
+          of evTransferError:
+            result = TransferResult(success: false, errorCode: ev.errorCode,
+                                    errorMsg: ev.errorMsg)
+            done = true
+          else: discard
+      if not done and not hasPendingOperations(): done = true
     if not result.success:
-      echo "  Error: " & errRef2.msg
+      echo "  Error: " & result.errorMsg
     check result.success == true
-    check progressCount[] > 1
+    check progressCount > 1
 
 suite "Integration - Large file (>128KB, block numbers >255)":
   test "download 256KB file — proves byte order works for block >255":
     skipIfNoServer()
     let outPath = getTempDir() / "chapulin_int_large.bin"
     defer: removeFile(outPath)
-
-    let errRef3 = newErrorRef()
-    let callbacks = makeCallbacks(errRef3)
+    let s = newSession()
     let req = newTransferRequest(tftpHost, tftpPort, "large.bin", outPath, tdGet)
-    let udp = newUdpTransport()
-    let result = waitFor executeTransfer(req, callbacks, udp)
-
+    let result = s.waitTransfer(s.startTransfer(req))
     if not result.success:
-      echo "  Error: " & errRef3.msg
+      echo "  Error: " & result.errorMsg
     check result.success == true
     check result.bytesTransferred == 256 * 1024  # 262144 bytes = 512 blocks
 
@@ -203,23 +171,22 @@ suite "Self-hosted server setup":
   test "start server":
     startTestServer()
     selfTestListener = newUdpListener(port = selfTestPort)
-    # Start server on the async event loop — non-blocking
-    asyncCheck serverInstance.run(selfTestListener)
+    # Start server on the async event loop — non-blocking.
+    # Use addCallback (not asyncCheck) so a future failure never re-raises
+    # through the test runner (mirrors api.nim Invariant 2).
+    let runFut = serverInstance.run(selfTestListener)
+    runFut.addCallback(proc() = discard)
     check serverInstance.running == true
 
 suite "Self-hosted - Client GET from our server":
   test "download small file":
     let outPath = getTempDir() / "chapulin_self_get.txt"
     defer: removeFile(outPath)
-    let errRef = newErrorRef()
-    let callbacks = makeCallbacks(errRef)
-    let req = newTransferRequest("127.0.0.1", selfTestPort,
-                                  "readme.txt", outPath, tdGet)
-    let udp = newUdpTransport()
-    let result = waitFor executeTransfer(req, callbacks, udp)
-    if udp.close != nil: udp.close()
+    let s = newSession()
+    let req = newTransferRequest("127.0.0.1", selfTestPort, "readme.txt", outPath, tdGet)
+    let result = s.waitTransfer(s.startTransfer(req))
     if not result.success:
-      echo "  Self-hosted GET error: " & errRef.msg
+      echo "  Self-hosted GET error: " & result.errorMsg
     check result.success == true
     check fileExists(outPath)
     check readFile(outPath) == "Self-test file content"
@@ -227,40 +194,28 @@ suite "Self-hosted - Client GET from our server":
   test "download multi-block file":
     let outPath = getTempDir() / "chapulin_self_multi.bin"
     defer: removeFile(outPath)
-    let errRef = newErrorRef()
-    let callbacks = makeCallbacks(errRef)
-    let req = newTransferRequest("127.0.0.1", selfTestPort,
-                                  "multiblock.bin", outPath, tdGet)
-    let udp = newUdpTransport()
-    let result = waitFor executeTransfer(req, callbacks, udp)
-    if udp.close != nil: udp.close()
+    let s = newSession()
+    let req = newTransferRequest("127.0.0.1", selfTestPort, "multiblock.bin", outPath, tdGet)
+    let result = s.waitTransfer(s.startTransfer(req))
     if not result.success:
-      echo "  Self-hosted multi GET error: " & errRef.msg
+      echo "  Self-hosted multi GET error: " & result.errorMsg
     check result.success == true
     check result.bytesTransferred == 2000
 
   test "file not found":
     let outPath = getTempDir() / "chapulin_self_missing.txt"
     defer: removeFile(outPath)
-    let errRef = newErrorRef()
-    let callbacks = makeCallbacks(errRef)
-    let req = newTransferRequest("127.0.0.1", selfTestPort,
-                                  "nonexistent.txt", outPath, tdGet)
-    let udp = newUdpTransport()
-    let result = waitFor executeTransfer(req, callbacks, udp)
-    if udp.close != nil: udp.close()
+    let s = newSession()
+    let req = newTransferRequest("127.0.0.1", selfTestPort, "nonexistent.txt", outPath, tdGet)
+    let result = s.waitTransfer(s.startTransfer(req))
     check result.success == false
 
   test "path traversal rejected":
     let outPath = getTempDir() / "chapulin_self_traversal.txt"
     defer: removeFile(outPath)
-    let errRef = newErrorRef()
-    let callbacks = makeCallbacks(errRef)
-    let req = newTransferRequest("127.0.0.1", selfTestPort,
-                                  "../../../etc/passwd", outPath, tdGet)
-    let udp = newUdpTransport()
-    let result = waitFor executeTransfer(req, callbacks, udp)
-    if udp.close != nil: udp.close()
+    let s = newSession()
+    let req = newTransferRequest("127.0.0.1", selfTestPort, "../../../etc/passwd", outPath, tdGet)
+    let result = s.waitTransfer(s.startTransfer(req))
     check result.success == false
 
 suite "Self-hosted - Client PUT to our server":
@@ -268,23 +223,9 @@ suite "Self-hosted - Client PUT to our server":
     let uploadPath = getTempDir() / "chapulin_self_upload_src.txt"
     writeFile(uploadPath, "Uploaded via self-test")
     defer: removeFile(uploadPath)
-    let clientConfig = TftpClientConfig(
-      timeout: 3, retries: 3, blocksize: DefaultBlocksize,
-      requestTsize: false, tsize: -1
-    )
-    let ct = newUdpTransport()
-    var file = open(uploadPath, fmRead)
-    defer: file.close()
-    let readData = proc(blockNum: uint16, blocksize: int): seq[byte] =
-      let offset = int64(blockNum - 1) * int64(blocksize)
-      file.setFilePos(offset)
-      var buf = newSeq[byte](blocksize)
-      let bytesRead = file.readBytes(buf, 0, blocksize)
-      buf.setLen(bytesRead)
-      return buf
-    let result = waitFor putFile(ct, clientConfig,
-                                  "127.0.0.1", selfTestPort, "writable.txt", readData)
-    if ct.close != nil: ct.close()
+    let s = newSession()
+    let req = newTransferRequest("127.0.0.1", selfTestPort, "writable.txt", uploadPath, tdPut)
+    let result = s.waitTransfer(s.startTransfer(req))
     if not result.success:
       echo "  Self-hosted PUT error: " & result.errorMsg
     check result.success == true
@@ -295,49 +236,27 @@ suite "Self-hosted - Client PUT to our server":
     let uploadPath = getTempDir() / "chapulin_self_upload_opt.txt"
     writeFile(uploadPath, "Options upload test")
     defer: removeFile(uploadPath)
-    let errRef = newErrorRef()
-    let callbacks = makeCallbacks(errRef)
-    let req = newTransferRequest("127.0.0.1", selfTestPort,
-                                  "writable.txt", uploadPath, tdPut)
-    let udp = newUdpTransport()
-    let result = waitFor executeTransfer(req, callbacks, udp)
-    if udp.close != nil: udp.close()
+    let s = newSession()
+    let req = newTransferRequest("127.0.0.1", selfTestPort, "writable.txt", uploadPath, tdPut)
+    let result = s.waitTransfer(s.startTransfer(req))
     if not result.success:
-      echo "  Self-hosted PUT+options error: " & errRef.msg
+      echo "  Self-hosted PUT+options error: " & result.errorMsg
     check result.success == true
 
 suite "Self-hosted - Concurrent transfers":
   test "two simultaneous async GETs succeed":
-    # Both transfers run concurrently on the same async event loop
-    proc twoGets(): Future[tuple[r1: TransferResult, r2: TransferResult]] {.async.} =
-      let errRef1 = newErrorRef()
-      let cb1 = makeCallbacks(errRef1)
-      let req1 = newTransferRequest("127.0.0.1", selfTestPort,
-                                     "multiblock.bin", getTempDir() / "chapulin_conc1.bin", tdGet)
-      let udp1 = newUdpTransport()
-
-      let errRef2 = newErrorRef()
-      let cb2 = makeCallbacks(errRef2)
-      let req2 = newTransferRequest("127.0.0.1", selfTestPort,
-                                     "readme.txt", getTempDir() / "chapulin_conc2.txt", tdGet)
-      let udp2 = newUdpTransport()
-
-      # Launch both transfers concurrently on the event loop
-      let fut1 = executeTransfer(req1, cb1, udp1)
-      let fut2 = executeTransfer(req2, cb2, udp2)
-
-      let r1 = await fut1
-      let r2 = await fut2
-
-      if udp1.close != nil: udp1.close()
-      if udp2.close != nil: udp2.close()
-      return (r1: r1, r2: r2)
-
-    let (result1, result2) = waitFor twoGets()
+    let s = newSession()
+    let req1 = newTransferRequest("127.0.0.1", selfTestPort,
+                                   "multiblock.bin", getTempDir() / "chapulin_conc1.bin", tdGet)
+    let req2 = newTransferRequest("127.0.0.1", selfTestPort,
+                                   "readme.txt", getTempDir() / "chapulin_conc2.txt", tdGet)
+    let id1 = s.startTransfer(req1)
+    let id2 = s.startTransfer(req2)
+    let result1 = s.waitTransfer(id1)
+    let result2 = s.waitTransfer(id2)
     defer:
       removeFile(getTempDir() / "chapulin_conc1.bin")
       removeFile(getTempDir() / "chapulin_conc2.txt")
-
     if not result1.success:
       echo "  Concurrent GET 1 error: " & result1.errorMsg
     if not result2.success:

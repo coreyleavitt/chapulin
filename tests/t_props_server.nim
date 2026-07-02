@@ -206,7 +206,7 @@ proc serveWithChecksum(content: seq[byte]): tuple[ok: bool, sidecar: string] =
   createDir(dir)
   writeFile(dir / "f.bin", toStr(content))
   var cfg = newDefaultServerConfig(dir)
-  cfg.checksumMode = "md5"
+  cfg.checksumMode = csMd5
   let request = TftpPacket(opcode: opRrq, filename: "f.bin", mode: tmOctet,
                            options: @[])
   let w = newWire()

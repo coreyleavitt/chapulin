@@ -6,116 +6,13 @@ import nigui
 import std/os
 import std/strutils
 import std/times
-import std/[atomics, asyncdispatch]
 import ../../src/chapulin/api
-import ../../src/chapulin/transport
-import ../../src/chapulin/format
-import ../../src/chapulin/server
-import ../../src/chapulin/server_config
-import ../../src/chapulin/logging
-
-type
-  MsgKind = enum
-    mkProgress, mkComplete, mkError, mkLog
-
-  TransferMsg = object
-    case kind: MsgKind
-    of mkProgress:
-      bytesTransferred: int64
-      totalBytes: int64
-    of mkComplete:
-      finalBytes: int64
-    of mkError:
-      errorMsg: string
-    of mkLog:
-      logMsg: string
-
-  TransferParams = object
-    host: string
-    port: int
-    remoteFile: string
-    localFile: string
-    direction: TransferDirection
-    blocksize: int
-
-  ServerParams = object
-    rootDir: string
-    port: int
-    writePolicy: WritePolicy
-    maxClients: int
-
-var
-  clientChannel: Channel[TransferMsg]
-  serverChannel: Channel[TransferMsg]
-  cancelRequested: Atomic[bool]
-  serverStopRequested: Atomic[bool]
-  transferParams: TransferParams
-  srvParams: ServerParams
-
-clientChannel.open()
-serverChannel.open()
 
 const LabelWidth = 80
 
-proc transferWorker() {.thread.} =
-  {.gcsafe.}:
-    let params = transferParams
-    var lastBytes: int64 = 0
-    let callbacks = TransferCallbacks(
-      onProgress: proc(b: int64, t: int64) =
-        lastBytes = b
-        clientChannel.send(TransferMsg(kind: mkProgress,
-                                        bytesTransferred: b, totalBytes: t)),
-      onComplete: proc() =
-        clientChannel.send(TransferMsg(kind: mkComplete, finalBytes: lastBytes)),
-      onError: proc(code: int, msg: string) =
-        clientChannel.send(TransferMsg(kind: mkError, errorMsg: msg))
-    )
-    var req = newTransferRequest(params.host, params.port, params.remoteFile,
-                                 params.localFile, params.direction)
-    req.options.blocksize = params.blocksize
-    let udpTransport = newUdpTransport(ipv6 = isIPv6(params.host))
-    defer:
-      if udpTransport.close != nil: udpTransport.close()
-    discard waitFor executeTransfer(req, callbacks, udpTransport,
-      cancelCheck = proc(): bool = cancelRequested.load())
-
-proc serverWorker() {.thread.} =
-  {.gcsafe.}:
-    let params = srvParams
-    let logOutput: LogOutput = proc(level: LogLevel, msg: string) =
-      serverChannel.send(TransferMsg(kind: mkLog,
-                                      logMsg: formatLogMessage(level, msg)))
-    let logger = newLogger(llInfo, logOutput)
-    var config = newDefaultServerConfig(params.rootDir)
-    config.listenPort = params.port
-    config.writePolicy = params.writePolicy
-    config.maxConcurrent = params.maxClients
-    let srv = newTftpServer(config, logger = logger)
-    let listener = newUdpListener(port = params.port)
-    serverChannel.send(TransferMsg(kind: mkLog,
-                                    logMsg: "[INFO]  Server started on port " & $params.port))
-    proc runUntilStopped() {.async.} =
-      srv.running = true
-      while srv.running and not serverStopRequested.load():
-        var data: seq[byte]
-        var clientHost: string
-        var clientPort: int
-        try:
-          (data, clientHost, clientPort) = await listener.recv(500)
-        except TransportTimeoutError:
-          continue
-        if isBroadcastOrMulticast(clientHost): continue
-        if srv.activeTransfers >= config.maxConcurrent: continue
-        srv.activeTransfers.inc
-        asyncCheck srv.handleRequest(data, clientHost, clientPort)
-      srv.running = false
-      listener.close()
-    waitFor runUntilStopped()
-    serverChannel.send(TransferMsg(kind: mkLog,
-                                    logMsg: "[INFO]  Server stopped"))
-
 proc launchGui*() =
+  let session = newSession()  # default minLogLevel = llInfo (resolved in api.nim's scope)
+
   app.init()
 
   var window = newWindow("chapulin")
@@ -284,11 +181,11 @@ proc launchGui*() =
   serverPanel.add(serverLog)
 
   # === State ===
-  var transferThread: Thread[void]
   var transferActive = false
   var clientStartTime: float = 0.0
-  var serverThread: Thread[void]
   var serverActive = false
+  var clientXferId: TransferId = NoTransfer
+  var serverId: ServerId = NoServer
 
   proc appendClientLog(msg: string) =
     if clientLog.text.len > 0: clientLog.addLine(msg)
@@ -335,56 +232,86 @@ proc launchGui*() =
 
   # === Client cancel ===
   cancelBtn.onClick = proc(event: ClickEvent) =
-    cancelRequested.store(true)
+    session.cancel(clientXferId)
     appendClientLog("Cancelling transfer...")
 
-  # === Poll channels ===
+  # === Single 50 ms timer: pump session events for both client and server ===
   discard startRepeatingTimer(50, proc(event: TimerEvent) =
-    if transferActive:
-      var recvResult = clientChannel.tryRecv()
-      while recvResult.dataAvailable:
-        let msg = recvResult.msg
-        case msg.kind
-        of mkProgress:
+    for ev in session.poll(0):
+      case ev.kind
+      of evTransferStarted:
+        # Server-side: a new incoming transfer was accepted.
+        if ev.srvId != NoServer:
+          let dirStr = if ev.snap.direction == tdGet: "RRQ" else: "WRQ"
+          appendServerLog("Incoming transfer started (" & dirStr & ")")
+        # Client-side: no additional UI action needed; startTransfer already logged.
+
+      of evTransferProgress:
+        if ev.srvId == NoServer and ev.xfrId == clientXferId:
+          # Client transfer progress: update progress bar and status label.
+          let f = fraction(ev.snap.bytes, ev.snap.total)
+          if f.isSome:
+            progressBar.value = f.get
           let elapsed = epochTime() - clientStartTime
-          let speed = if elapsed > 0: float(msg.bytesTransferred) / elapsed else: 0.0
-          var status = formatBytes(msg.bytesTransferred)
-          if msg.totalBytes > 0:
-            let pct = float(msg.bytesTransferred) / float(msg.totalBytes)
-            progressBar.value = pct
-            status &= " / " & formatBytes(msg.totalBytes) &
-                      " (" & $(int(pct * 100)) & "%)"
+          let speed = if elapsed > 0.0: float(ev.snap.bytes) / elapsed else: 0.0
+          var status = formatBytes(ev.snap.bytes)
+          if f.isSome:
+            status &= " / " & formatBytes(ev.snap.total.get) &
+                      " (" & $(int(f.get * 100.0)) & "%)"
           status &= " | " & formatSpeed(speed)
           statusLabel.text = status
-        of mkComplete:
+        elif ev.srvId != NoServer:
+          # Server-side per-transfer progress: show in server log.
+          let f = fraction(ev.snap.bytes, ev.snap.total)
+          var line = "Transfer progress: " & formatBytes(ev.snap.bytes)
+          if f.isSome:
+            line &= " (" & $(int(f.get * 100.0)) & "%)"
+          appendServerLog(line)
+
+      of evTransferComplete:
+        if ev.srvId == NoServer and ev.xfrId == clientXferId:
           progressBar.value = 1.0
           let elapsed = epochTime() - clientStartTime
           statusLabel.text = "Transfer complete (" &
             elapsed.formatFloat(ffDecimal, 2) & "s)"
-          appendClientLog("Completed: " & formatBytes(msg.finalBytes))
-          joinThread(transferThread)
+          appendClientLog("Completed: " & formatBytes(ev.snap.bytes))
           setTransferring(false)
-          return
-        of mkError:
-          statusLabel.text = "Error: " & msg.errorMsg
-          appendClientLog("Error: " & msg.errorMsg)
-          joinThread(transferThread)
-          setTransferring(false)
-          return
-        of mkLog:
-          appendClientLog(msg.logMsg)
-        recvResult = clientChannel.tryRecv()
+        elif ev.srvId != NoServer:
+          appendServerLog("Transfer complete: " & formatBytes(ev.snap.bytes))
 
-    if serverActive:
-      var recvResult = serverChannel.tryRecv()
-      while recvResult.dataAvailable:
-        let msg = recvResult.msg
-        case msg.kind
-        of mkLog:
-          appendServerLog(msg.logMsg)
+      of evTransferError:
+        if ev.srvId == NoServer and ev.xfrId == clientXferId:
+          statusLabel.text = "Error: " & sanitizeForDisplay(ev.errorMsg)
+          appendClientLog("Error: " & sanitizeForDisplay(ev.errorMsg))
+          setTransferring(false)
+        elif ev.srvId != NoServer:
+          appendServerLog("Transfer error: " & sanitizeForDisplay(ev.errorMsg))
+
+      of evTransferLog:
+        if ev.srvId != NoServer:
+          appendServerLog("[" & $ev.xLevel & "] " & ev.xMessage)
         else:
-          discard
-        recvResult = serverChannel.tryRecv()
+          appendClientLog("[" & $ev.xLevel & "] " & ev.xMessage)
+
+      of evServerLog:
+        appendServerLog("[" & $ev.sLevel & "] " & ev.sMessage)
+
+      of evServerStarted:
+        srvStatusLabel.text = "Server running on " & ev.boundAddr & ":" & $ev.boundPort
+
+      of evServerStartFailed:
+        window.alert("Server failed to start: " & ev.startErr)
+        serverActive = false
+        srvStartBtn.enabled = true
+        srvStopBtn.enabled = false
+        srvStatusLabel.text = "Server stopped"
+
+      of evServerStopped:
+        serverActive = false
+        srvStartBtn.enabled = true
+        srvStopBtn.enabled = false
+        srvStatusLabel.text = "Server stopped"
+        appendServerLog("Server stopped")
   )
 
   # === Client start ===
@@ -411,11 +338,9 @@ proc launchGui*() =
     if direction == tdPut and not fileExists(localFile):
       window.alert("Local file not found: " & localFile); return
 
-    transferParams = TransferParams(
-      host: host, port: port, remoteFile: remoteFile,
-      localFile: localFile, direction: direction, blocksize: blocksize)
+    var req = newTransferRequest(host, port, remoteFile, localFile, direction)
+    req.options.blocksize = blocksize
 
-    cancelRequested.store(false)
     clientStartTime = epochTime()
     progressBar.value = 0.0
     setTransferring(true)
@@ -424,7 +349,7 @@ proc launchGui*() =
     appendClientLog(dirStr & " " & remoteFile & " " &
       (if direction == tdGet: "from " else: "to ") & host & ":" & $port)
 
-    createThread(transferThread, transferWorker)
+    clientXferId = session.startTransfer(req)
 
   # === Server start ===
   srvStartBtn.onClick = proc(event: ClickEvent) =
@@ -449,36 +374,28 @@ proc launchGui*() =
       of 3: wpCreateOrOverwrite
       else: wpDeny
 
-    srvParams = ServerParams(
-      rootDir: rootDir, port: port, writePolicy: wp, maxClients: maxClients)
+    var config = newDefaultServerConfig(rootDir)
+    config.listenPort = port
+    config.writePolicy = wp
+    config.maxConcurrent = maxClients
 
-    serverStopRequested.store(false)
     serverActive = true
     srvStartBtn.enabled = false
     srvStopBtn.enabled = true
-    srvStatusLabel.text = "Server running on port " & $port
     appendServerLog("Starting server...")
 
-    createThread(serverThread, serverWorker)
+    serverId = session.startServer(config)
 
   # === Server stop ===
   srvStopBtn.onClick = proc(event: ClickEvent) =
-    serverStopRequested.store(true)
+    session.stop(serverId)
     srvStopBtn.enabled = false
     srvStatusLabel.text = "Stopping..."
-    appendServerLog("Stopping server...")
-
-  discard startRepeatingTimer(500, proc(event: TimerEvent) =
-    if serverActive and serverStopRequested.load():
-      try:
-        joinThread(serverThread)
-        serverActive = false
-        srvStartBtn.enabled = true
-        srvStopBtn.enabled = false
-        srvStatusLabel.text = "Server stopped"
-      except:
-        discard
-  )
 
   window.show()
   app.run()
+  # Note: no session.close() on exit.  NiGui has no window-close hook accessible
+  # here (app.run() returns only after the window is destroyed), and pumping
+  # poll() after that point would stall on the OS poller with no running event
+  # loop.  For TFTP this is acceptable: transfers are short-lived and the process
+  # exits immediately, releasing all OS resources.

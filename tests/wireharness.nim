@@ -9,6 +9,7 @@
 
 import std/[deques, asyncdispatch]
 import ../src/chapulin/transfer
+import ../src/chapulin/transport
 
 proc toByteSeq*(xs: seq[int]): seq[byte] =
   result = newSeq[byte](xs.len)
@@ -133,6 +134,108 @@ proc driveBoth*[T](a, b: Future[T], maxSteps = 100_000): bool =
     inc steps
     if steps > maxSteps: break
   a.finished and b.finished
+
+# ---------------------------------------------------------------------------
+# makeListener — a UdpListener backed by an in-memory deque, mirroring
+# makeTransport. Feed listener.recv() in server.run()'s loop without sockets.
+# ---------------------------------------------------------------------------
+
+type
+  ListenerQueue* = ref object
+    ## In-memory queue of inbound TFTP requests for wireharness-based tests.
+    queue*: Deque[tuple[data: seq[byte], host: string, port: int]]
+
+proc newListenerQueue*(): ListenerQueue =
+  ## Create an empty ListenerQueue.
+  ListenerQueue(queue: initDeque[tuple[data: seq[byte], host: string, port: int]]())
+
+proc push*(q: ListenerQueue, data: seq[byte], host: string, port: int) =
+  ## Enqueue a fake inbound request; call from test code before or while driving.
+  q.queue.addLast((data, host, port))
+
+proc makeListener*(q: ListenerQueue, port: int = 0): UdpListener =
+  ## Build a UdpListener whose recv pops from q. If q is empty it spins up to
+  ## 500 times (yield each spin) then raises TransportTimeoutError so the
+  ## server loop's `except TransportTimeoutError: continue` keeps running.
+  ## localPort() returns the `port` value supplied at construction (stub).
+  proc doRecv(timeoutMs: int): Future[tuple[data: seq[byte],
+              host: string, port: int]] {.async.} =
+    var spins = 0
+    while true:
+      if q.queue.len > 0:
+        return q.queue.popFirst()
+      inc spins
+      if spins > 500:
+        raise newException(TransportTimeoutError, "listener idle")
+      await sleepAsync(0)
+
+  proc doClose() = discard
+
+  UdpListener(recv: doRecv, close: doClose, localPort: proc(): int = port)
+
+# ---------------------------------------------------------------------------
+# makeFailingTransport — identical to makeTransport but send raises OSError
+# after `failAfter` successful deliveries, so the never-raise server property
+# can be tested (slices 2/4).
+# ---------------------------------------------------------------------------
+
+proc makeFailingTransport*(w: Wire, sideA: bool, failAfter: int,
+                           swallowFirst = false): Transport =
+  ## Build a Transport whose send succeeds for the first `failAfter` calls then
+  ## raises OSError on every subsequent call. recv is the normal wire path.
+  ## failAfter = 1 → 1st send succeeds, 2nd raises.
+  var swallowed = false
+  var sendCount = 0
+
+  proc doSend(data: seq[byte], host: string, port: int): Future[void] {.async.} =
+    if swallowFirst and not swallowed:
+      swallowed = true
+      return
+    inc sendCount
+    if sendCount > failAfter:
+      raise newException(OSError, "send failed")
+    w.wireSend(sideA, data)
+
+  proc doRecv(bufSize: int, timeoutMs: int): Future[tuple[data: seq[byte],
+              host: string, port: int]] {.async.} =
+    var spins = 0
+    while true:
+      if sideA:
+        if w.b2a.len > 0: return (w.b2a.popFirst(), "peer", 0)
+      else:
+        if w.a2b.len > 0: return (w.a2b.popFirst(), "peer", 0)
+      inc spins
+      if spins > 500:
+        raise newException(TransportTimeoutError, "wire idle")
+      await sleepAsync(0)
+
+  proc doClose() = discard
+
+  Transport(send: doSend, recv: doRecv, close: doClose)
+
+# ---------------------------------------------------------------------------
+# makeFailingListener — a UdpListener whose recv raises OSError (NOT
+# TransportTimeoutError) on the very first call.  Used to test Bug 2: an
+# unexpected recv error must not wedge the session (evServerStopped must
+# still be emitted).
+# ---------------------------------------------------------------------------
+
+proc makeFailingListener*(): UdpListener =
+  ## Build a UdpListener whose recv raises OSError on the first call.
+  ## Subsequent calls raise TransportTimeoutError so callers that retry do
+  ## not spin forever, but with the Bug 2 fix the loop breaks on the first
+  ## error and never reaches a second call.
+  var called = false
+  proc doRecv(timeoutMs: int): Future[tuple[data: seq[byte],
+              host: string, port: int]] {.async.} =
+    if not called:
+      called = true
+      raise newException(OSError, "recv failed: simulated network error")
+    raise newException(TransportTimeoutError, "listener idle")
+
+  proc doClose() = discard
+
+  UdpListener(recv: doRecv, close: doClose, localPort: proc(): int = 0)
 
 proc driveAll*[T](futs: seq[Future[T]], maxSteps = 200_000): bool =
   ## Pump the dispatcher until every future finishes or the cap is hit. Used to

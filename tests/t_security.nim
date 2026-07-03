@@ -6,6 +6,11 @@ import ../src/chapulin/security
 
 # Create a temp directory structure for testing
 let testRoot = getTempDir() / "chapulin_security_test"
+# A sibling directory *outside* the TFTP root, used as a symlink target.
+let outsideRoot = getTempDir() / "chapulin_security_outside"
+# Whether the platform/user can create symlinks (Windows needs privilege).
+# The issue #19 symlink tests are skipped when false.
+var symlinkOk = false
 
 suite "Setup":
   test "create test directory structure":
@@ -14,6 +19,22 @@ suite "Setup":
     writeFile(testRoot / "existing.txt", "hello")
     writeFile(testRoot / "subdir" / "nested.txt", "nested")
     check dirExists(testRoot)
+
+  test "create symlink fixtures (skipped if unsupported)":
+    createDir(outsideRoot)
+    writeFile(outsideRoot / "secret.txt", "topsecret")
+    try:
+      # A symlink inside the root pointing at a file outside it.
+      createSymlink(outsideRoot / "secret.txt", testRoot / "evil_link")
+      # A symlink inside the root pointing at a directory outside it.
+      createSymlink(outsideRoot, testRoot / "escape_dir")
+      # A symlink inside the root pointing at a file inside it (legitimate).
+      createSymlink(testRoot / "existing.txt", testRoot / "good_link")
+      symlinkOk = symlinkExists(testRoot / "evil_link")
+    except OSError, IOError:
+      symlinkOk = false
+    if not symlinkOk:
+      checkpoint("symlink creation unsupported here — #19 symlink tests skipped")
 
 suite "validatePath":
   test "simple filename resolves correctly":
@@ -75,6 +96,39 @@ suite "validatePath":
     let (valid, resolved, _) = validatePath(testRoot, "newfile.txt")
     check valid == true
     check resolved == testRoot / "newfile.txt"
+
+suite "validatePath symlink containment (issue #19)":
+  test "rejects symlink inside root pointing at a file outside (RRQ read)":
+    if not symlinkOk:
+      skip()
+    else:
+      let (valid, _, err) = validatePath(testRoot, "evil_link")
+      check valid == false
+      check err.len > 0
+
+  test "rejects overwrite of a symlink whose target escapes root (WRQ)":
+    # Same on-disk symlink; the WRQ path exercises the identical sink.
+    if not symlinkOk:
+      skip()
+    else:
+      let (valid, _, _) = validatePath(testRoot, "evil_link")
+      check valid == false
+
+  test "rejects create through a symlinked dir that escapes root (WRQ)":
+    if not symlinkOk:
+      skip()
+    else:
+      let (valid, _, err) = validatePath(testRoot, "escape_dir/pwned.txt")
+      check valid == false
+      check err.len > 0
+
+  test "allows a symlink whose target stays inside root":
+    if not symlinkOk:
+      skip()
+    else:
+      let (valid, resolved, _) = validatePath(testRoot, "good_link")
+      check valid == true
+      check resolved == testRoot / "good_link"
 
 suite "checkWriteAccess":
   test "wpDeny always rejects":
@@ -141,5 +195,12 @@ suite "checkHostAccess":
 
 suite "Cleanup":
   test "remove test directory":
+    # Remove symlinks explicitly first so directory teardown never follows
+    # `escape_dir` into (and deletes the contents of) the outside target.
+    for link in ["evil_link", "escape_dir", "good_link"]:
+      if symlinkExists(testRoot / link):
+        removeFile(testRoot / link)
     removeDir(testRoot)
+    removeDir(outsideRoot)
     check not dirExists(testRoot)
+    check not dirExists(outsideRoot)

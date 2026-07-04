@@ -630,6 +630,42 @@ suite "TftpSession — server lifecycle":
     check kinds == @[evServerStartFailed]
     check kinds[0] == evServerStartFailed
 
+  test "startServer rejects csSha256 config: evServerStartFailed, no evServerStarted (H2/M8)":
+    # RFC checksum-integrity-error-hygiene H2: csSha256 is a legal-to-construct
+    # but unimplemented ChecksumMode. startServer must reject it loud, at
+    # server construction, before any listener binds or RRQ is served — never
+    # a silent no-op. Mirrors parseChecksumMode's CLI-boundary rejection but
+    # at the embedding-API boundary (a config built programmatically, not
+    # parsed from a string, so parseChecksumMode itself is never consulted).
+    let q = newListenerQueue()
+    let s = newSession(
+      transportFactory = proc(h: string, p: int): Transport =
+        makeTransport(newWire(), sideA = false),
+      listenerFactory = proc(a: string, p: int): UdpListener = makeListener(q, p)
+    )
+
+    var cfg = newDefaultServerConfig(getTempDir())
+    cfg.listenAddr = "127.0.0.1"
+    cfg.listenPort = 6901
+    cfg.checksumMode = csSha256
+
+    var srvId: ServerId
+    var raised = false
+    try:
+      srvId = s.startServer(cfg)
+    except:
+      raised = true
+
+    check not raised
+    check srvId != NoServer
+
+    var kinds: seq[EventKind]
+    for ev in s.poll(0):
+      if ev.srvId == srvId:
+        kinds.add ev.kind
+
+    check kinds == @[evServerStartFailed]
+
 # ---------------------------------------------------------------------------
 # Suite: server GET over wire — full transfer event sequence (slice 4)
 # ---------------------------------------------------------------------------

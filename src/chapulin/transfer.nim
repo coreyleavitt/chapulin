@@ -1,7 +1,7 @@
 ## Shared transfer primitives — the foundation for both client and server.
 ## All I/O procs are async. Pure procs (types, constants, validation) are sync.
 
-import std/[asyncdispatch, times]
+import std/[asyncdispatch, times, tables]
 import protocol
 
 type
@@ -23,6 +23,17 @@ type
     errorMsg*: string
     errorCode*: int
     totalSize*: int64     ## -1 if unknown
+    ## NOTE (RFC checksum-integrity-error-hygiene, finding M3): this type is
+    ## SHARED by both client transfers (engine/sendBlocks/recvBlocks, surfaced
+    ## through api.nim's getFile/putFile) and the server's handleRrq/handleWrq.
+    ## It must carry ONLY client-facing fields. The server's operator-only
+    ## diagnostic (redacted OS open-failure / sidecar-write detail) is
+    ## deliberately NOT a field here -- see server.nim's `diagOut: ref string`
+    ## channel on handleRrq/handleWrq, consumed solely by handleRequest's
+    ## logger. That keeps the client-shared type structurally incapable of
+    ## carrying operator-only detail, rather than relying on a doc-comment
+    ## convention that a future wholesale-serialize/log/GUI consumer of
+    ## TransferResult could silently violate.
 
   ProgressCallback* = proc(bytesTransferred: int64, totalSize: int64) {.closure.}
   CancelCheck* = proc(): bool {.closure.}
@@ -156,7 +167,40 @@ proc sendBlocks*(transport: Transport, config: TransferConfig,
                  peer: PeerEndpoint, startBlock: uint16,
                  readData: proc(blockNum: uint16, blocksize: int): seq[byte],
                  onProgress: ProgressCallback = nil,
-                 cancelCheck: CancelCheck = nil): Future[TransferResult] {.async.} =
+                 cancelCheck: CancelCheck = nil,
+                 onDelivered: proc(data: openArray[byte]) = nil,
+                 peakCacheBlocksOut: ref int = new(int)): Future[TransferResult] {.async.} =
+  ## Send DATA blocks starting at `startBlock`, driven by the receiver's ACKs
+  ## (RFC 7440 windowsize supported: up to `config.windowsize` blocks may be
+  ## in flight unacknowledged at once).
+  ##
+  ## `onDelivered`, when non-nil, is the sender-side confirmed-delivery hook
+  ## (RFC checksum-integrity-error-hygiene, D1 Option A). Its contract:
+  ## - Fires exactly once per CONFIRMED block, never for a block that has not
+  ##   been ACKed, and never more than once for the same block.
+  ## - Fires in strictly ascending block-number order. Because TFTP ACKs are
+  ##   cumulative, a single ACK (e.g. under windowsize > 1) can confirm several
+  ##   blocks at once — the hook still fires once per block, never once per
+  ##   ACK packet.
+  ## - The payload is the bytes that block was *last transmitted* with (a
+  ##   cached copy from send time), not a fresh `readData` call. This matters
+  ##   under a source that mutates between sends: a block that is lost and
+  ##   retransmitted must report what the receiver actually holds, which may
+  ##   differ from a fresh read of the (by-then-mutated) source.
+  ## - The `openArray[byte]` payload is only valid for the duration of the
+  ##   synchronous callback — do not retain it; copy out if the caller needs
+  ##   the bytes to outlive the call.
+  ## - The firing loop for a confirming ACK runs strictly BEFORE the
+  ##   `lastAcked == high(uint16)` (>65535 blocks) early-return check, so the
+  ##   block that hits that ceiling is still delivered through this hook even
+  ##   though the overall transfer then reports failure.
+  ##
+  ## `peakCacheBlocksOut`: call-scoped diagnostic — peak `windowCache` size
+  ## reached during this transfer (for the O(window) memory-bound test). Like
+  ## `handleRrq`/`handleWrq`'s `diagOut`, each caller that omits it gets its
+  ## own private, freshly-allocated box (Nim evaluates a `ref` default fresh
+  ## per omitting call site), so concurrent `sendBlocks` calls never share
+  ## mutable state through it.
   var bytesSent: int64 = 0
   var nextBlock = startBlock        # next block to read and send
   var lastAcked: uint16 = startBlock - 1  # last ACKed block number
@@ -165,6 +209,13 @@ proc sendBlocks*(transport: Transport, config: TransferConfig,
   var lastSentPacket: seq[byte]     # for retransmit on timeout
   var dupAcks = 0                   # consecutive re-ACKs of lastAcked (loss signal)
   let ws = config.windowsize
+  # Bytes each in-flight (unacked) block was *last sent* with. A resend (partial-ACK
+  # refill or dup-ACK fast-retransmit) replays the cached bytes rather than
+  # re-invoking readData — correct under a mutating source (a block the client
+  # loses and re-receives must not silently change content across retransmits) —
+  # and onDelivered fires from this cache on confirm. Evicted on ACK, so memory
+  # stays O(windowsize x blocksize), never O(filesize).
+  var windowCache = initTable[uint16, seq[byte]]()
 
   # A receiver that loses a DATA packet keeps re-ACKing its last in-order block.
   # Those duplicate ACKs arrive before our recv times out, so a timeout-only
@@ -175,11 +226,17 @@ proc sendBlocks*(transport: Transport, config: TransferConfig,
   const dupAckThreshold = 2
 
   template sendOneBlock(blkNum: uint16) =
-    let blkData = readData(blkNum, config.blocksize)
+    let isResend = windowCache.hasKey(blkNum)
+    let blkData = if isResend: windowCache[blkNum]
+                  else: readData(blkNum, config.blocksize)
+    if not isResend:
+      windowCache[blkNum] = blkData
+      peakCacheBlocksOut[] = max(peakCacheBlocksOut[], windowCache.len)
     let dataPkt = TftpPacket(opcode: opData, blockNum: blkNum, data: blkData)
     lastSentPacket = encode(dataPkt)
     await transport.send(lastSentPacket, peer.host, peer.port)
-    bytesSent += blkData.len
+    if not isResend:
+      bytesSent += blkData.len
     windowEnd = blkNum
     if blkData.len < config.blocksize:
       hitFinal = true
@@ -212,8 +269,24 @@ proc sendBlocks*(transport: Transport, config: TransferConfig,
 
     if pkt.opcode == opAck:
       if pkt.ackBlockNum >= lastAcked + 1 and pkt.ackBlockNum <= windowEnd:
+        let prevAcked = lastAcked
         lastAcked = pkt.ackBlockNum
         dupAcks = 0                 # forward progress clears the loss signal
+
+        # TFTP ACKs are cumulative: a single accepted ACK can jump lastAcked
+        # forward by a whole window (windowsize>1), so fire once per confirmed
+        # block in ascending order — never once per ACK packet — replaying the
+        # bytes each block was last sent with. lastAcked advances only here, so
+        # consecutive firings partition the block space with no gap/overlap.
+        # Eviction is UNCONDITIONAL for every confirmed block (round-3 fix 1):
+        # only the onDelivered *call* is guarded on non-nil. Gating eviction
+        # itself behind onDelivered left the default/common path (every
+        # client PUT; every server RRQ with checksums off) never evicting,
+        # so windowCache grew to O(filesize) instead of O(windowsize).
+        for b in (prevAcked + 1) .. lastAcked:
+          if onDelivered != nil:               # nil closure => NilAccessDefect if called
+            onDelivered(windowCache[b])        # bytes block b was last sent with
+          windowCache.del(b)                   # evict on confirm -> O(window) memory, always
 
         # If final block was ACKed, transfer complete
         if hitFinal and lastAcked == windowEnd:

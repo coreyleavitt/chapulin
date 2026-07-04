@@ -60,13 +60,31 @@ proc newDefaultServerConfig*(rootDir: string): ServerConfig =
     deniedHosts: @[]
   )
 
+proc checksumModeImplemented*(m: ChecksumMode): bool =
+  ## Single authority for "is this checksum mode usable" (RFC checksum-
+  ## integrity-error-hygiene, H2). csSha256 is a legal enum value — a
+  ## deliberate forward-compat placeholder — but has no implementation
+  ## behind it (checksum.newDigester(csSha256) raises). Every boundary that
+  ## must reject an unimplemented mode (the CLI's parseChecksumMode, the
+  ## embedding API's startServer, and the RRQ hot path's handleRrq) routes
+  ## through this ONE predicate so "which modes are usable" is decided in
+  ## exactly one place instead of being re-derived — and able to drift —
+  ## at each call site.
+  m in {csNone, csMd5}
+
 proc parseChecksumMode*(s: string): ChecksumMode =
   ## Parse a checksum mode string from CLI/config.
-  ## Raises ValueError for unrecognised values.
-  case s.toLowerAscii
-  of "md5":    csMd5
-  of "sha256": raise newException(ValueError,
-      "checksum mode 'sha256' is not yet implemented (use md5 or none)")
-  of "", "none": csNone
-  else: raise newException(ValueError, "Invalid checksum mode: '" & s &
-      "' (expected md5 or none)")
+  ## Raises ValueError for unrecognised values, or for a value that names a
+  ## real (but unimplemented) ChecksumMode — routed through
+  ## checksumModeImplemented so this can never drift from the other
+  ## boundaries that enforce the same rule.
+  let mode = case s.toLowerAscii
+    of "md5":      csMd5
+    of "sha256":   csSha256
+    of "", "none": csNone
+    else: raise newException(ValueError, "Invalid checksum mode: '" & s &
+        "' (expected md5 or none)")
+  if not checksumModeImplemented(mode):
+    raise newException(ValueError, "checksum mode '" & s.toLowerAscii &
+        "' is not yet implemented (use md5 or none)")
+  mode

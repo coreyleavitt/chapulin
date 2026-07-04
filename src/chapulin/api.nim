@@ -375,6 +375,16 @@ proc startServer*(s: TftpSession, config: ServerConfig): ServerId =
   let srvId = ServerId(s.nextServerId)
 
   try:
+    # Routes through the single shared authority (server_config.checksum-
+    # ModeImplemented) so this rejection can never drift from parseChecksum-
+    # Mode's (CLI boundary) or handleRrq's (RRQ hot-path boundary) copy of
+    # the same rule. Reject here, at server construction, so no RRQ handler
+    # ever sees a csSha256 config from this path — belt-and-suspenders with
+    # both newDigester's own raise and handleRrq's own guard.
+    if not checksumModeImplemented(config.checksumMode):
+      raise newException(ValueError,
+        "checksum mode '" & $config.checksumMode & "' is not yet implemented (use md5 or none)")
+
     # --- Build listener ---
     let listener: UdpListener =
       if s.listenerFactory != nil:

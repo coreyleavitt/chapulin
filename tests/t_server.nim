@@ -262,6 +262,32 @@ suite "handleWrq — receive file from client":
     let sent = decode(sm.sentPackets[0].data)
     check sent.opcode == opError
 
+suite "handleRrq — csSha256 fails loud, never a silent no-op (H2)":
+  test "csSha256 config: handleRrq fails, sends ERROR, writes no sidecar":
+    # RFC checksum-integrity-error-hygiene H2: before this fix, handleRrq's
+    # sidecar-construction guard was `config.checksumMode == csMd5`, so
+    # csSha256 fell through into the SAME branch as csNone (no digester, no
+    # error) — the RRQ silently succeeded with no sidecar and no error,
+    # reproducing the exact pre-RFC silent-no-op bug for any caller that
+    # drives handleRrq directly with a csSha256 config (bypassing the
+    # parseChecksumMode/startServer boundary guards). It must instead fail
+    # loud: no successful transfer, no sidecar, an ERROR sent to the client.
+    let sm = newServerMock()
+    sm.addResponse(makeAckPkt(1))  # only consumed if the guard fails to fire
+
+    var config = newDefaultServerConfig(testRoot)
+    config.checksumMode = csSha256
+    let request = TftpPacket(opcode: opRrq, filename: "hello.txt",
+                              mode: tmOctet, options: @[])
+    let result = waitFor handleRrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000)
+
+    check result.success == false
+    check sm.sentPackets.len >= 1
+    let sent = decode(sm.sentPackets[0].data)
+    check sent.opcode == opError
+    check not fileExists(testRoot / "hello.txt.md5")
+
 suite "onTransferStart callback":
   test "onTransferStart fires once with correct totalBytes for RRQ":
     let sm = newServerMock()
@@ -357,6 +383,251 @@ suite "parseChecksumMode — FIX 10: sha256 raises ValueError":
     except ValueError:
       raised = true
     check raised
+
+suite "clientSafeError — exhaustive, path-free (RFC checksum-integrity-error-hygiene slice 3a)":
+  test "every TftpErrorCode maps to a non-empty, path-free message":
+    for code in TftpErrorCode:
+      let msg = clientSafeError(code)
+      check msg.len > 0
+      check '/' notin msg
+      check '\\' notin msg
+      check testRoot notin msg
+
+suite "sendOsErrorAndFail — no OS path/errno leak (slice 3a)":
+  test "direct call for errAccessViolation (the RRQ open-failure code) leaks nothing":
+    # There is no portable way to force a real open() failure at the RRQ
+    # `except IOError` site in handleRrq (server.nim): a directory RRQ is
+    # rejected earlier by the `fileExists` check with a canned, path-free
+    # string (see "file not found returns error" above), and a permission-
+    # based trigger isn't cross-platform-portable (Windows read-only
+    # attributes don't block reads). Real open()-failure reproduction for
+    # the RRQ site is slice 3b's job (POSIX-only permission denial). Here
+    # we verify the shared helper the RRQ site now calls -- with the exact
+    # code (errAccessViolation) it has always used -- leaks nothing.
+    let sm = newServerMock()
+    # Fake OS detail deliberately embeds testRoot, to also prove (L2) that
+    # the folded helper's `.diag` half is redacted independently of the
+    # client-facing `.xfer` half.
+    let fakeOsDetail = "permission denied: " & (testRoot / "secret.bin")
+    let outcome = waitFor sendOsErrorAndFail(sm.toTransport, "10.0.0.1", 5000,
+                                              errAccessViolation, testRoot,
+                                              fakeOsDetail, "RRQ open failed")
+
+    check outcome.xfer.success == false
+    check outcome.xfer.errorMsg == clientSafeError(errAccessViolation)
+    check testRoot notin outcome.xfer.errorMsg
+
+    # Operator-only diag half: carries the OS detail, but redacted.
+    check outcome.diag.len > 0
+    check testRoot notin outcome.diag
+    check outcome.diag != outcome.xfer.errorMsg
+
+    check sm.sentPackets.len == 1
+    let sent = decode(sm.sentPackets[0].data)
+    check sent.opcode == opError
+    check sent.errorCode == errAccessViolation
+    check sent.errorMsg == clientSafeError(errAccessViolation)
+
+suite "WRQ open failure — no OS path/errno leak (slice 3a)":
+  test "WRQ targeting an existing directory does not leak rootDir or errno text":
+    # Opening an existing directory with fmWrite raises IOError on both
+    # POSIX and Windows, and (unlike RRQ's fileExists pre-check) nothing
+    # in validatePath/checkWriteAccess rejects a directory target under
+    # wpCreateOrOverwrite -- so this portably reaches the real
+    # `except IOError` block at handleWrq's open() call.
+    let sm = newServerMock()
+    var config = newDefaultServerConfig(testRoot)
+    config.writePolicy = wpCreateOrOverwrite
+    createDir(testRoot / "adir")
+
+    let request = TftpPacket(opcode: opWrq, filename: "adir",
+                              mode: tmOctet, options: @[])
+    let result = waitFor handleWrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000)
+
+    check result.success == false
+    check testRoot notin result.errorMsg
+    check result.errorMsg == clientSafeError(errDiskFull)
+
+    var foundError = false
+    for pkt in sm.sentPackets:
+      let decoded = decode(pkt.data)
+      if decoded.opcode == opError:
+        foundError = true
+        check decoded.errorCode == errDiskFull
+        check testRoot notin decoded.errorMsg
+        check decoded.errorMsg == clientSafeError(errDiskFull)
+    check foundError
+
+suite "RRQ open failure — real OS reproduction (slice 3b, POSIX-only)":
+  test "chmod-000 file reaches the real open(fmRead) IOError and leaks nothing":
+    when not defined(windows):
+      # Unlike slice 3a (which could only call sendOsErrorAndFail directly,
+      # because no portable trigger reaches handleRrq's `except IOError` at
+      # server.nim:~153), a real file with all permission bits stripped makes
+      # `fileExists`/`validatePath` pass (the file genuinely exists) while
+      # `open(resolvedPath, fmRead)` genuinely fails with EACCES -- on any
+      # POSIX UID *without* DAC-override (i.e. non-root). This drives the
+      # actual handler code path end-to-end, not just the helper.
+      let path = testRoot / "unreadable_rrq.bin"
+      writeFile(path, "secret content that must never reach the client or errorMsg")
+      setFilePermissions(path, {})
+
+      let sm = newServerMock()
+      # Queued in case open() unexpectedly succeeds (root/DAC-override UID in
+      # the container -- root bypasses permission bits for open(2) entirely,
+      # a real POSIX property, not a test bug) so the transfer can complete
+      # normally instead of the mock exhausting and masking which code path
+      # actually ran.
+      sm.addResponse(makeAckPkt(1))
+
+      let config = newDefaultServerConfig(testRoot)
+      let request = TftpPacket(opcode: opRrq, filename: "unreadable_rrq.bin",
+                                mode: tmOctet, options: @[])
+      let result = waitFor handleRrq(config, request, sm.toTransport,
+                             "10.0.0.1", 5000)
+
+      # Restore permissions before any check/removeDir, or teardown fails.
+      setFilePermissions(path, {fpUserRead, fpUserWrite})
+
+      if result.success:
+        echo "NOTE (slice 3b): open(fmRead) did NOT fault on chmod-000 file -- " &
+             "this UID has DAC override (root) in this container, so the " &
+             "real-fault assertion below could not be exercised here. CI's " &
+             "native, non-root POSIX legs (ci.yaml) are the gate for this " &
+             "invariant; the helper-level leak-freedom is already proven by " &
+             "slice 3a's direct sendOsErrorAndFail test."
+      else:
+        check testRoot notin result.errorMsg
+        check result.errorMsg == clientSafeError(errAccessViolation)
+
+        var foundError = false
+        for pkt in sm.sentPackets:
+          let decoded = decode(pkt.data)
+          if decoded.opcode == opError:
+            foundError = true
+            check decoded.errorCode == errAccessViolation
+            check testRoot notin decoded.errorMsg
+            check decoded.errorMsg == clientSafeError(errAccessViolation)
+        check foundError
+    else:
+      echo "SKIP (slice 3b): POSIX-only -- setFilePermissions on Windows only " &
+           "toggles the read-only attribute and does not block owner reads " &
+           "(see docs/rfc/checksum-integrity-error-hygiene.md, slice 3b)."
+
+suite "Redacted operator diagnostics (slice 6, D2 follow-on)":
+  test "WRQ open failure logs a redacted diagnostic; wire/errorMsg stay generic":
+    # Reuses slice 3a's portable directory-WRQ trigger (server.nim's real
+    # `except IOError` at the WRQ open() site) but observes the operator-only
+    # side: the existing handleRequest logger should receive an extra,
+    # redacted diagnostic line carrying the OS detail slice 3a intentionally
+    # dropped from the wire/errorMsg -- with config.rootDir stripped so no
+    # absolute filesystem path appears even here.
+    createDir(testRoot / "slice6_wrq_dir")
+
+    var logged: seq[tuple[level: LogLevel, msg: string]]
+    let logger = newLogger(llDebug, proc(level: LogLevel, msg: string) =
+      logged.add (level, msg))
+
+    let sm = newServerMock()
+    var config = newDefaultServerConfig(testRoot)
+    config.writePolicy = wpCreateOrOverwrite
+    let server = newTftpServer(config, logger = logger)
+    server.transferFactory = proc(port: int): Transport = sm.toTransport()
+
+    var errCbMsg = ""
+    server.callbacks.onTransferError = proc(info: TransferInfo, msg: string) =
+      errCbMsg = msg
+
+    let request = TftpPacket(opcode: opWrq, filename: "slice6_wrq_dir",
+                              mode: tmOctet, options: @[])
+    waitFor server.handleRequest(encode(request), "10.0.0.1", 5000)
+
+    # Client-facing side is unchanged: still the generic, path-free message.
+    check errCbMsg == clientSafeError(errDiskFull)
+    check testRoot notin errCbMsg
+
+    var foundError = false
+    for pkt in sm.sentPackets:
+      let decoded = decode(pkt.data)
+      if decoded.opcode == opError:
+        foundError = true
+        check testRoot notin decoded.errorMsg
+    check foundError
+
+    # Operator-facing side: a redacted diagnostic was logged at warn level
+    # (the existing handleRequest logger, distinct from its info/error
+    # transfer-summary line), with no absolute rootDir substring, and
+    # distinct in content from the generic client-facing message.
+    var diagLine = ""
+    for entry in logged:
+      if entry.level == llWarn:
+        diagLine = entry.msg
+    check diagLine.len > 0
+    check testRoot notin diagLine
+    check diagLine != clientSafeError(errDiskFull)
+
+  test "sidecar commit failure logs a redacted diagnostic; RRQ still succeeds":
+    # Reuses slice 4's escaping-symlink trigger for writeSidecar containment
+    # (t_security.nim) so digester.commit(...) returns (false, err) after an
+    # otherwise-successful RRQ. Previously this failure was silently
+    # discarded; slice 6 makes it operator-visible (redacted) without
+    # turning the RRQ into a reported failure.
+    let outsideDir = getTempDir() / "chapulin_server_test_slice6_outside"
+    createDir(outsideDir)
+    let outsideTarget = outsideDir / "escape_target.txt"
+    writeFile(outsideTarget, "outside content")
+
+    let resolvedName = "slice6_sidecar.bin"
+    let resolvedPath = testRoot / resolvedName
+    writeFile(resolvedPath, "hello world")
+
+    var symlinkOk = true
+    try:
+      createSymlink(outsideTarget, resolvedPath & ".md5")
+    except OSError, IOError:
+      symlinkOk = false
+
+    if not symlinkOk:
+      checkpoint("symlink creation unsupported here -- sidecar diagnostic test skipped")
+      skip()
+    else:
+      var logged: seq[tuple[level: LogLevel, msg: string]]
+      let logger = newLogger(llDebug, proc(level: LogLevel, msg: string) =
+        logged.add (level, msg))
+
+      let sm = newServerMock()
+      sm.addResponse(makeAckPkt(1))
+      var config = newDefaultServerConfig(testRoot)
+      config.checksumMode = csMd5
+      let server = newTftpServer(config, logger = logger)
+      server.transferFactory = proc(port: int): Transport = sm.toTransport()
+
+      var completed = false
+      server.callbacks.onTransferComplete = proc(info: TransferInfo) =
+        completed = true
+
+      let request = TftpPacket(opcode: opRrq, filename: resolvedName,
+                                mode: tmOctet, options: @[])
+      waitFor server.handleRequest(encode(request), "10.0.0.1", 5000)
+
+      check completed == true
+
+      # Containment refused the write: the outside file is untouched and the
+      # planted symlink is left exactly as it was.
+      check readFile(outsideTarget) == "outside content"
+      check symlinkExists(resolvedPath & ".md5")
+
+      var diagLine = ""
+      for entry in logged:
+        if entry.level == llWarn:
+          diagLine = entry.msg
+      check diagLine.len > 0
+      check testRoot notin diagLine
+
+      removeFile(resolvedPath & ".md5")
+
+    removeDir(outsideDir)
 
 suite "Server test cleanup":
   test "remove test files":

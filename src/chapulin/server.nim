@@ -1,13 +1,14 @@
 ## TFTP server — async request handlers and listener dispatch.
 ## No threads, no locks, no atomics. Concurrent transfers via addCallback.
 
-import std/[os, asyncdispatch, strutils, times, md5]
+import std/[os, asyncdispatch, strutils, times]
 import protocol
 import transfer
 import transport
 import options
 import security
 import server_config
+import checksum
 import logging
 import format
 export logging
@@ -65,17 +66,65 @@ proc sendError(transport: Transport, host: string, port: int,
 proc failResult(msg: string): TransferResult =
   TransferResult(success: false, bytesTransferred: 0, errorMsg: msg, totalSize: -1)
 
-# --- RRQ handler: serve file to client ---
+proc clientSafeError*(code: TftpErrorCode): string =
+  ## Generic, path-free, client-safe message for a TFTP error code.
+  ## Exhaustive by construction (no `else`): a future `TftpErrorCode` fails
+  ## to compile here until it is given a generic string. Intended for the
+  ## narrow job of wrapping OS-exception messages (see sendOsErrorAndFail
+  ## below) -- NOT a blanket replacement for the already-useful, path-free
+  ## canned strings used at the other sendError call sites in this module
+  ## (e.g. "Server is read-only", "File already exists").
+  ## Exported so tests can verify exhaustiveness/path-freedom directly.
+  case code
+  of errNotDefined: "Undefined error"
+  of errFileNotFound: "File not found"
+  of errAccessViolation: "Access violation"
+  of errDiskFull: "Disk full or allocation exceeded"
+  of errIllegalOperation: "Illegal TFTP operation"
+  of errUnknownTransferId: "Unknown transfer ID"
+  of errFileAlreadyExists: "File already exists"
+  of errNoSuchUser: "No such user"
 
-proc generateChecksum(filePath: string, mode: ChecksumMode): string =
-  ## Generate a checksum sidecar file after a successful read transfer.
-  if mode == csMd5:
-    let content = readFile(filePath)
-    let hash = $toMD5(content)
-    let sidecar = filePath & ".md5"
-    writeFile(sidecar, hash & "  " & extractFilename(filePath) & "\n")
-    return sidecar
-  return ""
+proc redactRoot*(rootDir: string, msg: string): string =
+  ## Strip every occurrence of the server's absolute `rootDir` from `msg`,
+  ## replacing it with a root-relative marker. Used exclusively to prepare
+  ## operator-only diagnostics (RFC checksum-integrity-error-hygiene, slice
+  ## 6: OS open-failure detail, non-fatal sidecar-write failures) for the
+  ## existing `handleRequest` logger -- these diagnostics carry OS errno
+  ## text and internal error strings that were deliberately excluded from
+  ## the wire and `TransferResult.errorMsg` (D2), but an operator debugging
+  ## the server still needs the class/detail beyond the bare TFTP error
+  ## code, without ever seeing the server's absolute filesystem layout.
+  if rootDir.len == 0: return msg
+  msg.replace(rootDir, "<root>")
+
+proc sendOsErrorAndFail*(transport: Transport, host: string, port: int,
+                         code: TftpErrorCode, rootDir: string, osDetail: string,
+                         label: string): Future[tuple[xfer: TransferResult, diag: string]] {.async.} =
+  ## Send an ERROR packet and build BOTH halves of the required handling for
+  ## an OS-level exception (e.g. an open() failure) in one call (RFC
+  ## checksum-integrity-error-hygiene, slice 6 / finding L2 -- folds what
+  ## used to be a separate `sendOsErrorAndFail` + manual `redactRoot`
+  ## two-step at each call site): `.xfer` is the generic, path-free,
+  ## client-facing TransferResult; `.diag` is the redacted, operator-only
+  ## diagnostic (rootDir stripped) that the caller forwards into
+  ## handleRrq/handleWrq's `diagOut` channel (never onto the client-shared
+  ## TransferResult -- see finding M3).
+  ##
+  ## `rootDir`/`osDetail` are woven ONLY into `.diag`: `.xfer.errorMsg` is
+  ## built solely from `clientSafeError(code)`, so no path through this
+  ## helper can route OS errno/path text onto the wire or into the
+  ## client-shared TransferResult, even though (unlike the pre-L2 version)
+  ## this helper does accept those strings as parameters now. Exported so
+  ## tests can verify both halves directly, including at sites with no
+  ## portable way to force a real OS failure (see RRQ open-failure coverage
+  ## in tests/t_server.nim).
+  let msg = clientSafeError(code)
+  await sendError(transport, host, port, code, msg)
+  let diag = redactRoot(rootDir, label & ": " & osDetail)
+  return (xfer: failResult(msg), diag: diag)
+
+# --- RRQ handler: serve file to client ---
 
 proc generateDirListing(rootDir: string): string =
   ## Generate a directory listing of the TFTP root.
@@ -96,7 +145,40 @@ proc handleRrq*(config: ServerConfig, request: TftpPacket,
                 onStart: proc(info: TransferInfo) {.closure.} = nil,
                 startedAt: float = 0.0,
                 cancelCheck: CancelCheck = nil,
-                reqId: int = 0): Future[TransferResult] {.async.} =
+                reqId: int = 0,
+                diagOut: ref string = new(string)): Future[TransferResult] {.async.} =
+  ## `diagOut` receives a redacted, operator-only diagnostic (RFC checksum-
+  ## integrity-error-hygiene, finding M3) -- OS open-failure detail or a
+  ## non-fatal sidecar-write failure. This is a SERVER-ONLY channel, separate
+  ## from the returned (client-shared) TransferResult; only handleRequest
+  ## reads it (via its own box) after the call. Never placed on the wire or
+  ## in the returned TransferResult.errorMsg.
+  ##
+  ## Defaults to a freshly-allocated box rather than nil (round-3 code-review
+  ## fix 3): Nim evaluates a default argument expression per call, so every
+  ## caller that omits `diagOut` gets its own private, empty, immediately-
+  ## discarded box. This makes every write site inside this proc an
+  ## unconditional `diagOut[] = ...` instead of `if diagOut != nil: ...` --
+  ## collapsing per-call-site nil discipline (a future forgetful write site
+  ## would be a live NilAccessDefect landmine, per the codebase's tracked
+  ## never-throw Defect hazard) into a single structural guarantee.
+  # Fail LOUD on an unimplemented checksum mode (RFC checksum-integrity-
+  # error-hygiene H2), instead of silently falling through to the same
+  # no-sidecar branch as csNone. startServer already rejects an unimplemented
+  # mode before a listener ever binds, but handleRrq is itself an exported
+  # entry point (the RFC's own testing strategy calls it directly) — so this
+  # guard must not rely on callers routing through startServer first. Routes
+  # through the single shared authority (checksumModeImplemented) so the
+  # rule can never drift from parseChecksumMode's or startServer's copy.
+  # Checked before the directory-listing branch too: an invalid server
+  # config should refuse every RRQ uniformly, not just file serves. The
+  # wire-facing message stays generic (D2 error-hygiene invariant) — this is
+  # a server/config condition, not something to explain to the client.
+  if not checksumModeImplemented(config.checksumMode):
+    let msg = "Server checksum mode not supported"
+    await sendError(transport, clientHost, clientPort, errNotDefined, msg)
+    return failResult(msg)
+
   # Check for directory listing request
   if config.dirListFile.len > 0 and request.filename == config.dirListFile:
     let listing = generateDirListing(config.rootDir)
@@ -124,9 +206,12 @@ proc handleRrq*(config: ServerConfig, request: TftpPacket,
   var file: File
   try:
     file = open(resolvedPath, fmRead)
-  except IOError as e:
-    await sendError(transport, clientHost, clientPort, errAccessViolation, e.msg)
-    return failResult("Cannot open file: " & e.msg)
+  except IOError:
+    let osDetail = getCurrentExceptionMsg()
+    let osResult = await sendOsErrorAndFail(transport, clientHost, clientPort,
+      errAccessViolation, config.rootDir, osDetail, "RRQ open failed")
+    diagOut[] = osResult.diag
+    return osResult.xfer
   defer: file.close()
 
   var xferConfig = newTransferConfig(
@@ -179,6 +264,28 @@ proc handleRrq*(config: ServerConfig, request: TftpPacket,
     buf.setLen(bytesRead)
     return buf
 
+  # Checksum sidecar (RFC D1): only constructed when csMd5 is enabled, so the
+  # csNone path (default) allocates nothing and passes onDelivered = nil into
+  # sendBlocks (zero overhead). onDelivered feeds each delivered block's bytes
+  # (ACK-confirmed, ascending order, via transfer.nim's windowCache — never a
+  # second readFile of the source) into the incremental digest; the sidecar
+  # itself is written once, after a successful transfer, from the composed
+  # digester.commit call below.
+  #
+  # M1 (reserved-namespace cluster): never digest/commit a sidecar for a
+  # served file that is ITSELF a reserved .md5 name. A client legitimately
+  # downloading an existing sidecar to verify a prior transfer must still be
+  # served in full (the fileExists/open/sendBlocks path above is untouched),
+  # but generating foo.md5.md5 here would let any RRQ of the newest sidecar
+  # grow an unbounded, client-driven chain. Same isReservedSidecarName
+  # authority as checkWriteAccess (H1/M5), so "what counts as reserved"
+  # cannot drift between the WRQ-side and RRQ-side enforcement.
+  var digester: Digester
+  var onDelivered: proc(data: openArray[byte]) {.closure.}
+  if config.checksumMode == csMd5 and not isReservedSidecarName(resolvedPath):
+    digester = newDigester(csMd5)
+    onDelivered = proc(data: openArray[byte]) = digester.update(data)
+
   if onStart != nil:
     let startInfo = TransferInfo(
       clientHost: clientHost, clientPort: clientPort,
@@ -191,10 +298,16 @@ proc handleRrq*(config: ServerConfig, request: TftpPacket,
       reqId: reqId)
     onStart(startInfo)
 
-  let xferResult = await sendBlocks(transport, xferConfig, peer, 1, readData, onProgress, cancelCheck)
+  var xferResult = await sendBlocks(transport, xferConfig, peer, 1, readData,
+                                     onProgress, cancelCheck, onDelivered)
 
-  if xferResult.success and config.checksumMode != csNone:
-    discard generateChecksum(resolvedPath, config.checksumMode)
+  # Sidecar only follows a successful transfer (never on cancel/abort/error) —
+  # commit/writeSidecar never raise, so a sidecar failure must not fault this
+  # Future or turn a successful RRQ into a reported error.
+  if xferResult.success and digester != nil:
+    let (sidecarOk, sidecarErr) = digester.commit(config.rootDir, resolvedPath)
+    if not sidecarOk:
+      diagOut[] = redactRoot(config.rootDir, "sidecar write failed: " & sidecarErr)
 
   return xferResult
 
@@ -207,7 +320,11 @@ proc handleWrq*(config: ServerConfig, request: TftpPacket,
                 onStart: proc(info: TransferInfo) {.closure.} = nil,
                 startedAt: float = 0.0,
                 cancelCheck: CancelCheck = nil,
-                reqId: int = 0): Future[TransferResult] {.async.} =
+                reqId: int = 0,
+                diagOut: ref string = new(string)): Future[TransferResult] {.async.} =
+  ## See handleRrq's `diagOut` doc: same server-only, operator-diagnostic
+  ## channel (RFC checksum-integrity-error-hygiene, finding M3), including
+  ## the always-allocated default box (round-3 fix 3).
   let (valid, resolvedPath, pathErr) = validatePath(config.rootDir, request.filename)
   if not valid:
     await sendError(transport, clientHost, clientPort, errAccessViolation, pathErr)
@@ -254,9 +371,12 @@ proc handleWrq*(config: ServerConfig, request: TftpPacket,
   var file: File
   try:
     file = open(resolvedPath, fmWrite)
-  except IOError as e:
-    await sendError(transport, clientHost, clientPort, errDiskFull, e.msg)
-    return failResult("Cannot open file for writing: " & e.msg)
+  except IOError:
+    let osDetail = getCurrentExceptionMsg()
+    let osResult = await sendOsErrorAndFail(transport, clientHost, clientPort,
+      errDiskFull, config.rootDir, osDetail, "WRQ open failed")
+    diagOut[] = osResult.diag
+    return osResult.xfer
   defer: file.close()
 
   if onStart != nil:
@@ -392,15 +512,20 @@ proc handleRequest*(server: TftpServer, data: seq[byte],
         server.callbacks.onTransferStart(info)
 
   var xferResult: TransferResult
+  # Server-only channel (RFC checksum-integrity-error-hygiene, finding M3):
+  # handleRrq/handleWrq populate this with a redacted, operator-only
+  # diagnostic when there is one. It never rides on the client-shared
+  # TransferResult.
+  let diagBox = new(string)
   case pkt.opcode
   of opRrq:
     xferResult = await handleRrq(server.config, pkt, xferTransport,
                                   clientHost, clientPort, progressCb,
-                                  onStart, startTime, reqCancel, reqId)
+                                  onStart, startTime, reqCancel, reqId, diagBox)
   of opWrq:
     xferResult = await handleWrq(server.config, pkt, xferTransport,
                                   clientHost, clientPort, progressCb,
-                                  onStart, startTime, reqCancel, reqId)
+                                  onStart, startTime, reqCancel, reqId, diagBox)
   else:
     discard  # unreachable: guard above returns for any non-RRQ/WRQ opcode
 
@@ -413,6 +538,16 @@ proc handleRequest*(server: TftpServer, data: seq[byte],
     server.logger.info(logMsg)
   else:
     server.logger.error(logMsg)
+
+  # Redacted operator-only diagnostic (RFC checksum-integrity-error-hygiene,
+  # slice 6 / finding M3): open-failure OS detail or a non-fatal sidecar-write
+  # failure. Never on the wire or in errorMsg/callbacks -- diagBox is a
+  # server-only channel, populated by handleRrq/handleWrq specifically for
+  # this log line, entirely separate from the client-shared TransferResult.
+  if diagBox[].len > 0:
+    server.logger.warn("Diagnostic (redacted) for " & direction & " " &
+      sanitizeForDisplay(pkt.filename) & " from " & clientHost & ":" &
+      $clientPort & ": " & diagBox[])
 
   let info = TransferInfo(
     clientHost: clientHost, clientPort: clientPort,

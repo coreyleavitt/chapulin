@@ -17,7 +17,8 @@ import ./wireharness
 # Drive a real sender (side A) and receiver (side B) to completion over the wire.
 proc runTransfer(content: seq[byte], blocksize, windowsize: int,
                  actions: seq[WireAction] = @[],
-                 dropAOcc = -1, dropBOcc = -1):
+                 dropAOcc = -1, dropBOcc = -1,
+                 peakCacheBlocksOut: ref int = new(int)):
     tuple[terminated, ok: bool, received: seq[byte], n: int64] =
   let w = newWire(actions, dropAOcc, dropBOcc)
   let cfg = newTransferConfig(blocksize = blocksize, timeout = 5, retries = 3,
@@ -32,7 +33,7 @@ proc runTransfer(content: seq[byte], blocksize, windowsize: int,
     received.add data
 
   let sf = sendBlocks(makeTransport(w, true), cfg, newPeer("peer", 0, true),
-                      1, readData)
+                      1, readData, peakCacheBlocksOut = peakCacheBlocksOut)
   let rf = recvBlocks(makeTransport(w, false), cfg, newPeer("peer", 0, true),
                       1, onData)
 
@@ -41,6 +42,42 @@ proc runTransfer(content: seq[byte], blocksize, windowsize: int,
   let sres = futVal(sf)
   let rres = futVal(rf)
   return (true, sres.success and rres.success, received, rres.bytesTransferred)
+
+# Same as runTransfer, but wires up sendBlocks' onDelivered hook (RFC
+# checksum-integrity-error-hygiene, D1 Option A / slice 1.0) and captures every
+# firing so tests can assert once-per-block, ascending order, and correct bytes.
+proc runTransferWithHook(content: seq[byte], blocksize, windowsize: int,
+                        actions: seq[WireAction] = @[],
+                        dropAOcc = -1, dropBOcc = -1):
+    tuple[terminated, ok: bool, received: seq[byte], delivered: seq[seq[byte]],
+          sentBytes: int64] =
+  let w = newWire(actions, dropAOcc, dropBOcc)
+  let cfg = newTransferConfig(blocksize = blocksize, timeout = 5, retries = 3,
+                              windowsize = windowsize,
+                              totalSize = content.len.int64)
+  let readData = proc(blockNum: uint16, bs: int): seq[byte] =
+    let start = (int(blockNum) - 1) * bs
+    if start >= content.len: return @[]
+    return content[start ..< min(start + bs, content.len)]
+  var received: seq[byte]
+  let onData = proc(blockNum: uint16, data: seq[byte]) =
+    received.add data
+  var delivered: seq[seq[byte]] = @[]
+  let onDelivered = proc(data: openArray[byte]) =
+    var chunk = newSeq[byte](data.len)
+    for i in 0 ..< data.len: chunk[i] = data[i]
+    delivered.add chunk
+
+  let sf = sendBlocks(makeTransport(w, true), cfg, newPeer("peer", 0, true),
+                      1, readData, onDelivered = onDelivered)
+  let rf = recvBlocks(makeTransport(w, false), cfg, newPeer("peer", 0, true),
+                      1, onData)
+
+  if not driveBoth(sf, rf):
+    return (false, false, received, delivered, 0'i64)
+  let sres = futVal(sf)
+  let rres = futVal(rf)
+  return (true, sres.success and rres.success, received, delivered, sres.bytesTransferred)
 
 proc fileContents(maxLen = 2048): Strategy[seq[byte]] =
   lists(integers(0, 255), minLen = 0, maxLen = maxLen).map(toByteSeq)
@@ -151,3 +188,118 @@ suite "transfer efficiency (no spurious or cascading retransmits)":
     let ideal = content.len div blocksize + 1
     let r = senderPackets(content, blocksize, windowsize = 1, actions)
     ensure r.ok and r.sent < 2 * ideal
+
+# onDelivered hook + send-byte cache — RFC docs/rfc/checksum-integrity-error-hygiene.md,
+# D1 Option A, slice 1.0. Proven entirely here, with zero dependency on checksum.nim:
+# onDelivered must fire exactly once per block, in ascending order, with the exact
+# bytes that block was last sent with — under lossless lock-step, dup-ACK
+# fast-retransmit (issue #18's recovery path), and a windowsize>=3 cumulative ACK
+# (the round-2 CRITICAL case: a naive once-per-ACK-packet firing would only hash
+# the last block of the window and silently drop the interior blocks).
+suite "transfer onDelivered hook (checksum-integrity-error-hygiene D1 Option A)":
+
+  property "fires exactly once per block, ascending order, correct bytes (lossless)":
+    given content in fileContents(),
+          blocksize in integers(8, 512),
+          windowsize in integers(1, 8)
+    let r = runTransferWithHook(content, blocksize, windowsize)
+    var reassembled: seq[byte] = @[]
+    for chunk in r.delivered: reassembled.add chunk
+    ensure r.terminated and r.ok and reassembled == content and
+           r.delivered.len == content.len div blocksize + 1
+
+  test "dup-ACK fast-retransmit still delivers each block exactly once, in order (issue #18 path)":
+    var content = newSeq[byte](25)        # 25 bytes / blocksize 10 => 3 blocks
+    for i in 0 ..< content.len: content[i] = byte(i)
+    let r = runTransferWithHook(content, blocksize = 10, windowsize = 1,
+                                dropAOcc = 1)   # drop DATA(2)'s first transmission
+    check r.terminated and r.ok
+    var reassembled: seq[byte] = @[]
+    for chunk in r.delivered: reassembled.add chunk
+    check reassembled == content
+    check r.delivered.len == content.len div 10 + 1   # 3 blocks, no double-fire
+
+  test "a windowsize>=3 cumulative ACK fires every intermediate block, ascending":
+    # 55 bytes / blocksize 10 = 6 blocks (5 full + 1 short final); windowsize 5
+    # means recvBlocks only ACKs once for blocks 1..5 (a single cumulative ACK),
+    # then once more for block 6. A naive fire-once-per-ACK-packet implementation
+    # would call onDelivered twice total (missing blocks 1-4's bytes entirely) —
+    # this assertion goes RED against that shape.
+    var content = newSeq[byte](55)
+    for i in 0 ..< content.len: content[i] = byte(i)
+    let r = runTransferWithHook(content, blocksize = 10, windowsize = 5)
+    check r.terminated and r.ok
+    var reassembled: seq[byte] = @[]
+    for chunk in r.delivered: reassembled.add chunk
+    check reassembled == content
+    check r.delivered.len == 6
+
+# M7: sendOneBlock's `if not isResend: bytesSent += blkData.len`
+# (transfer.nim ~200-206) must count a resent block's bytes only once, so a
+# retransmitted block never inflates the sender-side byte count past the true
+# file size. The existing "partial ACK in window resumes correctly" test
+# (t_transfer.nim) never actually exercises the resend branch (its window
+# completes within the initial fill, isResend stays false throughout), so it
+# cannot catch a regression here. This reuses the exact issue #18 dup-ACK
+# fast-retransmit scenario proven above ("dup-ACK fast-retransmit still
+# delivers each block exactly once") -- dropAOcc=1 drops DATA(2)'s first
+# transmission, forcing the dup-ACK path to resend block 2 from windowCache
+# (isResend == true) -- and additionally checks the sender's own
+# bytesTransferred against the true file size.
+suite "transfer byte-count accounting (M7: bytesSent resend fix)":
+
+  test "a dup-ACK-triggered resend does not double-count bytesTransferred":
+    var content = newSeq[byte](25)        # 25 bytes / blocksize 10 => 3 blocks
+    for i in 0 ..< content.len: content[i] = byte(i)
+    let r = runTransferWithHook(content, blocksize = 10, windowsize = 1,
+                                dropAOcc = 1)   # drop DATA(2)'s first transmission
+    check r.terminated and r.ok
+    # With the fix: block1(10) + block2(10, counted once despite the resend)
+    # + block3(5, final) == 25 == content.len. Revert the `if not isResend`
+    # guard and this balloons to 35 (block 2's resend double-counted).
+    check r.sentBytes == content.len.int64
+
+# Round-3 code-review fix 1: windowCache eviction was WRONGLY nested inside
+# `if onDelivered != nil:` in sendBlocks' ACK-acceptance branch, so on the
+# onDelivered == nil path (the DEFAULT/common case: every client PUT has no
+# onDelivered param; every server RRQ with checksumMode == csNone, the
+# default) nothing was ever evicted and windowCache grew to O(filesize)
+# instead of the documented O(windowsize x blocksize). This drives a transfer
+# with many more blocks than the window, onDelivered = nil, and asserts the
+# cache's observed peak size (sendBlocks' `peakCacheBlocksOut` out-param, a
+# call-scoped diagnostic box -- see transfer.nim's doc comment, mirroring
+# server.nim's `diagOut` idiom so concurrent sendBlocks calls never share
+# mutable state) stayed bounded by ~windowsize rather than growing to ~total
+# block count.
+suite "transfer windowCache eviction (round-3 fix 1: memory leak on default path)":
+
+  test "onDelivered == nil: windowCache peak stays O(windowsize), not O(filesize)":
+    const blocksize = 8
+    const windowsize = 4
+    const nBlocks = 20
+    var content = newSeq[byte](blocksize * nBlocks)   # 20 full blocks + 1 final empty block
+    for i in 0 ..< content.len: content[i] = byte(i mod 256)
+
+    let box = new(int)
+    let r = runTransfer(content, blocksize, windowsize, peakCacheBlocksOut = box)   # onDelivered defaults to nil
+    check r.terminated and r.ok and r.received == content
+
+    # Before the fix: eviction never runs (onDelivered == nil), so the peak
+    # equals the total number of distinct blocks ever cached (~nBlocks + 1,
+    # the final short block) -- RED. After the fix: eviction runs
+    # unconditionally on every confirmed ACK, so the peak never exceeds the
+    # window (windowsize, +1 slack for the final short block) -- GREEN.
+    check box[] <= windowsize + 1
+    check box[] < nBlocks
+
+  test "onDelivered == nil, lock-step (windowsize=1): peak stays at 1, not O(filesize)":
+    const blocksize = 8
+    const nBlocks = 20
+    var content = newSeq[byte](blocksize * nBlocks)
+    for i in 0 ..< content.len: content[i] = byte(i mod 256)
+
+    let box = new(int)
+    let r = runTransfer(content, blocksize, windowsize = 1, peakCacheBlocksOut = box)
+    check r.terminated and r.ok and r.received == content
+    check box[] <= 2   # in-flight block + at most one resend overlap
+    check box[] < nBlocks

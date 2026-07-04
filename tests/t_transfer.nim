@@ -443,6 +443,50 @@ suite "sendBlocks":
     check result.success == false
     check "65535" in result.errorMsg
 
+  # RFC checksum-integrity-error-hygiene, finding M8b: the Testing-strategy
+  # section calls for "one test asserting a transfer exceeding the block-number
+  # limit fails with no sidecar", which guards that sendBlocks' onDelivered
+  # firing loop (transfer.nim ~232-251) stays BEFORE the `lastAcked ==
+  # high(uint16)` early return (~259-262) -- a future reorder would silently
+  # under-hash near the ceiling.
+  #
+  # LEVEL CHOSEN: sendBlocks, not a full server-level handleRrq(csMd5) RRQ.
+  # handleRrq always calls sendBlocks with a hardcoded startBlock = 1 (no
+  # test-only hook to jump near the ceiling), so proving the literal
+  # server-level claim would require actually sending and ACKing ~65535 real
+  # DATA blocks through the wire harness -- expensive, and this batch must not
+  # touch server.nim to add a shortcut. Proving the invariant here is
+  # equivalent: handleRrq's checksum digester is fed *exclusively* through
+  # onDelivered, and its sidecar commit is strictly gated on
+  # `xferResult.success` (server.nim: `if xferResult.success and digester !=
+  # nil: ... commit`). The existing "block 65535 limit" test above already
+  # proves sendBlocks reports success == false at the ceiling; this test
+  # additionally proves the onDelivered firing loop still runs -- in
+  # ascending order, exactly the genuinely-confirmed block, nothing past the
+  # ceiling -- immediately BEFORE that failing return, never after. A future
+  # reorder that returned failure without ever running the firing loop (or
+  # that fired for blocks beyond what was actually confirmed) would go RED
+  # here: `deliveredBlocks` would end up empty (or wrong), even though the
+  # ACK legitimately confirmed block 65535.
+  test "block 65535 limit: onDelivered still fires for the confirmed block before the failing return":
+    let mt = newMock()
+    mt.addResponse(makeAckPkt(high(uint16)))
+    let config = newTransferConfig()
+    let peer = newPeer("10.0.0.1", 5000, locked = true)
+    let blockPayload = newSeq[byte](512)
+    let readData = proc(blockNum: uint16, blocksize: int): seq[byte] = blockPayload
+    var deliveredBlocks: seq[seq[byte]] = @[]
+    let onDelivered = proc(data: openArray[byte]) =
+      var chunk = newSeq[byte](data.len)
+      for i in 0 ..< data.len: chunk[i] = data[i]
+      deliveredBlocks.add chunk
+    let result = waitFor sendBlocks(mt.toTransport, config, peer, high(uint16), readData,
+                                    onDelivered = onDelivered)
+    check result.success == false
+    check "65535" in result.errorMsg
+    check deliveredBlocks.len == 1
+    check deliveredBlocks[0] == blockPayload
+
 suite "sendBlocks windowed (RFC 7440)":
   test "windowsize=2 sends 2 blocks then waits for ACK":
     let mt = newMock()

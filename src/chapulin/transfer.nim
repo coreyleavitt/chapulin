@@ -3,6 +3,9 @@
 
 import std/[asyncdispatch, times, tables]
 import protocol
+export protocol  ## option bounds + defaults now live in protocol.nim (D7);
+                  ## re-exported so existing callers (options.nim, api.nim,
+                  ## server_config.nim, ...) see zero-diff.
 
 type
   TransportSendProc* = proc(data: seq[byte], host: string, port: int): Future[void] {.closure.}
@@ -56,27 +59,15 @@ type
     rttvar*: float     ## RTT variance
     adaptiveTimeout*: int  ## Current adaptive timeout in ms (0 = use config)
 
-const
-  MinBlocksize* = 8
-  MaxBlocksize* = 65464
-  DefaultBlocksize* = 512
-  DefaultTimeout* = 5
-  DefaultRetries* = 3
-  MinWindowsize* = 1
-  MaxWindowsize* = 65535
-  DefaultWindowsize* = 1
-
-proc validateBlocksize*(bs: int): int =
-  max(MinBlocksize, min(MaxBlocksize, bs))
-
 proc newTransferConfig*(blocksize: int = DefaultBlocksize,
                         timeout: int = DefaultTimeout,
                         retries: int = DefaultRetries,
                         windowsize: int = DefaultWindowsize,
                         totalSize: int64 = -1): TransferConfig =
   TransferConfig(blocksize: validateBlocksize(blocksize),
-                 timeout: timeout, retries: retries,
-                 windowsize: max(MinWindowsize, min(MaxWindowsize, windowsize)),
+                 timeout: max(MinTimeoutOpt, min(MaxTimeoutOpt, timeout)),
+                 retries: retries,
+                 windowsize: validateWindowsize(windowsize),
                  totalSize: totalSize)
 
 proc newPeer*(host: string, port: int, locked: bool = false): PeerEndpoint =
@@ -98,8 +89,14 @@ proc updateRtt*(peer: PeerEndpoint, rttMs: float) =
   peer.adaptiveTimeout = max(1000, int(peer.srtt + 4.0 * peer.rttvar))
 
 proc effectiveTimeout*(peer: PeerEndpoint, configTimeoutMs: int): int =
-  ## Return adaptive timeout if available, otherwise config timeout.
-  if peer.adaptiveTimeout > 0: peer.adaptiveTimeout
+  ## Return the adaptive timeout once RTT samples exist, but never below the
+  ## peer's negotiated `config.timeout` (RFC conformance-closure D5, round-2
+  ## bug 4a). Discarding the negotiated value once adaptive refinement kicked
+  ## in was the bug: a peer that explicitly negotiated a larger timeout for a
+  ## high-latency link kept losing that intent after the first RTT sample.
+  ## `configTimeoutMs` is a FLOOR, not a ceiling -- adaptive refinement still
+  ## applies above it.
+  if peer.adaptiveTimeout > 0: max(peer.adaptiveTimeout, configTimeoutMs)
   else: configTimeoutMs
 
 proc lockTo*(peer: PeerEndpoint, host: string, port: int) =
@@ -107,33 +104,84 @@ proc lockTo*(peer: PeerEndpoint, host: string, port: int) =
   peer.port = port
   peer.locked = true
 
-# --- Core async recv with retry/TID/decode handling ---
+# A receiver that loses a DATA packet keeps re-ACKing its last in-order block.
+# Those duplicate ACKs arrive before our recv times out, so a timeout-only
+# retransmit never fires and the transfer deadlocks (issue #18). Treat repeated
+# duplicate ACKs as a retransmit request. RFC 1123 4.2.3.1: reacting to a
+# *single* duplicate ACK causes the Sorcerer's Apprentice cascade, so only act
+# once the loss is confirmed by a second duplicate — one echoed ACK is ignored.
+#
+# Hoisted to top level (RFC conformance-closure D6) — was private to
+# sendBlocks. recvBlocks' RFC 7440 gap-ACK needs to fire this EXACT number of
+# back-to-back duplicates for a window-boundary gap, so both sides must agree
+# on the value by construction rather than by two modules independently
+# hardcoding the same magic number.
+const dupAckThreshold* = 2
 
-proc recvPacket*(transport: Transport, config: TransferConfig,
-                 peer: PeerEndpoint,
-                 lastSent: seq[byte]): Future[TftpPacket] {.async.} =
-  var retryCount = 0
-  while retryCount <= config.retries:
-    let timeoutMs = peer.effectiveTimeout(config.timeout * 1000)
-    let sendTime = epochTime()
+# Bounded final-ACK dally (RFC conformance-closure D2, policy R5). Deliberately
+# NOT operator-configurable (unlike the option bounds in protocol.nim) -- an
+# internal reliability constant, exported only so tests can assert against it
+# by name rather than a re-hardcoded magic number.
+const MaxDallyReacks* = 2
+
+# --- recvOnce: the single-attempt receive primitive ---
+#
+# FLAT result (never a case-object -- the tracked never-throw Defect hazard is
+# wrong-branch field access on a variant). `ok=false` means "no valid packet
+# this call" for any of three reasons -- a genuine transport timeout, a
+# corrupt/undecodable packet, or a TID-mismatched response (which this proc
+# answers with ERROR/unknown-TID, per RFC 1350, before trying again) -- and the
+# caller cannot tell which. That collapse is intentional: recvPacket's retry
+# budget (config.retries) has only ever counted genuine timeouts (see below),
+# and corrupt/mismatched packets are absorbed by looping internally on the SAME
+# timeoutMs budget the caller supplied, exactly mirroring the pre-extraction
+# inline loop. Only a real `TransportTimeoutError` from `transport.recv`
+# reaches the caller as ok=false.
+type
+  RecvOutcome* = object
+    ok*: bool
+    pkt*: TftpPacket   ## meaningful iff ok
+
+proc recvOnce*(transport: Transport, config: TransferConfig,
+               peer: PeerEndpoint, timeoutMs: int): Future[RecvOutcome] {.async.} =
+  ## A single receive + TID-lock validation + decode, with NO auto-resend and
+  ## NO raise on timeout (the inverse of `recvPacket`'s contract -- needed by
+  ## `dallyAfterFinalAck`, where silence means "done", not "resend and raise").
+  ## Both `recvPacket` (retry/resend/raise layered on top) and
+  ## `dallyAfterFinalAck` (bounded re-ACK-on-retransmit layered on top) sit on
+  ## this primitive, so TID-lock validation is structural, not duplicated.
+  ##
+  ## R5 fix (dally-deadline-bypassable-dos): a decode-failure or TID-mismatch
+  ## makes this loop `continue` rather than return, and each iteration used to
+  ## re-issue `transport.recv` with the SAME `timeoutMs` -- since
+  ## `transport.recv` starts a FRESH timer every call, a peer flooding
+  ## malformed/off-TID UDP faster than one packet per `timeoutMs` reset the
+  ## receive window forever, holding this call (and thus `dallyAfterFinalAck`,
+  ## its coroutine, and a server transfer slot) open indefinitely. The whole
+  ## internal loop is now bounded by ONE absolute wall-clock deadline derived
+  ## from the caller-supplied `timeoutMs`; each iteration passes the
+  ## shrinking remaining budget to `transport.recv`, so the TOTAL time this
+  ## call can spend across any number of garbage/mismatched iterations is
+  ## capped at that single timeout. A budget that has already run out is
+  ## reported the exact same way a genuine `TransportTimeoutError` is
+  ## (`RecvOutcome(ok: false)`), preserving `recvPacket`'s retry/resend and
+  ## `dallyAfterFinalAck`'s deadline/`MaxDallyReacks` contracts unchanged.
+  let deadline = epochTime() + timeoutMs.float / 1000.0
+  while true:
+    let remainingMs = int((deadline - epochTime()) * 1000.0)
+    if remainingMs <= 0:
+      return RecvOutcome(ok: false)
 
     var resp: tuple[data: seq[byte], host: string, port: int]
     try:
-      resp = await transport.recv(config.blocksize + 4, timeoutMs)
+      resp = await transport.recv(config.blocksize + 4, remainingMs)
     except TransportTimeoutError:
-      retryCount.inc
-      if retryCount > config.retries:
-        raise newException(TransferError,
-          "Timeout after " & $config.retries & " retries")
-      if lastSent.len > 0:
-        await transport.send(lastSent, peer.host, peer.port)
-      continue
+      return RecvOutcome(ok: false)
 
-    # Measure RTT and update adaptive timeout (RFC 1123)
-    let rttMs = (epochTime() - sendTime) * 1000.0
-    peer.updateRtt(rttMs)
-
-    # Decode — skip corrupt packets
+    # Decode — skip corrupt packets and try again (does not consume the
+    # caller's retry budget; see the type doc comment above). The NEXT
+    # iteration recomputes `remainingMs` from the same deadline, so this
+    # never re-arms a fresh full-length timeout.
     var pkt: TftpPacket
     try:
       pkt = decode(resp.data)
@@ -152,14 +200,79 @@ proc recvPacket*(transport: Transport, config: TransferConfig,
     if not peer.locked:
       peer.lockTo(resp.host, resp.port)
 
-    # Check for error packet
-    if pkt.opcode == opError:
-      raise newException(TransferError, pkt.errorMsg)
+    return RecvOutcome(ok: true, pkt: pkt)
 
-    return pkt
+# --- Core async recv with retry/TID/decode handling ---
+
+proc recvPacket*(transport: Transport, config: TransferConfig,
+                 peer: PeerEndpoint,
+                 lastSent: seq[byte]): Future[TftpPacket] {.async.} =
+  var retryCount = 0
+  while retryCount <= config.retries:
+    let timeoutMs = peer.effectiveTimeout(config.timeout * 1000)
+    let sendTime = epochTime()
+
+    let outcome = await recvOnce(transport, config, peer, timeoutMs)
+    if not outcome.ok:
+      retryCount.inc
+      if retryCount > config.retries:
+        raise newException(TransferError,
+          "Timeout after " & $config.retries & " retries")
+      if lastSent.len > 0:
+        await transport.send(lastSent, peer.host, peer.port)
+      continue
+
+    # Measure RTT and update adaptive timeout (RFC 1123). Intentional: this
+    # only runs when `outcome.ok` -- recvOnce's internal loop already
+    # absorbed any corrupt/TID-mismatched packets on the way here without
+    # returning, so `sendTime` is never sampled against anything but the
+    # peer's own genuine response. Timing a corrupt or off-TID packet would
+    # pollute the RTT estimate with a value that says nothing about this
+    # peer's actual latency.
+    let rttMs = (epochTime() - sendTime) * 1000.0
+    peer.updateRtt(rttMs)
+
+    # Check for error packet
+    if outcome.pkt.opcode == opError:
+      raise newException(TransferError, outcome.pkt.errorMsg)
+
+    return outcome.pkt
 
   raise newException(TransferError,
     "Timeout after " & $config.retries & " retries")
+
+proc dallyAfterFinalAck*(transport: Transport, peer: PeerEndpoint,
+                         config: TransferConfig, finalAck: seq[byte],
+                         finalBlock: uint16): Future[void] {.async.} =
+  ## RFC 1350 dally: after sending the final ACK, linger briefly so a
+  ## retransmitted final DATA (the sender's evidence that our ACK was lost)
+  ## gets re-ACKed instead of stranding the sender. Calls `recvOnce` directly
+  ## rather than `recvPacket` -- dally needs silence-means-success (no resend,
+  ## no raise), the opposite of `recvPacket`'s contract -- so the TID-lock
+  ## validation is preserved structurally rather than duplicated.
+  ##
+  ## Bounded by BOTH (R5), whichever binds first: a wall-clock deadline of one
+  ## `peer.effectiveTimeout`, and `MaxDallyReacks` re-ACKs. The deadline caps
+  ## total linger so a trickle of off-target packets can't extend the
+  ## epilogue; the re-ACK count caps retransmit responses.
+  ##
+  ## An off-target packet (wrong block number, or not a DATA packet) is
+  ## ignored WITHOUT consuming a re-ACK and WITHOUT ending the dally -- only a
+  ## genuine timeout from `recvOnce` (nothing arrived within the remaining
+  ## budget) ends it early.
+  let deadline = epochTime() + peer.effectiveTimeout(config.timeout * 1000).float / 1000.0
+  var reAcks = 0
+  while reAcks < MaxDallyReacks:
+    let remainingMs = int((deadline - epochTime()) * 1000.0)
+    if remainingMs <= 0:
+      break
+    let outcome = await recvOnce(transport, config, peer, remainingMs)
+    if not outcome.ok:
+      break  # silence within the remaining budget -- dally is done
+    if outcome.pkt.opcode == opData and outcome.pkt.blockNum == finalBlock:
+      await transport.send(finalAck, peer.host, peer.port)
+      reAcks.inc
+    # else: off-target -- ignore, keep dallying within the remaining budget
 
 # --- sendBlocks: send DATA, wait for ACK (supports RFC 7440 windowsize) ---
 
@@ -217,14 +330,6 @@ proc sendBlocks*(transport: Transport, config: TransferConfig,
   # stays O(windowsize x blocksize), never O(filesize).
   var windowCache = initTable[uint16, seq[byte]]()
 
-  # A receiver that loses a DATA packet keeps re-ACKing its last in-order block.
-  # Those duplicate ACKs arrive before our recv times out, so a timeout-only
-  # retransmit never fires and the transfer deadlocks (issue #18). Treat repeated
-  # duplicate ACKs as a retransmit request. RFC 1123 4.2.3.1: reacting to a
-  # *single* duplicate ACK causes the Sorcerer's Apprentice cascade, so only act
-  # once the loss is confirmed by a second duplicate — one echoed ACK is ignored.
-  const dupAckThreshold = 2
-
   template sendOneBlock(blkNum: uint16) =
     let isResend = windowCache.hasKey(blkNum)
     let blkData = if isResend: windowCache[blkNum]
@@ -244,6 +349,18 @@ proc sendBlocks*(transport: Transport, config: TransferConfig,
       onProgress(bytesSent, config.totalSize)
 
   # Fill and send the initial window
+  #
+  # NOTE (pre-existing, out of this RFC's scope): `nextBlock` is a `uint16`
+  # and TFTP block numbers have no room past 65535. `nextBlock.inc` at
+  # `high(uint16)` wraps to 0 (unsigned wraparound, not a checked/Defect-
+  # raising overflow in Nim), but that wrapped value is never actually put on
+  # the wire or fed back into `fillWindow`: the block-count ceiling check
+  # below (`lastAcked == high(uint16)` -> "Block number limit reached
+  # (65535)") returns failure as soon as block 65535 itself is ACKed, which
+  # happens before any subsequent `fillWindow()` call could run with the
+  # wrapped `nextBlock`. A transfer that legitimately needs more than 65535
+  # blocks at the negotiated blocksize has no path to succeed today --
+  # documented here as the current hard ceiling, not a silent-wrap hazard.
   template fillWindow() =
     var sent = 0
     while sent < ws and not hitFinal:
@@ -326,6 +443,16 @@ proc sendBlocks*(transport: Transport, config: TransferConfig,
                             errorMsg: "Unexpected packet type: " & $pkt.opcode,
                             totalSize: config.totalSize)
 
+proc lastInOrderBlock(expectedBlock: uint16): uint16 =
+  ## The most recent block number the receiver has actually taken delivery of,
+  ## in-order -- the correct re-ACK target for both recvBlocks' duplicate
+  ## branch (pkt.blockNum < expectedBlock) and its RFC 7440 gap-ACK branch
+  ## (pkt.blockNum > expectedBlock, D6). Guarded against a `uint16` underflow
+  ## when expectedBlock == 0 (no in-order block received yet this call): an
+  ## unguarded `expectedBlock - 1` there is an `OverflowDefect`, which is the
+  ## tracked never-throw Defect hazard escaping past `except CatchableError`.
+  if expectedBlock == 0: 0'u16 else: expectedBlock - 1'u16
+
 # --- recvBlocks: recv DATA, send ACK (supports RFC 7440 windowsize) ---
 
 proc recvBlocks*(transport: Transport, config: TransferConfig,
@@ -339,12 +466,42 @@ proc recvBlocks*(transport: Transport, config: TransferConfig,
   let ws = config.windowsize
   var blocksInWindow = 0  # how many blocks received since last ACK
 
+  # The last block number this call has actually put on the wire in an ACK.
+  # Seeded to the block already implied "acked" on entry (lastInOrderBlock of
+  # startBlock) rather than a raw 0/unset sentinel -- e.g. a client resuming
+  # recvBlocks at startBlock=2 after handling block 1 inline during the
+  # handshake has, in reality, already had block 1 ACKed on the wire, and the
+  # sender's own `lastAcked` reflects that. Needed by the RFC 7440 gap-ACK
+  # (D6) to tell a mid-window gap (target never yet ACKed) from a
+  # window-boundary gap (target already ACKed) -- see recvBlocks below.
+  var lastAckedBlock = lastInOrderBlock(startBlock)
+
+  # Suppresses re-firing the gap-ACK sequence for the SAME still-open gap
+  # (e.g. a duplicated copy of the same ahead-of-gap block arriving again
+  # before the hole is filled) while still allowing a later, DISTINCT gap to
+  # fire. Keyed on the expectedBlock at the time of firing (not a sticky
+  # bool) so it naturally resets once real progress closes the gap.
+  var lastGapAcked: uint16
+  var lastGapAckedSet = false
+
+  # Set only on the successful final-block break out of the loop below --
+  # feeds the epilogue's dallyAfterFinalAck call (D2).
+  var finalBlockNum: uint16
+
   template sendAck(blkNum: uint16) =
     let ack = TftpPacket(opcode: opAck, ackBlockNum: blkNum)
     let ackData = encode(ack)
     await transport.send(ackData, peer.host, peer.port)
     lastSent = ackData
+    # Intentional (not a bug under windowsize>1): sendAck is also used for
+    # duplicate-block and RFC 7440 gap re-ACKs, not just the normal
+    # every-`ws`-blocks ACK. Any ACK we send -- final, duplicate, or gap --
+    # tells the sender "here is what I actually have", which effectively
+    # restarts the receiver's window from that point; resetting
+    # blocksInWindow to 0 here keeps the next real ACK's timing anchored to
+    # that restart instead of counting blocks received before it.
     blocksInWindow = 0
+    lastAckedBlock = blkNum
 
   while true:
     if cancelCheck != nil and cancelCheck():
@@ -368,11 +525,13 @@ proc recvBlocks*(transport: Transport, config: TransferConfig,
         if onProgress != nil:
           onProgress(bytesReceived, config.totalSize)
 
-        # Final block — always ACK immediately
+        # Final block — always ACK immediately, then break into the dally
+        # epilogue below (a distinct phase, not a fourth nested case) rather
+        # than returning directly from inside the loop.
         if pkt.data.len < config.blocksize:
           sendAck(pkt.blockNum)
-          return TransferResult(success: true, bytesTransferred: bytesReceived,
-                                totalSize: config.totalSize)
+          finalBlockNum = pkt.blockNum
+          break
 
         if expectedBlock == high(uint16):
           sendAck(pkt.blockNum)
@@ -387,11 +546,54 @@ proc recvBlocks*(transport: Transport, config: TransferConfig,
           sendAck(pkt.blockNum)
 
       elif pkt.blockNum < expectedBlock:
-        # Duplicate — re-ACK
-        let ack = TftpPacket(opcode: opAck, ackBlockNum: pkt.blockNum)
-        await transport.send(encode(ack), peer.host, peer.port)
+        # Duplicate — re-ACK the last block actually received in-order, NOT
+        # the stale duplicate's own block number (pre-D6 bug: echoing
+        # pkt.blockNum under windowsize>1 could under-report the receiver's
+        # true progress relative to the sender's cumulative-ACK view).
+        sendAck(lastInOrderBlock(expectedBlock))
+
+      else:
+        # pkt.blockNum > expectedBlock: RFC 7440 gap-ACK (D6). A forward
+        # block arrived while an earlier one is still missing -- re-ACK the
+        # last in-order block so the sender doesn't wait a full RTO. The
+        # response arity MUST compose with how sendBlocks classifies an
+        # incoming ACK: forward-progress (`ackBlockNum >= lastAcked+1`) or
+        # duplicate (`ackBlockNum == lastAcked`, needing `dupAckThreshold`
+        # repeats to fast-retransmit).
+        if not (lastGapAckedSet and lastGapAcked == expectedBlock):
+          lastGapAcked = expectedBlock
+          lastGapAckedSet = true
+          let target = lastInOrderBlock(expectedBlock)
+          if lastAckedBlock == target:
+            # Window-boundary gap: the target was already ACKed (a previous
+            # window fully drained before the new window's lead block(s)
+            # were lost). From the sender's view this re-ACK is a genuine
+            # duplicate, so fire it dupAckThreshold times back-to-back to
+            # reach the sender's fast-retransmit threshold.
+            for _ in 1 .. dupAckThreshold:
+              sendAck(target)
+          else:
+            # Mid-window gap: the target has never been ACKed yet, so a
+            # single re-ACK lands in the sender's forward-progress branch and
+            # immediately drives its partial-ACK retransmit (fillWindow). A
+            # second copy would then match the just-advanced lastAcked as a
+            # phantom duplicate and prime dupAcks, causing a later spurious
+            # retransmit -- defeating the Sorcerer's-Apprentice guard.
+            sendAck(target)
+        # else: this exact gap was already re-ACKed -- suppress, so a
+        # redundant copy of the same ahead-of-gap block doesn't re-fire the
+        # sequence every time it arrives before the hole is actually filled.
 
     else:
       return TransferResult(success: false, bytesTransferred: bytesReceived,
                             errorMsg: "Unexpected packet type: " & $pkt.opcode,
                             totalSize: config.totalSize)
+
+  # --- Epilogue: RFC 1350 bounded final-ACK dally (D2, R5) ---
+  # Reached only via the successful final-block `break` above (every other
+  # exit from the loop `return`s directly and skips this phase). Re-ACKs a
+  # retransmitted final DATA (the sender's evidence our ACK was lost) instead
+  # of leaving the sender stranded.
+  await dallyAfterFinalAck(transport, peer, config, lastSent, finalBlockNum)
+  return TransferResult(success: true, bytesTransferred: bytesReceived,
+                        totalSize: config.totalSize)

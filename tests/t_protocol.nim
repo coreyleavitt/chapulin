@@ -450,19 +450,12 @@ suite "Decode edge cases":
       discard decode(@[byte 0, 255, 0, 0])
 
   test "decode ERROR with code 8 (extended, e.g. option negotiation)":
-    # RFC 2347 and real servers use error codes >7.
-    # The client must not crash on them.
+    # RFC 2347 defines error code 8 for option-negotiation failures.
     let wire = @[byte 0x00, 0x05, 0x00, 0x08, byte(ord('x')), 0x00]
-    # Currently this raises — this test documents the bug (issue #10).
-    # After fix, it should succeed and return errNotDefined or a raw code.
-    try:
-      let pkt = decode(wire)
-      # If we get here, the fix is in — verify it decoded something reasonable
-      check pkt.opcode == opError
-      check pkt.errorMsg == "x"
-    except TftpDecodeError:
-      # This is the current (buggy) behavior. Test marks as known failure.
-      fail()
+    let pkt = decode(wire)
+    check pkt.opcode == opError
+    check pkt.errorCode == errOptionNegotiation
+    check pkt.errorMsg == "x"
 
   test "decode ERROR with code 255":
     let wire = @[byte 0x00, 0x05, 0x00, 0xFF, byte(ord('y')), 0x00]

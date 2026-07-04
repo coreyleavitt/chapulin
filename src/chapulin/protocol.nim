@@ -23,6 +23,7 @@ type
     errUnknownTransferId = 5
     errFileAlreadyExists = 6
     errNoSuchUser = 7
+    errOptionNegotiation = 8
 
   TransferMode* = enum
     tmOctet = "octet"
@@ -168,12 +169,53 @@ proc decode*(data: seq[byte]): TftpPacket =
     if data.len < 5:
       raise newException(TftpDecodeError, "ERROR packet too short: " & $data.len & " bytes")
     let errCode = readUint16BE(data, 2)
-    # Map codes 0-7 to the enum; codes >7 (from RFC 2347+ or vendor extensions)
-    # map to errNotDefined so the client can still read the error message.
-    let mappedCode = if errCode <= 7: TftpErrorCode(errCode) else: errNotDefined
+    # Map codes 0-8 to the enum; codes >8 (vendor extensions beyond RFC 2347's
+    # option-negotiation code 8) map to errNotDefined so the client can still
+    # read the error message.
+    let mappedCode = if errCode <= 8: TftpErrorCode(errCode) else: errNotDefined
     let (msg, _) = readCString(data, 4)
     result = TftpPacket(opcode: opError, errorCode: mappedCode, errorMsg: msg)
 
   of opOack:
     let opts = readOptions(data, 2)
     result = TftpPacket(opcode: opOack, oackOptions: opts)
+
+# --- Option bounds (RFC 2348 blksize / RFC 2349 timeout / RFC 7440 windowsize) ---
+#
+# Single source of truth for legal wire-value bounds (RFC conformance-closure
+# D7). This is a *pure* home for the legal-value facts: on-failure POLICY
+# (clamp / drop the option / reply ERROR(8)) is decided at each call site
+# (client parse, server negotiate, ServerConfig validation) — never here.
+# `DefaultBlocksize`/`DefaultTimeout`/`DefaultWindowsize` live alongside their
+# bounds for the same reason: "what to assume absent an explicit option" is
+# itself an RFC-codec fact. `DefaultRetries` is not an RFC option at all (pure
+# local retransmission-count policy, no wire representation) but is kept here
+# too, purely so every operator-facing ServerConfig default is reachable from
+# this one import-free module (server_config.nim needs only `protocol`).
+
+const
+  MinBlocksize* = 8
+  MaxBlocksize* = 65464
+  DefaultBlocksize* = 512
+  MinWindowsize* = 1
+  MaxWindowsize* = 65535
+  DefaultWindowsize* = 1
+  MinTimeoutOpt* = 1
+  MaxTimeoutOpt* = 255
+  DefaultTimeout* = 5
+  DefaultRetries* = 3
+
+proc validateBlocksize*(bs: int): int =
+  ## Clamp a requested/negotiated blksize (RFC 2348) into [Min,Max].
+  max(MinBlocksize, min(MaxBlocksize, bs))
+
+proc validateWindowsize*(ws: int): int =
+  ## Clamp a requested/negotiated windowsize (RFC 7440) into [Min,Max].
+  max(MinWindowsize, min(MaxWindowsize, ws))
+
+proc validateTimeoutOpt*(t: int): bool =
+  ## Is `t` a legal RFC 2349 timeout option value (1..255 inclusive)? Unlike
+  ## blksize/windowsize, an out-of-range timeout has no sane clamp (the RFC
+  ## expects it REJECTED, not silently coerced) -- callers branch on this
+  ## bool to decide their own "drop the option" / "ERROR(8)" policy.
+  t >= MinTimeoutOpt and t <= MaxTimeoutOpt

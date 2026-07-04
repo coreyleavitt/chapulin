@@ -76,15 +76,6 @@ proc uriStrings(maxLen = 30): Strategy[string] =
   lists(sampledFrom(UriAlphabet), minLen = 0, maxLen = maxLen).map(
     proc(cs: seq[char]): string = "tftp://" & charsToStr(cs))
 
-const OptionKeys = @["blksize", "timeout", "windowsize", "tsize", "frobnicate"]
-
-proc optionPair(): Strategy[(string, string)] =
-  sampledFrom(OptionKeys).flatMap(proc(k: string): Strategy[(string, string)] =
-    safeStrings(0, 10).map(proc(v: string): (string, string) = (k, v)))
-
-proc optionPairs(maxLen = 4): Strategy[seq[(string, string)]] =
-  lists(optionPair(), minLen = 0, maxLen = maxLen)
-
 # Option pairs with numeric values (no parse failures) — for negotiation
 # invariants that should hold whenever the values actually parse.
 proc numericOptionPairs(maxLen = 4): Strategy[seq[(string, string)]] =
@@ -149,16 +140,6 @@ suite "protocol codec properties":
     ensure decode(encode(pkt)) == pkt
 
 suite "option negotiation properties":
-
-  property "parseOackOptions raises only ValueError on arbitrary pairs":
-    given opts in optionPairs()
-    let ok =
-      try:
-        discard parseOackOptions(opts)
-        true
-      except ValueError:
-        true
-    ensure ok
 
   property "negotiateServerOptions never OACKs an unsolicited option":
     # RFC 2347: the server may only acknowledge options the client requested.

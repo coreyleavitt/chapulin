@@ -303,3 +303,93 @@ suite "transfer windowCache eviction (round-3 fix 1: memory leak on default path
     check r.terminated and r.ok and r.received == content
     check box[] <= 2   # in-flight block + at most one resend overlap
     check box[] < nBlocks
+
+# RFC conformance-closure D6: recvBlocks' RFC 7440 gap-ACK (pkt.blockNum >
+# expectedBlock) must compose with sendBlocks' dup-ACK classifier
+# (transfer.nim: `ackBlockNum >= lastAcked+1` is forward-progress,
+# `ackBlockNum == lastAcked` is a duplicate needing `dupAckThreshold`
+# repeats). The two tests below drive the REAL sendBlocks against the REAL
+# recvBlocks over the wire (not a mock) so the composability itself is what's
+# under test, not either side's classifier in isolation.
+#
+# Both scenarios need the gap to land in a window that is NOT the sender's
+# final one (hitFinal == false at the moment the gap-ACK arrives) -- the
+# sender's partial-ACK forward-progress branch
+# (`elif not hitFinal: ... fillWindow()`) only fires a proactive resend when
+# more data is still pending. A gap inside the transfer's last window falls
+# back to the (still-correct, just slower) timeout/dup-ACK path regardless of
+# fire count -- an orthogonal, pre-existing characteristic of sendBlocks'
+# own gating that D6 does not touch. Both proc bodies below are wired with a
+# trailing 4th block precisely so this doesn't apply.
+proc runTransferWithWire(content: seq[byte], blocksize, windowsize: int,
+                        dropAOcc = -1, dropBOcc = -1):
+    tuple[terminated, ok: bool, w: Wire] =
+  let w = newWire(dropAOcc = dropAOcc, dropBOcc = dropBOcc)
+  let cfg = newTransferConfig(blocksize = blocksize, timeout = 5, retries = 3,
+                              windowsize = windowsize,
+                              totalSize = content.len.int64)
+  let readData = proc(blockNum: uint16, bs: int): seq[byte] =
+    let start = (int(blockNum) - 1) * bs
+    if start >= content.len: return @[]
+    return content[start ..< min(start + bs, content.len)]
+  var received: seq[byte]
+  let onData = proc(blockNum: uint16, data: seq[byte]) = received.add data
+
+  let sf = sendBlocks(makeTransport(w, true), cfg, newPeer("peer", 0, true),
+                      1, readData)
+  let rf = recvBlocks(makeTransport(w, false), cfg, newPeer("peer", 0, true),
+                      1, onData)
+
+  let terminated = driveBoth(sf, rf)
+  let ok = terminated and futVal(sf).success and futVal(rf).success and
+           received == content
+  (terminated, ok, w)
+
+proc countAck(log: seq[seq[byte]], blockNum: uint16): int =
+  for raw in log:
+    let pkt = decode(raw)
+    if pkt.opcode == opAck and pkt.ackBlockNum == blockNum:
+      inc result
+
+suite "receiver gap-ACK composability (RFC 7440, D6)":
+
+  test "mid-window gap: exactly ONE gap-ACK, and it drives the sender's forward-progress resend":
+    # blocksize=10, 4 blocks (10,10,10,5-final). windowsize=3: window 1 is
+    # [1,2,3] (not the file's final window -- block 4 is still pending).
+    # dropAOcc=1 drops DATA(2)'s first transmission (0-indexed: block1=occ0,
+    # block2=occ1, block3=occ2), so the receiver sees block1, then block3
+    # arrives ahead of the still-missing block2: expectedBlock=2,
+    # pkt.blockNum=3 > expectedBlock -- a mid-window gap. The receiver has
+    # never ACKed block1 yet (windowsize=3 hasn't been reached), so this MUST
+    # fire exactly once (a second copy would prime the sender's dupAcks as a
+    # phantom duplicate against the now-advanced lastAcked).
+    var content = newSeq[byte](35)
+    for i in 0 ..< content.len: content[i] = byte(i)
+    let r = runTransferWithWire(content, blocksize = 10, windowsize = 3,
+                                dropAOcc = 1)
+    check r.terminated and r.ok
+    # The gap-ACK's target is the last in-order block (expectedBlock-1 == 1).
+    # Exactly one such ACK may appear -- windowsize=3 never legitimately ACKs
+    # block 1 alone through the normal windowed path, so any ACK(1) on the
+    # wire can only be the gap-ACK.
+    check countAck(r.w.bLog, 1'u16) == 1
+
+  test "window-boundary gap: exactly dupAckThreshold gap-ACKs, reaching the sender's fast-retransmit":
+    # blocksize=10, 4 blocks (10,10,10,5-final). windowsize=2: window 1 is
+    # [1,2] (both delivered, receiver ACKs block 2 -- a genuine, already-sent
+    # ACK). Window 2 is [3,4]; dropAOcc=2 drops DATA(3)'s first transmission
+    # (occ0=block1, occ1=block2, occ2=block3), so the receiver sees block4
+    # arrive ahead of the still-missing block3: expectedBlock=3,
+    # pkt.blockNum=4 > expectedBlock -- a window-boundary gap, because the
+    # target (block 2) was ALREADY ACKed when window 1 drained. This must
+    # fire exactly dupAckThreshold times to reach the sender's fast-retransmit
+    # (a single copy would just read as yet another already-seen duplicate
+    # ACK on the sender's side and go nowhere).
+    var content = newSeq[byte](35)
+    for i in 0 ..< content.len: content[i] = byte(i)
+    let r = runTransferWithWire(content, blocksize = 10, windowsize = 2,
+                                dropAOcc = 2)
+    check r.terminated and r.ok
+    # ACK(2) appears once legitimately (window 1's cumulative ACK) plus
+    # exactly dupAckThreshold times as the boundary gap-ACK.
+    check countAck(r.w.bLog, 2'u16) == 1 + dupAckThreshold

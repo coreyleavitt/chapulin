@@ -46,64 +46,94 @@ suite "buildClientOptions":
     let opts = buildClientOptions(config, requestTsize = true)
     check opts.len == 4
 
-suite "parseOackOptions":
-  test "parses blksize":
-    let opts = @[("blksize", "1024")]
-    let neg = parseOackOptions(opts)
-    check neg.blocksize == 1024
+suite "validateAndParseOack":
+  test "filters an unrequested option out of negotiated (R4 enforcement)":
+    let requested = @[("blksize", "1024")]
+    let returned = @[("blksize", "1024"), ("windowsize", "8")]  # windowsize never requested
+    let outcome = validateAndParseOack(returned, requested)
+    check outcome.ok == true
+    check outcome.negotiated.blocksize == 1024
+    check outcome.negotiated.windowsize == DefaultWindowsize  # NOT 8 -- foisted option never applied
 
-  test "parses tsize":
-    let opts = @[("tsize", "65536")]
-    let neg = parseOackOptions(opts)
-    check neg.totalSize == 65536
+  test "accepts a requested blksize within bounds and <= requested value":
+    let requested = @[("blksize", "4096")]
+    let returned = @[("blksize", "2048")]
+    let outcome = validateAndParseOack(returned, requested)
+    check outcome.ok == true
+    check outcome.negotiated.blocksize == 2048
 
-  test "parses timeout":
-    let opts = @[("timeout", "10")]
-    let neg = parseOackOptions(opts)
-    check neg.timeout == 10
+  test "rejects a requested blksize larger than what was requested":
+    let requested = @[("blksize", "1024")]
+    let returned = @[("blksize", "2048")]  # server tried to raise it
+    let outcome = validateAndParseOack(returned, requested)
+    check outcome.ok == false
+    check outcome.rejectReason.len > 0
 
-  test "parses windowsize":
-    let opts = @[("windowsize", "4")]
-    let neg = parseOackOptions(opts)
-    check neg.windowsize == 4
+  test "rejects a requested blksize below the RFC 2348 floor":
+    let requested = @[("blksize", "1024")]
+    let returned = @[("blksize", "4")]  # below MinBlocksize == 8
+    let outcome = validateAndParseOack(returned, requested)
+    check outcome.ok == false
 
-  test "ignores unknown options":
-    let opts = @[("blksize", "1024"), ("custom", "val")]
-    let neg = parseOackOptions(opts)
-    check neg.blocksize == 1024
+  test "rejects a requested timeout outside 1..255":
+    let requested = @[("timeout", "10")]
+    let returned = @[("timeout", "0")]
+    let outcome = validateAndParseOack(returned, requested)
+    check outcome.ok == false
 
-  test "case insensitive keys":
-    let opts = @[("BLKSIZE", "2048"), ("Tsize", "100")]
-    let neg = parseOackOptions(opts)
-    check neg.blocksize == 2048
-    check neg.totalSize == 100
+  test "rejects a requested windowsize outside bounds":
+    let requested = @[("windowsize", "8")]
+    let returned = @[("windowsize", "70000")]  # > MaxWindowsize
+    let outcome = validateAndParseOack(returned, requested)
+    check outcome.ok == false
 
-  test "validates blocksize range":
-    let opts = @[("blksize", "99999")]
-    let neg = parseOackOptions(opts)
-    check neg.blocksize == MaxBlocksize  # clamped
+  test "accepts a requested tsize that parses as a non-negative int64":
+    let requested = @[("tsize", "0")]
+    let returned = @[("tsize", "1048576")]
+    let outcome = validateAndParseOack(returned, requested)
+    check outcome.ok == true
+    check outcome.negotiated.totalSize == 1048576
 
-  test "invalid non-numeric blksize raises ValueError":
-    let opts = @[("blksize", "abc")]
-    expect(ValueError):
-      discard parseOackOptions(opts)
+  test "rejects a negative tsize":
+    let requested = @[("tsize", "0")]
+    let returned = @[("tsize", "-1")]
+    let outcome = validateAndParseOack(returned, requested)
+    check outcome.ok == false
 
-  test "invalid non-numeric tsize raises ValueError":
-    let opts = @[("tsize", "xyz")]
-    expect(ValueError):
-      discard parseOackOptions(opts)
+  test "rejects a duplicate option name in the returned OACK":
+    let requested = @[("blksize", "1024")]
+    let returned = @[("blksize", "1024"), ("blksize", "512")]
+    let outcome = validateAndParseOack(returned, requested)
+    check outcome.ok == false
 
-  test "empty options returns defaults":
-    let neg = parseOackOptions(@[])
-    check neg.blocksize == DefaultBlocksize
-    check neg.totalSize == -1
-    check neg.timeout == DefaultTimeout
-    check neg.windowsize == DefaultWindowsize
+  test "matches option names case-insensitively":
+    let requested = @[("blksize", "1024")]
+    let returned = @[("BLKSIZE", "1024")]
+    let outcome = validateAndParseOack(returned, requested)
+    check outcome.ok == true
+    check outcome.negotiated.blocksize == 1024
 
-  test "invalid non-numeric windowsize raises ValueError":
-    let opts = @[("windowsize", "abc")]
-    expect(ValueError):
-      discard parseOackOptions(opts)
+  test "is total on garbage (non-numeric) input for a requested option — no exception, ok=false":
+    let requested = @[("blksize", "1024")]
+    let returned = @[("blksize", "not-a-number")]
+    let outcome = validateAndParseOack(returned, requested)
+    check outcome.ok == false
+
+  test "empty returned OACK is accepted with defaults":
+    let requested = @[("blksize", "1024")]
+    let outcome = validateAndParseOack(@[], requested)
+    check outcome.ok == true
+    check outcome.negotiated.blocksize == DefaultBlocksize
+
+  test "multiple valid requested options all negotiate together":
+    let requested = @[("blksize", "4096"), ("timeout", "10"), ("windowsize", "8"), ("tsize", "0")]
+    let returned = @[("blksize", "4096"), ("timeout", "10"), ("windowsize", "8"), ("tsize", "2048")]
+    let outcome = validateAndParseOack(returned, requested)
+    check outcome.ok == true
+    check outcome.negotiated.blocksize == 4096
+    check outcome.negotiated.timeout == 10
+    check outcome.negotiated.windowsize == 8
+    check outcome.negotiated.totalSize == 2048
 
 suite "negotiateServerOptions":
   test "accepts blocksize within server limits":
@@ -122,13 +152,27 @@ suite "negotiateServerOptions":
     check neg.blocksize == 1468
     check ("blksize", "1468") in oackOpts
 
-  test "clamps blocksize to server min":
+  test "requested blksize below server min is omitted, never clamped upward (Fix B, RFC 2348)":
+    # Old (buggy) behavior clamped UP to limits.minBlocksize here, which
+    # violates RFC 2348 ("server MUST NOT respond with a blksize larger than
+    # the one requested") and made this project's own client reject its own
+    # server's OACK. The corrected behavior drops the option entirely when it
+    # cannot be honored within limits without exceeding the request.
     let limits = ServerOptionLimits(
       maxBlocksize: 65464, minBlocksize: 512, timeout: 5)
     let clientOpts = @[("blksize", "64")]
     let (neg, oackOpts) = negotiateServerOptions(clientOpts, limits)
-    check neg.blocksize == 512
-    check ("blksize", "512") in oackOpts
+    check oackOpts.len == 0  # dropped, not offered at any value
+    check neg.blocksize == DefaultBlocksize
+
+  test "requested blksize below server minBlocksize is omitted, not offered above the request (Fix B)":
+    let limits = ServerOptionLimits(
+      maxBlocksize: 65464, minBlocksize: 100, timeout: 5)
+    let clientOpts = @[("blksize", "64")]
+    let (neg, oackOpts) = negotiateServerOptions(clientOpts, limits)
+    check oackOpts.len == 0
+    check ("blksize", "100") notin oackOpts
+    check neg.blocksize == DefaultBlocksize
 
   test "tsize request returns file size":
     let limits = ServerOptionLimits(
@@ -153,6 +197,32 @@ suite "negotiateServerOptions":
     let (neg, oackOpts) = negotiateServerOptions(clientOpts, limits)
     check neg.timeout == 3
     check ("timeout", "3") in oackOpts
+
+  test "no timeout requested seeds negotiated.timeout from limits.timeout, not the global default (D5, round-2 bug 4b)":
+    # limits.timeout is populated from the operator's ServerConfig.timeout,
+    # deliberately set here to something other than DefaultTimeout so this
+    # test cannot pass by accident.
+    check DefaultTimeout != 20
+    let limits = ServerOptionLimits(
+      maxBlocksize: 65464, minBlocksize: 8, timeout: 20,
+      maxWindowsize: 16, minWindowsize: 1)
+    # Client negotiates only blksize/windowsize -- no timeout option at all.
+    let clientOpts = @[("blksize", "1024"), ("windowsize", "4")]
+    let (neg, oackOpts) = negotiateServerOptions(clientOpts, limits)
+    check neg.timeout == 20  # the operator's configured timeout, NOT DefaultTimeout
+    check oackOpts.len == 2  # only blksize + windowsize -- timeout never echoed
+
+  test "out-of-range but parseable timeout is dropped, not clamped or raised (R6)":
+    let limits = ServerOptionLimits(
+      maxBlocksize: 65464, minBlocksize: 8, timeout: 7,
+      maxWindowsize: 16, minWindowsize: 1)
+    let (negLow, oackLow) = negotiateServerOptions(@[("timeout", "0")], limits)
+    check negLow.timeout == 7          # falls back to the limits seed
+    check oackLow.len == 0             # dropped, not echoed at any value
+
+    let (negHigh, oackHigh) = negotiateServerOptions(@[("timeout", "300")], limits)
+    check negHigh.timeout == 7
+    check oackHigh.len == 0
 
   test "windowsize negotiated within server limits":
     let limits = ServerOptionLimits(

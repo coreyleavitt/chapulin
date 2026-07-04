@@ -30,6 +30,12 @@ type
     dropAOcc, dropBOcc: int    # deterministic single drop by occurrence (-1 none)
     aSent, bSent: int
     aLog*, bLog*: seq[seq[byte]]  # every packet each side attempted to send
+    aRecvTimeoutsMs*, bRecvTimeoutsMs*: seq[int]
+      ## every timeoutMs a side's Transport.recv was called with, in order --
+      ## lets a test observe that a negotiated `timeout` actually reached the
+      ## recv call governing the transfer (RFC conformance-closure D5's
+      ## "apply", not just "validate"). Recorded regardless of outcome
+      ## (delivered / dropped / spin-timeout).
 
 proc newWire*(actions: seq[WireAction] = @[],
               dropAOcc = -1, dropBOcc = -1): Wire =
@@ -93,6 +99,7 @@ proc makeTransport*(w: Wire, sideA: bool, swallowFirst = false): Transport =
 
   proc doRecv(bufSize: int, timeoutMs: int): Future[tuple[data: seq[byte],
               host: string, port: int]] {.async.} =
+    if sideA: w.aRecvTimeoutsMs.add timeoutMs else: w.bRecvTimeoutsMs.add timeoutMs
     var spins = 0
     while true:
       if sideA:

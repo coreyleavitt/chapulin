@@ -666,6 +666,54 @@ suite "TftpSession — server lifecycle":
 
     check kinds == @[evServerStartFailed]
 
+  test "startServer rejects out-of-RFC-bound config: evServerStartFailed, no evServerStarted (D7)":
+    # RFC conformance-closure D7: protocol.nim is the single source of truth
+    # for legal option bounds (blksize 8..65464, windowsize 1..65535, timeout
+    # 1..255). ServerConfig is a plain mutable object with no construction
+    # choke point (the CLI pokes fields directly), so startServer must reject
+    # an out-of-bound config loud -- mirrors the csSha256 precedent above, at
+    # the same evServerStartFailed channel.
+    proc freshSession(): TftpSession =
+      let q = newListenerQueue()
+      newSession(
+        transportFactory = proc(h: string, p: int): Transport =
+          makeTransport(newWire(), sideA = false),
+        listenerFactory = proc(a: string, p: int): UdpListener = makeListener(q, p)
+      )
+
+    proc expectRejected(mutate: proc(cfg: var ServerConfig), port: int) =
+      let s = freshSession()
+      var cfg = newDefaultServerConfig(getTempDir())
+      cfg.listenAddr = "127.0.0.1"
+      cfg.listenPort = port
+      mutate(cfg)
+
+      var srvId: ServerId
+      var raised = false
+      try:
+        srvId = s.startServer(cfg)
+      except:
+        raised = true
+
+      check not raised
+      check srvId != NoServer
+
+      var kinds: seq[EventKind]
+      for ev in s.poll(0):
+        if ev.srvId == srvId:
+          kinds.add ev.kind
+
+      check kinds == @[evServerStartFailed]
+
+    expectRejected(proc(cfg: var ServerConfig) = cfg.timeout = 0, 6902)
+    expectRejected(proc(cfg: var ServerConfig) = cfg.timeout = 256, 6903)
+    expectRejected(proc(cfg: var ServerConfig) = cfg.minBlocksize = 1, 6904)
+    expectRejected(proc(cfg: var ServerConfig) = cfg.maxBlocksize = 100_000, 6905)
+    expectRejected(proc(cfg: var ServerConfig) = (cfg.minBlocksize = 2000; cfg.maxBlocksize = 100), 6906)
+    expectRejected(proc(cfg: var ServerConfig) = cfg.minWindowsize = 0, 6907)
+    expectRejected(proc(cfg: var ServerConfig) = cfg.maxWindowsize = 100_000, 6908)
+    expectRejected(proc(cfg: var ServerConfig) = (cfg.minWindowsize = 40; cfg.maxWindowsize = 4), 6909)
+
 # ---------------------------------------------------------------------------
 # Suite: server GET over wire — full transfer event sequence (slice 4)
 # ---------------------------------------------------------------------------
@@ -1269,6 +1317,51 @@ suite "TftpSession — PUT evTransferStarted.total (slice 6B)":
     check evs[0].kind == evTransferStarted
     check evs[0].snap.total.isSome
     check evs[0].snap.total.get == fileSize
+
+# ---------------------------------------------------------------------------
+# RFC-conformance-closure slice 7a (D1d, client-side specifics): a netascii
+# PUT's `.bytes` counts post-translation wire bytes while the local
+# `fileSize` is pre-translation -- reporting `total == some(fileSize)` (as
+# slice 6B does for octet) could show progress exceeding 100%. The reported
+# total must be `none` under netascii instead.
+# ---------------------------------------------------------------------------
+suite "TftpSession — PUT evTransferStarted.total (slice 7a, netascii)":
+  test "netascii PUT evTransferStarted snapshot has total == none (D1d)":
+    let tmpDir = getTempDir() / "chapulin_t_put_total_7a_netascii"
+    createDir(tmpDir)
+    let localSrc = tmpDir / "src7a.txt"
+    writeFile(localSrc, "line one\nline two\n")
+    let fileSize = int64(getFileSize(localSrc))
+    check fileSize > 0
+
+    defer:
+      try: removeDir(tmpDir) except: discard
+
+    var serverCfg = newDefaultServerConfig(tmpDir)
+    serverCfg.writePolicy = wpCreateOrOverwrite
+
+    let w = newWire()
+    let serverT = makeTransport(w, sideA = false)
+
+    proc serverRespond7a(): Future[void] {.async.} =
+      let (data, host, port) = await serverT.recv(65536, 5000)
+      let pkt = decode(data)
+      discard await handleWrq(serverCfg, pkt, serverT, host, port)
+    discard serverRespond7a()
+
+    let s = newSession(transportFactory =
+      proc(host: string, port: int): Transport = makeTransport(w, sideA = true))
+
+    var req = newTransferRequest("peer", 0, "upload7a.txt", localSrc, tdPut)
+    req.options.mode = tmNetascii
+    let id = s.startTransfer(req)
+    check id != NoTransfer
+
+    let evs = driveSession(s, id)
+
+    require evs.len >= 1
+    check evs[0].kind == evTransferStarted
+    check evs[0].snap.total.isNone
 
 # ---------------------------------------------------------------------------
 # Slice 7a: waitTransfer / waitServer / close-mid-transfer
@@ -2318,6 +2411,182 @@ suite "TftpSession — FIX 12-residual: server ERROR path terminal count":
       if stoppedCount > 0: break
 
     check stoppedCount == 1
+
+# ---------------------------------------------------------------------------
+# RFC conformance-closure slice 1 (D3 + Q1/Option A): a server-side
+# option-negotiation failure (unparseable option value, R6) must emit
+# ERROR(8) on the wire AND surface as evTransferError with errorCode == 8
+# through the embedding API. This is deliberately NOT covered by the
+# fail-before-start "Invariant 4" drop above -- unlike file-not-found (which
+# fails before any onStart), handleRrq's option-catch now mints a TransferId
+# via onStart specifically so this failure is observable (see server.nim's
+# mkTransferInfo doc comment).
+# ---------------------------------------------------------------------------
+suite "TftpSession — RFC conformance-closure D3: option-negotiation failure surfaces ERROR(8)":
+
+  test "server RRQ with unparseable blksize value yields evTransferError with errorCode == 8":
+    let tmpDir = getTempDir() / "chapulin_t_d3_erropt"
+    createDir(tmpDir)
+    writeFile(tmpDir / "serve_me.txt", "D3 option negotiation failure test data")
+    defer: (try: removeDir(tmpDir) except: discard)
+
+    let w = newWire()
+    let q = newListenerQueue()
+
+    let s = newSession(
+      transportFactory = proc(h: string, p: int): Transport =
+        makeTransport(w, sideA = false),
+      listenerFactory = proc(a: string, p: int): UdpListener = makeListener(q, p)
+    )
+
+    var cfg = newDefaultServerConfig(tmpDir)
+    cfg.listenAddr = "127.0.0.1"
+    cfg.listenPort = 7202
+
+    let srvId = s.startServer(cfg)
+    check srvId != NoServer
+
+    # Drain evServerStarted
+    var startedSeen = false
+    for step in 0 .. 2000:
+      for ev in s.poll(0):
+        if ev.srvId == srvId and ev.kind == evServerStarted: startedSeen = true
+      if startedSeen: break
+    check startedSeen
+
+    # RRQ with a syntactically unparseable blksize value (R6: this is the
+    # ONLY case that reaches ERROR(8) -- out-of-range-but-parseable values
+    # are clamped/dropped instead).
+    let rrq = TftpPacket(opcode: opRrq, filename: "serve_me.txt",
+                          mode: tmOctet,
+                          options: @[("blksize", "not-a-number")])
+    q.push(encode(rrq), "peer", 0)
+
+    # The server sends an ERROR packet over the wire; drain it so the
+    # handler completes (we assert on the session-side event, not the wire).
+    let clientT = makeTransport(w, sideA = true)
+    proc drainErr(): Future[void] {.async.} =
+      try:
+        discard await clientT.recv(65536, 3000)
+      except: discard
+    discard drainErr()
+
+    var evs: seq[Event]
+    var gotTerminal = false
+    for step in 0 .. 200_000:
+      for ev in s.poll(0):
+        evs.add ev
+        if ev.srvId == srvId and ev.kind in {evTransferComplete, evTransferError}:
+          gotTerminal = true
+      if gotTerminal: break
+
+    require gotTerminal
+
+    var termCount = 0
+    var errEv: Event
+    for ev in evs:
+      if ev.srvId == srvId and ev.kind in {evTransferComplete, evTransferError}:
+        inc termCount
+        errEv = ev
+
+    check termCount == 1
+    check errEv.kind == evTransferError
+    # Guard the case-object field access structurally (never-throw Defect
+    # hazard): only read `.errorCode` when `.kind` is statically confirmed,
+    # rather than relying on the `check` above to have passed.
+    if errEv.kind == evTransferError:
+      check errEv.errorCode == ord(errOptionNegotiation)
+
+    s.stop(srvId)
+    for step in 0 .. 200_000:
+      var stopped = false
+      for ev in s.poll(0):
+        if ev.srvId == srvId and ev.kind == evServerStopped: stopped = true
+      if stopped: break
+
+# ---------------------------------------------------------------------------
+# RFC conformance-closure D5: negotiated timeout is APPLIED, not just
+# validated -- the #16-windowsize-bug class, missed for timeout.
+# ---------------------------------------------------------------------------
+suite "TftpSession — RFC conformance-closure D5: negotiated timeout is applied":
+
+  test "server seeds negotiated timeout from ServerConfig.timeout (not the global default) and wires it in before the post-OACK handshake wait":
+    let tmpDir = getTempDir() / "chapulin_t_d5_timeout"
+    createDir(tmpDir)
+    writeFile(tmpDir / "slow.bin", "0123456789")  # 10 bytes -- one short DATA block
+    defer: (try: removeDir(tmpDir) except: discard)
+
+    let w = newWire()
+    let q = newListenerQueue()
+
+    let s = newSession(
+      transportFactory = proc(h: string, p: int): Transport =
+        makeTransport(w, sideA = false),
+      listenerFactory = proc(a: string, p: int): UdpListener = makeListener(q, p)
+    )
+
+    check DefaultTimeout != 20  # guard against a coincidental pass
+    var cfg = newDefaultServerConfig(tmpDir)
+    cfg.listenAddr = "127.0.0.1"
+    cfg.listenPort = 7203
+    cfg.timeout = 20  # operator-configured, deliberately non-default
+
+    let srvId = s.startServer(cfg)
+    check srvId != NoServer
+
+    var startedSeen = false
+    for step in 0 .. 2000:
+      for ev in s.poll(0):
+        if ev.srvId == srvId and ev.kind == evServerStarted: startedSeen = true
+      if startedSeen: break
+    check startedSeen
+
+    # RRQ requests blksize only -- NO timeout option (round-2 bug 4b
+    # scenario: negotiating an unrelated option must not clobber the
+    # operator's non-default timeout back to DefaultTimeout).
+    let rrq = TftpPacket(opcode: opRrq, filename: "slow.bin", mode: tmOctet,
+                          options: @[("blksize", "1024")])
+    q.push(encode(rrq), "peer", 0)
+
+    let clientT = makeTransport(w, sideA = true)
+    proc clientGet(): Future[void] {.async.} =
+      while true:
+        var tdata: seq[byte]; var host: string; var port: int
+        try:
+          (tdata, host, port) = await clientT.recv(65536, 5000)
+        except TransportTimeoutError: break
+        let pkt = decode(tdata)
+        case pkt.opcode
+        of opOack:
+          await clientT.send(encode(TftpPacket(opcode: opAck, ackBlockNum: 0)), host, port)
+        of opData:
+          await clientT.send(encode(TftpPacket(opcode: opAck, ackBlockNum: pkt.blockNum)), host, port)
+          if pkt.data.len < 1024: break
+        else: break
+    discard clientGet()
+
+    var gotComplete = false
+    for step in 0 .. 200_000:
+      for ev in s.poll(0):
+        if ev.srvId == srvId and ev.kind == evTransferComplete: gotComplete = true
+      if gotComplete: break
+    check gotComplete
+
+    # The RRQ itself arrives via the listener queue `q`, not this per-transfer
+    # Transport, so this Transport's FIRST recv call is handleRrq's post-OACK
+    # ACK(0) wait (`recvPacket`). If negotiateServerOptions had not seeded
+    # from limits.timeout, or if `xferConfig.timeout = neg.timeout` had been
+    # assigned after (rather than before) this wait, it would read 5000
+    # (DefaultTimeout*1000) instead of the operator's negotiated 20000.
+    check w.bRecvTimeoutsMs.len >= 1
+    check w.bRecvTimeoutsMs[0] == 20_000
+
+    s.stop(srvId)
+    for step in 0 .. 200_000:
+      var stopped = false
+      for ev in s.poll(0):
+        if ev.srvId == srvId and ev.kind == evServerStopped: stopped = true
+      if stopped: break
 
 # ---------------------------------------------------------------------------
 # R2-2: snap is a common field on ALL evTransfer* kinds (including evTransferError)

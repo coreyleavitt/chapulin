@@ -6,6 +6,7 @@ import ../src/chapulin/options
 import ../src/chapulin/server_config
 import ../src/chapulin/security
 import ../src/chapulin/server
+import ../src/chapulin/netascii
 
 # --- Test helpers ---
 
@@ -82,6 +83,8 @@ suite "Server test setup":
     writeFile(testRoot / "hello.txt", "Hello from TFTP server")
     writeFile(testRoot / "exact512.bin", 'A'.repeat(512))
     writeFile(testRoot / "multi.bin", 'B'.repeat(1025))
+    writeFile(testRoot / "netascii_lf.txt", "hello\nworld")
+    writeFile(testRoot / "netascii_chunks.txt", "ABCDEFGH\nIJKLMNOP\nQR")
     check fileExists(testRoot / "hello.txt")
 
 suite "handleRrq — serve file to client":
@@ -129,6 +132,7 @@ suite "handleRrq — serve file to client":
                            "10.0.0.1", 5000)
 
     check result.success == false
+    check result.errorCode == ord(errFileNotFound)  # Fix B: errorCode wired, not 0
     # Server should have sent ERROR packet
     check sm.sentPackets.len >= 1
     let sent = decode(sm.sentPackets[0].data)
@@ -145,6 +149,7 @@ suite "handleRrq — serve file to client":
                            "10.0.0.1", 5000)
 
     check result.success == false
+    check result.errorCode == ord(errAccessViolation)  # Fix B: errorCode wired, not 0
     check sm.sentPackets.len >= 1
     let sent = decode(sm.sentPackets[0].data)
     check sent.opcode == opError
@@ -180,6 +185,271 @@ suite "handleRrq — serve file to client":
     check result.success == false
     check "cancel" in result.errorMsg.toLowerAscii
 
+  test "RRQ with unparseable option value sends ERROR(8), not ERROR(4)":
+    # D3/R6: an unparseable (not merely out-of-range) option value is the
+    # ONLY case that gets ERROR(8) errOptionNegotiation -- clamp/drop handle
+    # out-of-range-but-parseable values without ever reaching this catch.
+    let sm = newServerMock()
+
+    let config = newDefaultServerConfig(testRoot)
+    let request = TftpPacket(opcode: opRrq, filename: "hello.txt",
+                              mode: tmOctet,
+                              options: @[("blksize", "not-a-number")])
+    let result = waitFor handleRrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000)
+
+    check result.success == false
+    check result.errorCode == ord(errOptionNegotiation)
+    check sm.sentPackets.len >= 1
+    let sent = decode(sm.sentPackets[0].data)
+    check sent.opcode == opError
+    check sent.errorCode == errOptionNegotiation
+
+suite "handleRrq — netascii send side (RFC-conformance-closure D1b/d, slice 7a)":
+  test "LF to CR LF round trip: a real file's LF bytes arrive on the wire as CR LF":
+    let sm = newServerMock()
+    sm.addResponse(makeAckPkt(1))
+
+    let config = newDefaultServerConfig(testRoot)
+    let request = TftpPacket(opcode: opRrq, filename: "netascii_lf.txt",
+                              mode: tmNetascii, options: @[])
+    let result = waitFor handleRrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000)
+
+    check result.success == true
+    # Local "hello\nworld" (11 bytes) -> wire "hello" CR LF "world" (12 bytes).
+    check result.bytesTransferred == 12
+    let sent = decode(sm.sentPackets[0].data)
+    check sent.opcode == opData
+    check sent.blockNum == 1
+    check sent.data == @[byte('h'), byte('e'), byte('l'), byte('l'), byte('o'),
+                        byte('\r'), byte('\n'),
+                        byte('w'), byte('o'), byte('r'), byte('l'), byte('d')]
+
+  test "multi-block RRQ under netascii: CR LF encoding spans block boundaries correctly":
+    # "ABCDEFGH\nIJKLMNOP\nQR" (20 local bytes, 2 LFs) -> 22 wire bytes after
+    # each LF expands to CR LF. blksize=8 (RFC 2348's floor -- MinBlocksize)
+    # lands this as three blocks: 8 full + 8 full + 6 short-final --
+    # exercising netasciiReader's block-chunking read-ahead loop across
+    # several internal raw reads, not just a single-call translation.
+    let localBytes = cast[seq[byte]]("ABCDEFGH\nIJKLMNOP\nQR")
+    let expectedWire = toNetascii(localBytes)
+    check expectedWire.len == 22
+
+    let sm = newServerMock()
+    sm.addResponse(makeAckPkt(0))  # OACK ack
+    sm.addResponse(makeAckPkt(1))
+    sm.addResponse(makeAckPkt(2))
+    sm.addResponse(makeAckPkt(3))
+
+    let config = newDefaultServerConfig(testRoot)
+    let request = TftpPacket(opcode: opRrq, filename: "netascii_chunks.txt",
+                              mode: tmNetascii,
+                              options: @[("blksize", "8")])
+    let result = waitFor handleRrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000)
+
+    check result.success == true
+    check result.bytesTransferred == expectedWire.len
+
+    let d1 = decode(sm.sentPackets[1].data)
+    let d2 = decode(sm.sentPackets[2].data)
+    let d3 = decode(sm.sentPackets[3].data)
+    check d1.blockNum == 1
+    check d2.blockNum == 2
+    check d3.blockNum == 3
+    check d1.data.len == 8    # full block
+    check d2.data.len == 8    # full block
+    check d3.data.len < 8     # short -- final (true EOF, not a straddle artifact)
+    check d1.data & d2.data & d3.data == expectedWire
+
+  test "retransmission under netascii: dup-ACK fast retransmit replays windowCache, never re-invokes the reader":
+    # Same 3-block layout as above (blksize=8: 8 + 8 + 6). windowsize=2 fills
+    # DATA(1),DATA(2); two duplicate ACK(0) reach dupAckThreshold and force a
+    # resend of the outstanding window. If a future change re-invoked
+    # readData for the resend instead of replaying sendBlocks' windowCache,
+    # netasciiReader's continuity doAssert would crash outright (blockNum
+    # would repeat instead of advancing) -- so this test also stands as the
+    # "future retry-logic change can't silently corrupt netascii" regression
+    # guard the RFC calls for.
+    let localBytes = cast[seq[byte]]("ABCDEFGH\nIJKLMNOP\nQR")
+    let expectedWire = toNetascii(localBytes)
+
+    let sm = newServerMock()
+    sm.addResponse(makeAckPkt(0))  # OACK ack
+    sm.addResponse(makeAckPkt(0))  # duplicate #1 (window [1,2] outstanding)
+    sm.addResponse(makeAckPkt(0))  # duplicate #2 -> fast retransmit of [1,2]
+    sm.addResponse(makeAckPkt(2))  # forward progress covers 1 and 2
+    sm.addResponse(makeAckPkt(3))  # final block acked
+
+    let config = newDefaultServerConfig(testRoot)
+    let request = TftpPacket(opcode: opRrq, filename: "netascii_chunks.txt",
+                              mode: tmNetascii,
+                              options: @[("blksize", "8"), ("windowsize", "2")])
+    let result = waitFor handleRrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000)
+
+    check result.success == true
+    check result.bytesTransferred == expectedWire.len
+
+    # [0]=OACK, [1]=DATA(1) original, [2]=DATA(2) original,
+    # [3]=DATA(1) resend, [4]=DATA(2) resend, [5]=DATA(3) final.
+    check sm.sentPackets.len == 6
+    let orig1 = decode(sm.sentPackets[1].data)
+    let orig2 = decode(sm.sentPackets[2].data)
+    let resend1 = decode(sm.sentPackets[3].data)
+    let resend2 = decode(sm.sentPackets[4].data)
+    let final3 = decode(sm.sentPackets[5].data)
+
+    check orig1.blockNum == 1
+    check resend1.blockNum == 1
+    check orig1.data == resend1.data          # replayed byte-identical
+
+    check orig2.blockNum == 2
+    check resend2.blockNum == 2
+    check orig2.data == resend2.data          # replayed byte-identical
+
+    check final3.blockNum == 3
+    check orig1.data & orig2.data & final3.data == expectedWire
+
+  test "checksum sidecar is skipped under netascii (R3)":
+    let sm = newServerMock()
+    sm.addResponse(makeAckPkt(1))
+
+    var config = newDefaultServerConfig(testRoot)
+    config.checksumMode = csMd5
+    let request = TftpPacket(opcode: opRrq, filename: "netascii_lf.txt",
+                              mode: tmNetascii, options: @[])
+    let result = waitFor handleRrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000)
+
+    check result.success == true
+    check not fileExists(testRoot / "netascii_lf.txt.md5")
+
+  test "tsize is dropped under netascii: no OACK at all when tsize is the only requested option":
+    # negotiateServerOptions(mode = tmNetascii) never emits the tsize OACK
+    # entry -- with tsize the only option requested, oackOptions ends up
+    # empty and handleRrq skips the OACK handshake entirely, going straight
+    # to DATA(1). (An octet RRQ with the same request would OACK tsize back.)
+    let sm = newServerMock()
+    sm.addResponse(makeAckPkt(1))
+
+    let config = newDefaultServerConfig(testRoot)
+    let request = TftpPacket(opcode: opRrq, filename: "netascii_lf.txt",
+                              mode: tmNetascii,
+                              options: @[("tsize", "0")])
+    let result = waitFor handleRrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000)
+
+    check result.success == true
+    let sent = decode(sm.sentPackets[0].data)
+    check sent.opcode == opData  # NOT opOack -- tsize was the only option and it was dropped
+    check sent.blockNum == 1
+
+suite "netascii finishNetasciiDecode — shared terminal-flush helper (D1c, slice 7b)":
+  test "flushes the trailing deferred CR to disk on success":
+    let path = testRoot / "finish_decode_success.tmp"
+    var f = open(path, fmWrite)
+    var dec: NetasciiDecoder
+    # A lone wire CR fed with nothing after it: `feed` defers classification
+    # (never resolves a CR via in-call lookahead) rather than writing anything.
+    let decoded = dec.feed(@[byte('A'), byte('\r')])
+    discard f.writeBytes(decoded, 0, decoded.len)
+    check decoded == @[byte('A')]  # the CR itself is still pending, not yet written
+
+    let ok = finishNetasciiDecode(f, dec, true)
+    f.close()
+    # flush() resolves the trailing lone CR to a literal CR (R2) and it is
+    # written as the file's final byte.
+    check readFile(path) == "A\r"
+    check ok == true  # Fix A: terminal write succeeded -- surfaced, not swallowed
+
+  test "does NOT flush a partial decode on failure/abort":
+    let path = testRoot / "finish_decode_failure.tmp"
+    var f = open(path, fmWrite)
+    var dec: NetasciiDecoder
+    let decoded = dec.feed(@[byte('A'), byte('\r')])
+    discard f.writeBytes(decoded, 0, decoded.len)
+
+    # success = false: a failed/aborted transfer must not flush the pending
+    # CR as if the stream had ended cleanly.
+    let ok = finishNetasciiDecode(f, dec, false)
+    f.close()
+    check readFile(path) == "A"  # trailing CR never materialized
+    check ok == true  # nothing was attempted -- not itself a failure
+
+suite "handleWrq — netascii recv side (RFC-conformance-closure D1c, slice 7b)":
+  test "CR LF to LF round trip: wire CR LF arrives as local LF on disk":
+    let sm = newServerMock()
+    let wireBytes = @[byte('h'), byte('e'), byte('l'), byte('l'), byte('o'),
+                      byte('\r'), byte('\n'),
+                      byte('w'), byte('o'), byte('r'), byte('l'), byte('d')]
+    sm.addResponse(makeDataPkt(1, wireBytes))
+
+    var config = newDefaultServerConfig(testRoot)
+    config.writePolicy = wpCreateOrOverwrite
+    let request = TftpPacket(opcode: opWrq, filename: "netascii_wrq_lf.txt",
+                              mode: tmNetascii, options: @[])
+    let result = waitFor handleWrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000)
+
+    check result.success == true
+    # Wire "hello" CR LF "world" (12 bytes) -> local "hello" LF "world" (11 bytes).
+    check readFile(testRoot / "netascii_wrq_lf.txt") == "hello\nworld"
+
+  test "foreign-interop-shaped: a CR LF / CR NUL wire stream decodes end-to-end through the write path":
+    # Exercises both wire escapes a conformant foreign sender may produce in
+    # the same stream: CR LF (line ending -> local LF) and CR NUL (escaped
+    # literal CR -> local CR), through the actual handleWrq write path (not
+    # a bare feed/flush call).
+    let sm = newServerMock()
+    let wireBytes = @[byte('A'), byte('B'), byte('\r'), byte('\n'),
+                      byte('C'), byte('D'), byte('\r'), byte(0),
+                      byte('E'), byte('F')]
+    sm.addResponse(makeDataPkt(1, wireBytes))
+
+    var config = newDefaultServerConfig(testRoot)
+    config.writePolicy = wpCreateOrOverwrite
+    let request = TftpPacket(opcode: opWrq, filename: "netascii_wrq_interop.txt",
+                              mode: tmNetascii, options: @[])
+    let result = waitFor handleWrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000)
+
+    check result.success == true
+    let expected = "AB" & "\n" & "CD" & "\r" & "EF"
+    check readFile(testRoot / "netascii_wrq_interop.txt") == expected
+
+  test "trailing deferred CR at true end-of-stream is flushed via finishNetasciiDecode":
+    let sm = newServerMock()
+    let wireBytes = @[byte('A'), byte('B'), byte('\r')]  # ends in a lone CR
+    sm.addResponse(makeDataPkt(1, wireBytes))
+
+    var config = newDefaultServerConfig(testRoot)
+    config.writePolicy = wpCreateOrOverwrite
+    let request = TftpPacket(opcode: opWrq, filename: "netascii_wrq_trailing_cr.txt",
+                              mode: tmNetascii, options: @[])
+    let result = waitFor handleWrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000)
+
+    check result.success == true
+    check readFile(testRoot / "netascii_wrq_trailing_cr.txt") == "AB\r"
+
+  test "zero-length file boundary under netascii":
+    let sm = newServerMock()
+    sm.addResponse(makeDataPkt(1, @[]))  # empty, final block
+
+    var config = newDefaultServerConfig(testRoot)
+    config.writePolicy = wpCreateOrOverwrite
+    let request = TftpPacket(opcode: opWrq, filename: "netascii_wrq_zero.txt",
+                              mode: tmNetascii, options: @[])
+    let result = waitFor handleWrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000)
+
+    check result.success == true
+    check result.bytesTransferred == 0
+    check fileExists(testRoot / "netascii_wrq_zero.txt")
+    check readFile(testRoot / "netascii_wrq_zero.txt").len == 0
+
 suite "handleWrq — receive file from client":
   test "single block upload succeeds":
     let sm = newServerMock()
@@ -212,6 +482,7 @@ suite "handleWrq — receive file from client":
                            "10.0.0.1", 5000)
 
     check result.success == false
+    check result.errorCode == ord(errAccessViolation)  # Fix B: errorCode wired, not 0
     let sent = decode(sm.sentPackets[0].data)
     check sent.opcode == opError
     check sent.errorCode == errAccessViolation
@@ -227,6 +498,7 @@ suite "handleWrq — receive file from client":
                            "10.0.0.1", 5000)
 
     check result.success == false
+    check result.errorCode == ord(errFileAlreadyExists)  # Fix B: errorCode wired, not 0
     let sent = decode(sm.sentPackets[0].data)
     check sent.opcode == opError
     check sent.errorCode == errFileAlreadyExists
@@ -259,8 +531,96 @@ suite "handleWrq — receive file from client":
                            "10.0.0.1", 5000)
 
     check result.success == false
+    check result.errorCode == ord(errAccessViolation)  # Fix B: errorCode wired, not 0
     let sent = decode(sm.sentPackets[0].data)
     check sent.opcode == opError
+
+  test "WRQ with unparseable option value sends ERROR(8), not ERROR(4)":
+    let sm = newServerMock()
+
+    var config = newDefaultServerConfig(testRoot)
+    config.writePolicy = wpCreateOrOverwrite
+    let request = TftpPacket(opcode: opWrq, filename: "opt_bad.txt",
+                              mode: tmOctet,
+                              options: @[("windowsize", "not-a-number")])
+    let result = waitFor handleWrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000)
+
+    check result.success == false
+    check result.errorCode == ord(errOptionNegotiation)
+    check sm.sentPackets.len >= 1
+    let sent = decode(sm.sentPackets[0].data)
+    check sent.opcode == opError
+    check sent.errorCode == errOptionNegotiation
+
+# ---------------------------------------------------------------------------
+# RFC conformance-closure D5/R6: an out-of-range-but-parseable timeout is
+# dropped (omitted from the OACK), never clamped or substituted -- RFC 2349
+# forbids silent substitution for timeout, unlike blksize/windowsize which
+# RFC 2348/7440 permit clamping. The pure-function drop is already covered by
+# `negotiateServerOptions` unit tests in tests/t_options.nim; this suite is
+# the wire/session-level integration counterpart D3/D4/D6 already got but D5
+# didn't -- a real RRQ/WRQ carrying an out-of-range timeout through
+# handleRrq/handleWrq, asserting the resulting OACK omits "timeout" while a
+# concurrently-requested, in-range option (blksize) IS still negotiated.
+# ---------------------------------------------------------------------------
+suite "handleRrq/handleWrq — R6: out-of-range timeout is dropped from the OACK (D5 integration coverage)":
+  test "RRQ with timeout=0 (below range): OACK negotiates blksize but omits timeout entirely":
+    let sm = newServerMock()
+    sm.addResponse(makeAckPkt(0))  # client ACKs OACK
+    sm.addResponse(makeAckPkt(1))  # client ACKs DATA(1)
+
+    let config = newDefaultServerConfig(testRoot)
+    let request = TftpPacket(opcode: opRrq, filename: "hello.txt",
+                              mode: tmOctet,
+                              options: @[("blksize", "1024"), ("timeout", "0")])
+    let result = waitFor handleRrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000)
+
+    check result.success == true
+    let oack = decode(sm.sentPackets[0].data)
+    check oack.opcode == opOack
+    check ("blksize", "1024") in oack.oackOptions       # valid option still negotiated
+    for (key, _) in oack.oackOptions:
+      check key.toLowerAscii != "timeout"               # out-of-range option dropped, not clamped
+
+  test "RRQ with timeout=300 (above range): OACK negotiates blksize but omits timeout entirely":
+    let sm = newServerMock()
+    sm.addResponse(makeAckPkt(0))
+    sm.addResponse(makeAckPkt(1))
+
+    let config = newDefaultServerConfig(testRoot)
+    let request = TftpPacket(opcode: opRrq, filename: "hello.txt",
+                              mode: tmOctet,
+                              options: @[("blksize", "1024"), ("timeout", "300")])
+    let result = waitFor handleRrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000)
+
+    check result.success == true
+    let oack = decode(sm.sentPackets[0].data)
+    check oack.opcode == opOack
+    check ("blksize", "1024") in oack.oackOptions
+    for (key, _) in oack.oackOptions:
+      check key.toLowerAscii != "timeout"
+
+  test "WRQ with timeout=0 (below range): OACK negotiates blksize but omits timeout entirely":
+    let sm = newServerMock()
+    sm.addResponse(makeDataPkt(1, @[byte 7, 8, 9]))  # RFC 2347: client ACKs OACK with DATA(1)
+
+    var config = newDefaultServerConfig(testRoot)
+    config.writePolicy = wpCreateOrOverwrite
+    let request = TftpPacket(opcode: opWrq, filename: "d5_timeout_wrq.txt",
+                              mode: tmOctet,
+                              options: @[("blksize", "1024"), ("timeout", "0")])
+    let result = waitFor handleWrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000)
+
+    check result.success == true
+    let oack = decode(sm.sentPackets[0].data)
+    check oack.opcode == opOack
+    check ("blksize", "1024") in oack.oackOptions
+    for (key, _) in oack.oackOptions:
+      check key.toLowerAscii != "timeout"
 
 suite "handleRrq — csSha256 fails loud, never a silent no-op (H2)":
   test "csSha256 config: handleRrq fails, sends ERROR, writes no sidecar":
@@ -414,6 +774,7 @@ suite "sendOsErrorAndFail — no OS path/errno leak (slice 3a)":
                                               fakeOsDetail, "RRQ open failed")
 
     check outcome.xfer.success == false
+    check outcome.xfer.errorCode == ord(errAccessViolation)  # Fix B: errorCode wired, not 0
     check outcome.xfer.errorMsg == clientSafeError(errAccessViolation)
     check testRoot notin outcome.xfer.errorMsg
 
@@ -446,6 +807,7 @@ suite "WRQ open failure — no OS path/errno leak (slice 3a)":
                            "10.0.0.1", 5000)
 
     check result.success == false
+    check result.errorCode == ord(errDiskFull)  # Fix B: errorCode wired, not 0
     check testRoot notin result.errorMsg
     check result.errorMsg == clientSafeError(errDiskFull)
 

@@ -1,6 +1,6 @@
 ## Server configuration types.
 
-import transfer
+import protocol
 import std/strutils
 
 type
@@ -71,6 +71,23 @@ proc checksumModeImplemented*(m: ChecksumMode): bool =
   ## exactly one place instead of being re-derived — and able to drift —
   ## at each call site.
   m in {csNone, csMd5}
+
+proc serverConfigBoundsValid*(config: ServerConfig): bool =
+  ## Single authority for "are this ServerConfig's option bounds legal per
+  ## protocol.nim's RFC bounds" (RFC conformance-closure D7). Mirrors
+  ## checksumModeImplemented: every boundary that must reject an invalid
+  ## config (startServer, handleRrq, handleWrq) routes through this ONE
+  ## predicate so "which bounds are legal" can never drift between them.
+  ## ServerConfig has no real construction choke point (a plain mutable
+  ## object; the CLI pokes fields directly), so this exists to be called at
+  ## every entry point instead of trusted-by-construction.
+  config.minBlocksize >= MinBlocksize and
+    config.maxBlocksize <= MaxBlocksize and
+    config.minBlocksize <= config.maxBlocksize and
+    config.minWindowsize >= MinWindowsize and
+    config.maxWindowsize <= MaxWindowsize and
+    config.minWindowsize <= config.maxWindowsize and
+    validateTimeoutOpt(config.timeout)
 
 proc parseChecksumMode*(s: string): ChecksumMode =
   ## Parse a checksum mode string from CLI/config.

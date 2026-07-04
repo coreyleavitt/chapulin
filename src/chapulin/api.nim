@@ -4,6 +4,7 @@
 import std/asyncdispatch
 import engine
 import protocol
+import netascii
 export Transport, CancelCheck, TransportTimeoutError,
        TransferResult, DefaultBlocksize, DefaultTimeout,
        DefaultRetries, DefaultWindowsize, MinWindowsize, MaxWindowsize,
@@ -234,7 +235,14 @@ proc startTransfer*(s: TftpSession, req: TransferRequest): TransferId =
     let xport = s.transportFactory(req.host, req.port)
 
     var config = TftpClientConfig(
-      timeout:      req.options.timeout,
+      # R2-3 fix (b): clamp into [MinTimeoutOpt, MaxTimeoutOpt] here, same as
+      # blocksize/windowsize just below -- D7 belt-and-suspenders so the
+      # public API can never hand engine.getFile/putFile an out-of-range (or
+      # zero) timeout in the first place. engine.nim's toTransferConfig
+      # clamps too (fix a), but that second layer should never be the ONLY
+      # thing standing between a bad public-API input and a zero timeout
+      # reaching validateAndParseOack's configuredTimeout fallback.
+      timeout:      max(MinTimeoutOpt, min(MaxTimeoutOpt, req.options.timeout)),
       retries:      req.options.retries,
       blocksize:    validateBlocksize(bs),
       windowsize:   max(MinWindowsize, min(MaxWindowsize, ws)),
@@ -260,28 +268,50 @@ proc startTransfer*(s: TftpSession, req: TransferRequest): TransferId =
     case req.direction
     of tdGet:
       var gfile:       File
-      var gfileOpened: bool = false
       var writeError:  string = ""
+      # D1c: the RECEIVE-side counterpart of tdPut's readData above -- api.nim
+      # owns this file handle directly (not via engine.nim), so it builds its
+      # own `makeRecvSink` once the file is open (it can't be built up front
+      # like server.handleWrq's, since the file open itself is lazy here --
+      # deferred to the first onData call rather than done eagerly).
+      #
+      # L2 (structural nil-invariant fix): there is deliberately NO separate
+      # "is the file open" bool. `recvSink != nil` IS the single source of
+      # truth for "the file is open and its sink is ready" -- the open and
+      # the sink construction happen in the same branch, guarded by the same
+      # check that gates every call to `recvSink` below. A prior version
+      # tracked file-openness with its own `gfileOpened` flag, separate from
+      # `recvSink`'s nil-ness; a future edit could then in principle flip one
+      # without the other and reach `recvSink(...)` while it was still nil
+      # (NilAccessDefect, the tracked never-throw hazard). Collapsing both
+      # onto one variable makes that ordering a compile-time-adjacent
+      # impossibility rather than a doAssert/runtime check.
+      var recvSink: proc(data: seq[byte], isFinal: bool): bool
 
       let onData: proc(blockNum: uint16, data: seq[byte]) =
         proc(blockNum: uint16, data: seq[byte]) =
           if writeError.len > 0: return
-          if not gfileOpened:
+          if recvSink == nil:
             try:
               gfile = open(req.localPath, fmWrite)
-              gfileOpened = true
+              recvSink = makeRecvSink(gfile, md)
             except IOError as e:
               writeError = "Cannot open file for writing: " & e.msg
               return
-          if data.len > 0:
-            let written = gfile.writeBytes(data, 0, data.len)
-            if written != data.len:
-              writeError = "Write failed"
+          # Same final-block signal recvBlocks/getFile's single-block branch
+          # use (`data.len < negotiated blocksize`); `effBs` tracks the
+          # negotiated value from the moment onNegCb fires, before any DATA
+          # arrives. Fix A: a short/failed terminal write is no longer
+          # silently discarded -- makeRecvSink folds it into its return value
+          # exactly like a per-block write mismatch, so combinedCancel below
+          # (and the caller's failure path) observes it.
+          if not recvSink(data, data.len < effBs):
+            writeError = "Write failed"
 
       let combinedCancel: CancelCheck = proc(): bool = writeError.len > 0 or flag[]
 
       fileCleanup = proc() {.closure.} =
-        if gfileOpened: gfile.close()
+        if recvSink != nil: gfile.close()
 
       fut = getFile(xport, config, req.host, req.port, req.filename,
                     onData, progressCb, combinedCancel, onNegCb)
@@ -291,23 +321,16 @@ proc startTransfer*(s: TftpSession, req: TransferRequest): TransferId =
       var pfile = open(req.localPath, fmRead)
       let fileSize = getFileSize(req.localPath)
       config.tsize = fileSize
-      startTotal = some(fileSize)
+      let netasciiPolicy = netasciiPolicyFor(md)
+      # D1d(client PUT): `.bytes` counts post-translation wire bytes while
+      # `fileSize` is pre-translation local bytes -- under netascii the two
+      # can diverge (progress could otherwise exceed 100%), so the reported
+      # total is unknown rather than the (wrong) pre-translation size.
+      startTotal = if netasciiPolicy.reportTotalUnknown: none(int64)
+                  else: some(fileSize)
 
-      var blockCache: seq[byte]
-      var cachedBlock: uint16 = 0
-
-      let readData: proc(blockNum: uint16, blocksize: int): seq[byte] =
-        proc(blockNum: uint16, blocksize: int): seq[byte] =
-          if blockNum == 0: return @[]
-          if blockNum == cachedBlock: return blockCache
-          let offset = int64(blockNum - 1) * int64(blocksize)
-          pfile.setFilePos(offset)
-          var buf = newSeq[byte](blocksize)
-          let nr = pfile.readBytes(buf, 0, blocksize)
-          buf.setLen(nr)
-          blockCache = buf
-          cachedBlock = blockNum
-          return buf
+      var netasciiEnc: NetasciiEncoder
+      let readData = makeSendReader(pfile, md, netasciiEnc)
 
       fileCleanup = proc() {.closure.} = pfile.close()
 
@@ -385,6 +408,19 @@ proc startServer*(s: TftpSession, config: ServerConfig): ServerId =
       raise newException(ValueError,
         "checksum mode '" & $config.checksumMode & "' is not yet implemented (use md5 or none)")
 
+    # RFC conformance-closure D7: reject an out-of-RFC-bound config (blksize,
+    # windowsize, timeout) at server construction, before any listener binds
+    # or RRQ is served -- same rationale/channel as the checksumMode guard
+    # above. Routes through the single shared authority (server_config.
+    # serverConfigBoundsValid) so this can never drift from handleRrq's/
+    # handleWrq's own copy of the same rule.
+    if not serverConfigBoundsValid(config):
+      raise newException(ValueError,
+        "ServerConfig option bounds out of RFC range (blksize " &
+        $MinBlocksize & ".." & $MaxBlocksize & ", windowsize " &
+        $MinWindowsize & ".." & $MaxWindowsize & ", timeout " &
+        $MinTimeoutOpt & ".." & $MaxTimeoutOpt & ")")
+
     # --- Build listener ---
     let listener: UdpListener =
       if s.listenerFactory != nil:
@@ -461,7 +497,7 @@ proc startServer*(s: TftpSession, config: ServerConfig): ServerId =
           cS.enqueue(Event(xfrId: tid, srvId: cSrvId, kind: evTransferError,
                            snap: mkSnap(info.bytesTransferred, totOpt, dir, info.mode,
                                         info.blocksize, info.windowsize, info.startedAt),
-                           errorCode: 0, errorMsg: msg))
+                           errorCode: info.errorCode, errorMsg: msg))
     )
 
     # --- Logger that feeds evServerLog ---

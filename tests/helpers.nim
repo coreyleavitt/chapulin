@@ -15,9 +15,20 @@ type
     responseIdx*: int
     sentPackets*: seq[tuple[data: seq[byte], host: string, port: int]]
     timeoutOnNext*: int
+    recvTimeoutsMs*: seq[int]  ## every timeoutMs a caller asked recv() for, in
+                               ## order -- lets a test observe that a
+                               ## negotiated `timeout` actually reached the
+                               ## wire-level recv call (RFC conformance-
+                               ## closure D5's "apply", not just "validate").
+    recvDelayMs*: int  ## optional artificial delay (via sleepAsync) before
+                       ## each recv() resolves -- lets a test make real
+                       ## wall-clock time elapse deterministically between
+                       ## iterations of a bounded-deadline retry loop (R2-1),
+                       ## mirroring t_transfer.nim's local mock.
 
 proc newMockTransport*(): MockTransport =
-  MockTransport(responses: @[], responseIdx: 0, sentPackets: @[], timeoutOnNext: 0)
+  MockTransport(responses: @[], responseIdx: 0, sentPackets: @[], timeoutOnNext: 0,
+               recvTimeoutsMs: @[], recvDelayMs: 0)
 
 proc addResponse*(mt: MockTransport, pkt: TftpPacket, host: string = "127.0.0.1", port: int = 12345) =
   mt.responses.add MockResponse(data: encode(pkt), host: host, port: port)
@@ -32,19 +43,18 @@ proc toTransport*(mt: MockTransport): Transport =
     fut.complete()
     return fut
 
-  result.recv = proc(bufSize: int, timeoutMs: int): Future[tuple[data: seq[byte], host: string, port: int]] =
-    let fut = newFuture[tuple[data: seq[byte], host: string, port: int]]("mockRecv")
+  result.recv = proc(bufSize: int, timeoutMs: int): Future[tuple[data: seq[byte], host: string, port: int]] {.async.} =
+    mt.recvTimeoutsMs.add timeoutMs
+    if mt.recvDelayMs > 0:
+      await sleepAsync(mt.recvDelayMs)
     if mt.timeoutOnNext > 0:
       mt.timeoutOnNext.dec
-      fut.fail(newException(TransportTimeoutError, "Mock timeout"))
-      return fut
+      raise newException(TransportTimeoutError, "Mock timeout")
     if mt.responseIdx >= mt.responses.len:
-      fut.fail(newException(TransportTimeoutError, "No more mock responses"))
-      return fut
+      raise newException(TransportTimeoutError, "No more mock responses")
     let resp = mt.responses[mt.responseIdx]
     mt.responseIdx.inc
-    fut.complete((data: resp.data, host: resp.host, port: resp.port))
-    return fut
+    return (data: resp.data, host: resp.host, port: resp.port)
 
   result.close = proc() = discard
 

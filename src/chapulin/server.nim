@@ -11,6 +11,7 @@ import server_config
 import checksum
 import logging
 import format
+import netascii
 export logging
 
 type
@@ -26,6 +27,10 @@ type
     windowsize*: int      ## negotiated (or default) windowsize for this transfer
     mode*: TransferMode   ## transfer mode (tmOctet / tmNetascii)
     reqId*: int           ## monotonic per-server request counter; unique within server lifetime
+    errorCode*: int       ## RFC TftpErrorCode ord on failure (Q1/Option A); 0 (errNotDefined)
+                          ## absent a failure, or when the failure path hasn't been wired to
+                          ## a specific code yet. Additive field -- rides on the existing
+                          ## onTransferError(info, msg) callback signature.
 
   ServerCallbacks* = object
     onTransferStart*: proc(info: TransferInfo) {.closure.}
@@ -52,6 +57,21 @@ proc serverOptionLimits(config: ServerConfig): ServerOptionLimits =
     minWindowsize: config.minWindowsize
   )
 
+proc shouldDigestForSidecar(config: ServerConfig, mode: TransferMode,
+                            resolvedPath: string): bool =
+  ## Named gate for the RRQ sidecar-digest decision (RFC code-review
+  ## finding, D1d/M1 collapse): a served file is digested into a .md5
+  ## sidecar iff the server is configured for it, netascii's R3 policy
+  ## doesn't skip it (translation would make the sidecar mode-dependent --
+  ## see the call site's fuller comment), and the file being served isn't
+  ## itself a reserved sidecar name (M1 -- prevents an unbounded
+  ## foo.md5.md5.md5... chain from a client repeatedly RRQing the newest
+  ## sidecar). Named and pulled out of the `if` at the call site purely for
+  ## readability -- same three conditions, same order, same short-circuit
+  ## behavior as before.
+  config.checksumMode == csMd5 and not netasciiPolicyFor(mode).skipSidecar and
+    not isReservedSidecarName(resolvedPath)
+
 proc filterOptionsForPxe(opts: seq[(string, string)]): seq[(string, string)] =
   ## PXE compatibility: only allow tsize option, strip everything else.
   for (key, val) in opts:
@@ -63,8 +83,29 @@ proc sendError(transport: Transport, host: string, port: int,
   let errPkt = TftpPacket(opcode: opError, errorCode: code, errorMsg: msg)
   await transport.send(encode(errPkt), host, port)
 
-proc failResult(msg: string): TransferResult =
-  TransferResult(success: false, bytesTransferred: 0, errorMsg: msg, totalSize: -1)
+proc failResult(msg: string, errorCode: int = 0): TransferResult =
+  TransferResult(success: false, bytesTransferred: 0, errorMsg: msg,
+                 errorCode: errorCode, totalSize: -1)
+
+proc mkTransferInfo(clientHost: string, clientPort: int, filename, direction: string,
+                    totalBytes: int64, startedAt: float, blocksize, windowsize: int,
+                    mode: TransferMode, reqId: int): TransferInfo =
+  ## Shared `onStart`-callback TransferInfo builder. Used both on the normal
+  ## pre-transfer path (after option negotiation succeeds, reporting
+  ## negotiated blocksize/windowsize) AND on the option-negotiation failure
+  ## path (Q1/Option A -- see the `except ValueError` sites in
+  ## handleRrq/handleWrq): calling `onStart` there mints a TransferId for the
+  ## about-to-fail request so its ERROR(8) can surface via `onTransferError`,
+  ## rather than being silently dropped by Invariant 4 (which still applies,
+  ## unchanged, to every OTHER pre-onStart failure -- checksum-mode,
+  ## config-bounds, path-validation, file-not-found, OS open failure). This
+  ## is the one call site the RFC's Q1 resolution requires to be observable;
+  ## widening Invariant 4 itself is out of scope. `bytesTransferred` is
+  ## always 0 here -- this fires before any bytes move either way.
+  TransferInfo(clientHost: clientHost, clientPort: clientPort, filename: filename,
+              direction: direction, bytesTransferred: 0, totalBytes: totalBytes,
+              startedAt: startedAt, blocksize: blocksize, windowsize: windowsize,
+              mode: mode, reqId: reqId)
 
 proc clientSafeError*(code: TftpErrorCode): string =
   ## Generic, path-free, client-safe message for a TFTP error code.
@@ -84,6 +125,7 @@ proc clientSafeError*(code: TftpErrorCode): string =
   of errUnknownTransferId: "Unknown transfer ID"
   of errFileAlreadyExists: "File already exists"
   of errNoSuchUser: "No such user"
+  of errOptionNegotiation: "Option negotiation failed"
 
 proc redactRoot*(rootDir: string, msg: string): string =
   ## Strip every occurrence of the server's absolute `rootDir` from `msg`,
@@ -122,7 +164,7 @@ proc sendOsErrorAndFail*(transport: Transport, host: string, port: int,
   let msg = clientSafeError(code)
   await sendError(transport, host, port, code, msg)
   let diag = redactRoot(rootDir, label & ": " & osDetail)
-  return (xfer: failResult(msg), diag: diag)
+  return (xfer: failResult(msg, ord(code)), diag: diag)
 
 # --- RRQ handler: serve file to client ---
 
@@ -179,10 +221,26 @@ proc handleRrq*(config: ServerConfig, request: TftpPacket,
     await sendError(transport, clientHost, clientPort, errNotDefined, msg)
     return failResult(msg)
 
+  # RFC conformance-closure D7: belt-and-suspenders. startServer already
+  # rejects an out-of-RFC-bound config before a listener ever binds, but
+  # handleRrq is itself an exported entry point that can be called directly
+  # (bypassing startServer) -- same rationale as the checksumMode guard
+  # above, same shared authority (server_config.serverConfigBoundsValid).
+  if not serverConfigBoundsValid(config):
+    let msg = "Server configuration invalid"
+    await sendError(transport, clientHost, clientPort, errNotDefined, msg)
+    return failResult(msg)
+
   # Check for directory listing request
   if config.dirListFile.len > 0 and request.filename == config.dirListFile:
     let listing = generateDirListing(config.rootDir)
-    let listingBytes = cast[seq[byte]](listing)
+    # D1d(4): the pseudo-file is already a fully-materialized in-memory
+    # buffer, so under netascii it gets a one-shot feed+flush translation up
+    # front (netascii.nim's toNetascii convenience wrapper) rather than being
+    # forced through the block-chunking netasciiReader -- then plain
+    # seek-addressing continues over the (already-translated) wire bytes.
+    let listingBytes = if request.mode == tmNetascii: toNetascii(cast[seq[byte]](listing))
+                       else: cast[seq[byte]](listing)
     var offset = 0
     let xferConfig = newTransferConfig(timeout = config.timeout, retries = config.retries)
     let peer = newPeer(clientHost, clientPort, locked = true)
@@ -196,11 +254,11 @@ proc handleRrq*(config: ServerConfig, request: TftpPacket,
   let (valid, resolvedPath, pathErr) = validatePath(config.rootDir, request.filename)
   if not valid:
     await sendError(transport, clientHost, clientPort, errAccessViolation, pathErr)
-    return failResult(pathErr)
+    return failResult(pathErr, ord(errAccessViolation))
 
   if not fileExists(resolvedPath):
     await sendError(transport, clientHost, clientPort, errFileNotFound, "File not found")
-    return failResult("File not found: " & request.filename)
+    return failResult("File not found: " & request.filename, ord(errFileNotFound))
 
   let fileSize = getFileSize(resolvedPath)
   var file: File
@@ -230,14 +288,23 @@ proc handleRrq*(config: ServerConfig, request: TftpPacket,
     var oackOpts: seq[(string, string)]
     try:
       (neg, oackOpts) = negotiateServerOptions(clientOpts, limits,
-                                                fileSize = fileSize)
+                                                fileSize = fileSize,
+                                                suppressTsize = netasciiPolicyFor(request.mode).suppressTsize)
     except ValueError:
-      await sendError(transport, clientHost, clientPort, errIllegalOperation,
-                      "Invalid option value")
-      return failResult("Invalid option in request")
+      # R6: this fires only on a syntactically unparseable option value
+      # (never on an out-of-range-but-parseable one, which is clamped or
+      # dropped) -- RFC 2347 error code 8 (errOptionNegotiation).
+      if onStart != nil:
+        onStart(mkTransferInfo(clientHost, clientPort, request.filename, "RRQ",
+                               xferConfig.totalSize, startedAt, xferConfig.blocksize,
+                               xferConfig.windowsize, request.mode, reqId))
+      await sendError(transport, clientHost, clientPort, errOptionNegotiation,
+                      clientSafeError(errOptionNegotiation))
+      return failResult("Invalid option in request", ord(errOptionNegotiation))
 
     xferConfig.blocksize = neg.blocksize
     xferConfig.windowsize = neg.windowsize
+    xferConfig.timeout = neg.timeout
     if neg.totalSize >= 0:
       xferConfig.totalSize = neg.totalSize
 
@@ -246,6 +313,9 @@ proc handleRrq*(config: ServerConfig, request: TftpPacket,
       let oackData = encode(oack)
       await transport.send(oackData, clientHost, clientPort)
 
+      # neg.timeout was assigned into xferConfig ABOVE, before this wait, so
+      # the handshake itself honors the negotiated value (RFC conformance-
+      # closure D5) rather than the pre-negotiation default.
       var pkt: TftpPacket
       try:
         pkt = await recvPacket(transport, xferConfig, peer, oackData)
@@ -255,14 +325,13 @@ proc handleRrq*(config: ServerConfig, request: TftpPacket,
       if pkt.opcode != opAck or pkt.ackBlockNum != 0:
         return failResult("Expected ACK(0) after OACK, got: " & $pkt.opcode)
 
-  let readData = proc(blockNum: uint16, blocksize: int): seq[byte] =
-    if blockNum == 0: return @[]
-    let offset = int64(blockNum - 1) * int64(blocksize)
-    file.setFilePos(offset)
-    var buf = newSeq[byte](blocksize)
-    let bytesRead = file.readBytes(buf, 0, blocksize)
-    buf.setLen(bytesRead)
-    return buf
+  # D1b/d: netascii translation is expansive and data-dependent, so the wire
+  # offset of a given local byte can't be computed from blockNum*blocksize --
+  # the seek-addressed octet closure is invalid for netascii. makeSendReader
+  # (netascii.nim) owns that choice now; octet keeps its self-correcting seek
+  # closure untouched, just relocated inside that constructor.
+  var netasciiEnc: NetasciiEncoder
+  let readData = makeSendReader(file, request.mode, netasciiEnc)
 
   # Checksum sidecar (RFC D1): only constructed when csMd5 is enabled, so the
   # csNone path (default) allocates nothing and passes onDelivered = nil into
@@ -280,23 +349,21 @@ proc handleRrq*(config: ServerConfig, request: TftpPacket,
   # grow an unbounded, client-driven chain. Same isReservedSidecarName
   # authority as checkWriteAccess (H1/M5), so "what counts as reserved"
   # cannot drift between the WRQ-side and RRQ-side enforcement.
+  # R3: under netascii, skip the .md5 sidecar entirely (as tsize is dropped).
+  # Hashing post-translation wire bytes would make the sidecar mode-dependent
+  # and clobber a prior octet sidecar; hashing pre-translation bytes would
+  # break the checksum RFC's "delivered bytes" invariant. Skipping avoids
+  # both -- this is one of the enumerated policy-seam sites (D1d).
   var digester: Digester
   var onDelivered: proc(data: openArray[byte]) {.closure.}
-  if config.checksumMode == csMd5 and not isReservedSidecarName(resolvedPath):
+  if shouldDigestForSidecar(config, request.mode, resolvedPath):
     digester = newDigester(csMd5)
     onDelivered = proc(data: openArray[byte]) = digester.update(data)
 
   if onStart != nil:
-    let startInfo = TransferInfo(
-      clientHost: clientHost, clientPort: clientPort,
-      filename: request.filename, direction: "RRQ",
-      bytesTransferred: 0, totalBytes: xferConfig.totalSize,
-      startedAt: startedAt,
-      blocksize: xferConfig.blocksize,
-      windowsize: xferConfig.windowsize,
-      mode: request.mode,
-      reqId: reqId)
-    onStart(startInfo)
+    onStart(mkTransferInfo(clientHost, clientPort, request.filename, "RRQ",
+                           xferConfig.totalSize, startedAt, xferConfig.blocksize,
+                           xferConfig.windowsize, request.mode, reqId))
 
   var xferResult = await sendBlocks(transport, xferConfig, peer, 1, readData,
                                      onProgress, cancelCheck, onDelivered)
@@ -325,15 +392,23 @@ proc handleWrq*(config: ServerConfig, request: TftpPacket,
   ## See handleRrq's `diagOut` doc: same server-only, operator-diagnostic
   ## channel (RFC checksum-integrity-error-hygiene, finding M3), including
   ## the always-allocated default box (round-3 fix 3).
+  # RFC conformance-closure D7: belt-and-suspenders -- see handleRrq's
+  # identical guard for the rationale (handleWrq is likewise a directly-
+  # callable exported entry point that can bypass startServer).
+  if not serverConfigBoundsValid(config):
+    let msg = "Server configuration invalid"
+    await sendError(transport, clientHost, clientPort, errNotDefined, msg)
+    return failResult(msg)
+
   let (valid, resolvedPath, pathErr) = validatePath(config.rootDir, request.filename)
   if not valid:
     await sendError(transport, clientHost, clientPort, errAccessViolation, pathErr)
-    return failResult(pathErr)
+    return failResult(pathErr, ord(errAccessViolation))
 
   let (writeOk, writeErrCode, writeErr) = checkWriteAccess(config, resolvedPath)
   if not writeOk:
     await sendError(transport, clientHost, clientPort, writeErrCode, writeErr)
-    return failResult(writeErr)
+    return failResult(writeErr, ord(writeErrCode))
 
   var xferConfig = newTransferConfig(
     blocksize = DefaultBlocksize,
@@ -349,14 +424,22 @@ proc handleWrq*(config: ServerConfig, request: TftpPacket,
     var neg: NegotiatedOptions
     var oackOpts: seq[(string, string)]
     try:
-      (neg, oackOpts) = negotiateServerOptions(wrqClientOpts, limits)
+      (neg, oackOpts) = negotiateServerOptions(wrqClientOpts, limits,
+                                                suppressTsize = netasciiPolicyFor(request.mode).suppressTsize)
     except ValueError:
-      await sendError(transport, clientHost, clientPort, errIllegalOperation,
-                      "Invalid option value")
-      return failResult("Invalid option in request")
+      # R6: syntactically unparseable option value -- see handleRrq's
+      # identical catch for the rationale.
+      if onStart != nil:
+        onStart(mkTransferInfo(clientHost, clientPort, request.filename, "WRQ",
+                               xferConfig.totalSize, startedAt, xferConfig.blocksize,
+                               xferConfig.windowsize, request.mode, reqId))
+      await sendError(transport, clientHost, clientPort, errOptionNegotiation,
+                      clientSafeError(errOptionNegotiation))
+      return failResult("Invalid option in request", ord(errOptionNegotiation))
 
     xferConfig.blocksize = neg.blocksize
     xferConfig.windowsize = neg.windowsize
+    xferConfig.timeout = neg.timeout
     if neg.totalSize >= 0:
       xferConfig.totalSize = neg.totalSize
 
@@ -380,24 +463,29 @@ proc handleWrq*(config: ServerConfig, request: TftpPacket,
   defer: file.close()
 
   if onStart != nil:
-    let startInfo = TransferInfo(
-      clientHost: clientHost, clientPort: clientPort,
-      filename: request.filename, direction: "WRQ",
-      bytesTransferred: 0, totalBytes: xferConfig.totalSize,
-      startedAt: startedAt,
-      blocksize: xferConfig.blocksize,
-      windowsize: xferConfig.windowsize,
-      mode: request.mode,
-      reqId: reqId)
-    onStart(startInfo)
+    onStart(mkTransferInfo(clientHost, clientPort, request.filename, "WRQ",
+                           xferConfig.totalSize, startedAt, xferConfig.blocksize,
+                           xferConfig.windowsize, request.mode, reqId))
+
+  # D1c: writes route through makeRecvSink (netascii.nim), which owns the
+  # decode-feed (undoing the wire's CR-LF/CR-NUL escaping under netascii)
+  # AND the terminal finalize/flush -- see its doc for the exact contract.
+  let recvSink = makeRecvSink(file, request.mode)
 
   var writeError = ""
   let onData = proc(blockNum: uint16, data: seq[byte]) =
     if writeError.len > 0: return
-    if data.len > 0:
-      let written = file.writeBytes(data, 0, data.len)
-      if written != data.len:
-        writeError = "Write failed"
+    # Final (short) block: the sink flushes durably on this call so the file
+    # is durable on disk as soon as the data is accepted -- NOT gated on
+    # recvBlocks() returning. D2's bounded final-ACK dally now runs (an extra
+    # async suspension) between sendAck and recvBlocks' return, during which
+    # the event loop can resume the CLIENT's coroutine (which sees the ACK
+    # and reports its own transfer complete) well before the server-side
+    # `defer: file.close()` below fires. Without this, a caller that reacts
+    # to the client's completion (e.g. this module's own test harness) can
+    # observe a not-yet-flushed file.
+    if not recvSink(data, data.len < xferConfig.blocksize):
+      writeError = "Write failed"
 
   let combinedCancel: CancelCheck = proc(): bool =
     writeError.len > 0 or (cancelCheck != nil and cancelCheck())
@@ -558,7 +646,8 @@ proc handleRequest*(server: TftpServer, data: seq[byte],
     blocksize: effBlocksize,
     windowsize: effWindowsize,
     mode: effMode,
-    reqId: reqId)
+    reqId: reqId,
+    errorCode: xferResult.errorCode)
 
   if xferResult.success:
     if server.callbacks.onTransferComplete != nil:

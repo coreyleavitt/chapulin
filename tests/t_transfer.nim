@@ -16,9 +16,19 @@ type
     responseIdx: int
     sentPackets: seq[tuple[data: seq[byte], host: string, port: int]]
     timeoutOnNext: int
+    recvTimeoutsMs: seq[int]  ## every timeoutMs a caller asked recv() for, in
+                               ## order -- lets a test observe the R5 deadline
+                               ## budget shrinking across recvOnce's internal
+                               ## retry loop instead of resetting each call.
+    recvDelayMs: int  ## optional artificial delay (via sleepAsync) before each
+                       ## recv() resolves -- lets a test make real wall-clock
+                       ## time elapse deterministically between iterations of
+                       ## recvOnce's internal loop, without relying on OS
+                       ## timer/scheduling precision for the assertion itself.
 
 proc newMock(): MockTransport =
-  MockTransport(responses: @[], responseIdx: 0, sentPackets: @[], timeoutOnNext: 0)
+  MockTransport(responses: @[], responseIdx: 0, sentPackets: @[], timeoutOnNext: 0,
+               recvTimeoutsMs: @[], recvDelayMs: 0)
 
 proc addResponse(mt: MockTransport, pkt: TftpPacket, host: string = "10.0.0.1", port: int = 5000) =
   mt.responses.add MockResponse(data: encode(pkt), host: host, port: port)
@@ -33,19 +43,18 @@ proc toTransport(mt: MockTransport): Transport =
     fut.complete()
     return fut
 
-  result.recv = proc(bufSize: int, timeoutMs: int): Future[tuple[data: seq[byte], host: string, port: int]] =
-    let fut = newFuture[tuple[data: seq[byte], host: string, port: int]]("mockRecv")
+  result.recv = proc(bufSize: int, timeoutMs: int): Future[tuple[data: seq[byte], host: string, port: int]] {.async.} =
+    mt.recvTimeoutsMs.add timeoutMs
+    if mt.recvDelayMs > 0:
+      await sleepAsync(mt.recvDelayMs)
     if mt.timeoutOnNext > 0:
       mt.timeoutOnNext.dec
-      fut.fail(newException(TransportTimeoutError, "Mock timeout"))
-      return fut
+      raise newException(TransportTimeoutError, "Mock timeout")
     if mt.responseIdx >= mt.responses.len:
-      fut.fail(newException(TransportTimeoutError, "No more mock responses"))
-      return fut
+      raise newException(TransportTimeoutError, "No more mock responses")
     let resp = mt.responses[mt.responseIdx]
     mt.responseIdx.inc
-    fut.complete((data: resp.data, host: resp.host, port: resp.port))
-    return fut
+    return (data: resp.data, host: resp.host, port: resp.port)
 
 proc makeDataPkt(blockNum: uint16, payload: seq[byte]): TftpPacket =
   TftpPacket(opcode: opData, blockNum: blockNum, data: payload)
@@ -60,6 +69,39 @@ proc makeErrorPkt(code: TftpErrorCode, msg: string): TftpPacket =
 # recvPacket tests
 # ============================================================
 
+suite "Option bounds (D7 — protocol.nim single source of truth)":
+  test "validateBlocksize clamps into [MinBlocksize, MaxBlocksize]":
+    check protocol.validateBlocksize(0) == MinBlocksize
+    check protocol.validateBlocksize(MinBlocksize) == MinBlocksize
+    check protocol.validateBlocksize(1024) == 1024
+    check protocol.validateBlocksize(MaxBlocksize) == MaxBlocksize
+    check protocol.validateBlocksize(999_999) == MaxBlocksize
+
+  test "validateWindowsize clamps into [MinWindowsize, MaxWindowsize]":
+    check protocol.validateWindowsize(0) == MinWindowsize
+    check protocol.validateWindowsize(MinWindowsize) == MinWindowsize
+    check protocol.validateWindowsize(4) == 4
+    check protocol.validateWindowsize(MaxWindowsize) == MaxWindowsize
+    check protocol.validateWindowsize(999_999) == MaxWindowsize
+
+  test "validateTimeoutOpt accepts only 1..255 (RFC 2349)":
+    check MinTimeoutOpt == 1
+    check MaxTimeoutOpt == 255
+    check protocol.validateTimeoutOpt(0) == false
+    check protocol.validateTimeoutOpt(1) == true
+    check protocol.validateTimeoutOpt(255) == true
+    check protocol.validateTimeoutOpt(256) == false
+
+  test "newTransferConfig still clamps blocksize/windowsize via the relocated predicates":
+    let cfg = newTransferConfig(blocksize = 999_999, windowsize = 0)
+    check cfg.blocksize == MaxBlocksize
+    check cfg.windowsize == MinWindowsize
+
+  test "newTransferConfig clamps timeout into [MinTimeoutOpt, MaxTimeoutOpt] (D5 client outbound)":
+    check newTransferConfig(timeout = 0).timeout == MinTimeoutOpt
+    check newTransferConfig(timeout = 300).timeout == MaxTimeoutOpt
+    check newTransferConfig(timeout = 30).timeout == 30  # in-range: unchanged
+
 suite "Adaptive timeout (RFC 1123)":
   test "peer starts with no adaptive timeout":
     let peer = newPeer("10.0.0.1", 5000)
@@ -72,7 +114,25 @@ suite "Adaptive timeout (RFC 1123)":
     peer.updateRtt(100.0)  # 100ms RTT
     check peer.srtt == 100.0
     check peer.adaptiveTimeout > 0
-    check peer.effectiveTimeout(5000) == peer.adaptiveTimeout
+    # configTimeoutMs (500) is below the computed adaptive value here, so the
+    # adaptive value still wins -- see the dedicated floor test below for the
+    # case where the negotiated config value is the LARGER of the two.
+    check peer.effectiveTimeout(500) == peer.adaptiveTimeout
+
+  test "effectiveTimeout floors at the negotiated config value (D5, round-2 bug 4a)":
+    let peer = newPeer("10.0.0.1", 5000)
+    peer.updateRtt(100.0)  # adaptiveTimeout settles at 1000ms (the algorithm's floor)
+    check peer.adaptiveTimeout == 1000
+    # A peer that negotiated timeout=20s (20000ms) for a high-latency link
+    # must keep that floor even though the adaptive sample is smaller --
+    # discarding it was the bug (effectiveTimeout used to return
+    # peer.adaptiveTimeout unconditionally once it was > 0).
+    check peer.effectiveTimeout(20000) == 20000
+    # Once adaptive refinement exceeds the negotiated floor, it still governs.
+    for i in 0 ..< 10:
+      peer.updateRtt(30_000.0)
+    check peer.adaptiveTimeout > 20000
+    check peer.effectiveTimeout(20000) == peer.adaptiveTimeout
 
   test "updateRtt converges with stable RTT":
     let peer = newPeer("10.0.0.1", 5000)
@@ -182,8 +242,88 @@ suite "recvPacket":
       check "No such file" in e.msg
 
 # ============================================================
-# recvBlocks tests
+# recvOnce R5 deadline tests (issue: dally deadline bypassable -> remote DoS)
+#
+# Bug: recvOnce's inner loop re-issued `transport.recv(.., timeoutMs)` with the
+# SAME un-decremented timeoutMs on every decode-failure / TID-mismatch
+# iteration, so a flood of garbage/off-TID packets (faster than one per
+# timeout) kept resetting the receive window and held recvOnce -- and thus
+# dallyAfterFinalAck and its coroutine/transfer slot -- alive indefinitely.
+# Fix: recvOnce must bound its ENTIRE internal loop by one absolute wall-clock
+# deadline derived from the caller-supplied timeoutMs, passing the shrinking
+# remaining budget to each transport.recv call.
 # ============================================================
+
+suite "recvOnce R5 deadline (bounded by ONE wall-clock budget, not reset per iteration)":
+  test "a flood of decode-fail packets cannot extend recvOnce past its single timeout budget":
+    let mt = newMock()
+    mt.recvDelayMs = 20  # real elapsed time per iteration, so the deadline can bind
+    for i in 0 ..< 500:
+      mt.addRawResponse(@[byte 0])  # 1 byte: too short to decode -> TftpDecodeError -> continue
+    let config = newTransferConfig()
+    let peer = newPeer("10.0.0.1", 5000, locked = true)
+    let outcome = waitFor recvOnce(mt.toTransport, config, peer, 200)  # 200ms budget, 20ms/iter
+    check outcome.ok == false
+    # Before the fix: timeoutMs never shrinks, so the loop only stops once the
+    # 500 queued garbage packets are exhausted -- consuming all of them.
+    # After the fix: the deadline binds after roughly 200/20 = 10 iterations,
+    # leaving the vast majority of the flood unconsumed.
+    check mt.responseIdx < 500
+    check mt.recvTimeoutsMs.len < 500
+    # The per-call timeout budget passed to transport.recv must strictly
+    # shrink call over call -- the direct signature of the bug (constant
+    # timeoutMs == the reset-the-window defect).
+    for i in 1 ..< mt.recvTimeoutsMs.len:
+      check mt.recvTimeoutsMs[i] < mt.recvTimeoutsMs[i - 1]
+    # The very first call should see essentially the full 200ms budget (a
+    # sub-millisecond bookkeeping gap between capturing the deadline and the
+    # first remaining-budget computation is fine; a fixed, non-flaky
+    # tolerance avoids asserting exact floating-point equality on wall time).
+    check mt.recvTimeoutsMs[0] in 190..200
+
+  test "a flood of TID-mismatched packets cannot extend recvOnce past its single timeout budget":
+    let mt = newMock()
+    mt.recvDelayMs = 20
+    for i in 0 ..< 500:
+      mt.addResponse(makeAckPkt(0), host = "10.0.0.99", port = 9999)  # wrong TID
+    let config = newTransferConfig()
+    let peer = newPeer("10.0.0.1", 5000, locked = true)  # locked to a DIFFERENT peer
+    let outcome = waitFor recvOnce(mt.toTransport, config, peer, 200)
+    check outcome.ok == false
+    check mt.responseIdx < 500
+    check mt.recvTimeoutsMs.len < 500
+    for i in 1 ..< mt.recvTimeoutsMs.len:
+      check mt.recvTimeoutsMs[i] < mt.recvTimeoutsMs[i - 1]
+    # Every mismatched packet still gets an "Unknown transfer ID" ERROR reply.
+    check mt.sentPackets.len == mt.recvTimeoutsMs.len
+
+  test "a genuine TID-matched packet still returns immediately (happy path unaffected)":
+    let mt = newMock()
+    mt.addResponse(makeAckPkt(1))
+    let config = newTransferConfig()
+    let peer = newPeer("10.0.0.1", 5000, locked = true)
+    let outcome = waitFor recvOnce(mt.toTransport, config, peer, 5000)
+    check outcome.ok == true
+    check outcome.pkt.ackBlockNum == 1
+    check mt.recvTimeoutsMs.len == 1
+    check mt.recvTimeoutsMs[0] in 4990..5000
+
+  test "dallyAfterFinalAck returns within the single-timeout bound despite a decode-fail flood":
+    let mt = newMock()
+    mt.recvDelayMs = 20
+    for i in 0 ..< 500:
+      mt.addRawResponse(@[byte 0])
+    var config = newTransferConfig()
+    config.timeout = 1  # 1s config timeout -> effectiveTimeout floors at 1000ms
+    let peer = newPeer("10.0.0.1", 5000, locked = true)
+    let finalAck = encode(makeAckPkt(5))
+    waitFor dallyAfterFinalAck(mt.toTransport, peer, config, finalAck, 5'u16)
+    # No valid final-DATA retransmit ever arrived, so no re-ACK should fire --
+    # but critically the call must RETURN (bounded by config.timeout, ~1000ms /
+    # 20ms per iter =~ 50 iterations) rather than consuming the full 500-packet
+    # flood (which the pre-fix reset bug would have required).
+    check mt.sentPackets.len == 0
+    check mt.responseIdx < 500
 
 suite "recvBlocks":
   test "single block transfer":
@@ -331,6 +471,123 @@ suite "recvBlocks windowed (RFC 7440)":
     # Lock-step: ACK after each block
     check mt.sentPackets.len == 2
 
+suite "recvBlocks gap-ACK / duplicate re-ACK (RFC 7440, D6)":
+  test "duplicate branch re-ACKs the last IN-ORDER block, not the stale duplicate's own number":
+    # windowsize=3: blocks 1 and 2 are received but NOT yet ACKed (only 2 of
+    # the 3 blocks needed to cross the window threshold). A duplicate re-send
+    # of block 1 then arrives. Pre-D6 bug: the duplicate branch echoed
+    # pkt.blockNum (1) directly; the fix re-ACKs lastInOrderBlock(expectedBlock)
+    # (2) -- the receiver's true highest in-order progress.
+    let mt = newMock()
+    let fullBlock = newSeq[byte](512)
+    mt.addResponse(makeDataPkt(1, fullBlock))
+    mt.addResponse(makeDataPkt(2, fullBlock))
+    mt.addResponse(makeDataPkt(1, fullBlock))   # stale duplicate of block 1
+    mt.addResponse(makeDataPkt(3, @[byte 0xFF])) # final block, completes the transfer
+
+    let config = newTransferConfig(windowsize = 3)
+    let peer = newPeer("10.0.0.1", 5000, locked = true)
+    var blocks: seq[uint16] = @[]
+    let onData = proc(blockNum: uint16, data: seq[byte]) = blocks.add blockNum
+    let result = waitFor recvBlocks(mt.toTransport, config, peer, 1, onData)
+    check result.success == true
+    check blocks == @[1'u16, 2, 3]
+    # The duplicate's re-ACK is the FIRST packet this call ever sends (blocks
+    # 1/2 alone never crossed the windowsize=3 threshold).
+    check mt.sentPackets.len == 2
+    check decode(mt.sentPackets[0].data).ackBlockNum == 2   # NOT 1
+    check decode(mt.sentPackets[1].data).ackBlockNum == 3   # final block
+
+  test "gap-ACK underflow guard: expectedBlock == 0 does not raise a Defect (block-2-first arrival)":
+    # A direct, synthetic call with startBlock = 0 (production callers only
+    # ever pass 1 or 2 -- see engine.nim/server.nim -- but D6's underflow
+    # guard must hold regardless, defensively). DATA(1) arrives first with
+    # nothing preceding it: expectedBlock stays at 0, pkt.blockNum(1) > 0 is a
+    # gap. The re-ACK target computes as `expectedBlock - 1`, which
+    # underflows an unguarded uint16 to 65535 (an OverflowDefect escaping
+    # `except CatchableError` -- the tracked never-throw Defect hazard). The
+    # guard must compute target == 0 instead, and — since lastAckedBlock is
+    # seeded from the very same guarded helper at startBlock=0 — this reads
+    # as a window-boundary gap (target already "acked"), firing
+    # dupAckThreshold times.
+    let mt = newMock()
+    mt.addResponse(makeDataPkt(1, @[byte 1, 2, 3]))
+    # retries=0: once the gap-ACKs fire, no more mock responses exist and the
+    # call must fail cleanly on the very next timeout, rather than recvPacket's
+    # own resend-on-timeout loop padding sentPackets with further copies of
+    # `lastSent` -- keeps this test's packet count pinned to exactly the
+    # gap-ACK firing under test.
+    let config = newTransferConfig(retries = 0)
+    let peer = newPeer("10.0.0.1", 5000, locked = true)
+    let onData = proc(blockNum: uint16, data: seq[byte]) = discard
+    let result = waitFor recvBlocks(mt.toTransport, config, peer, 0'u16, onData)
+    # No more mock responses after the gap-ACKs -> the call ultimately times
+    # out and reports failure. That's expected and NOT what's under test;
+    # what matters is that no Defect escaped and the guard produced ACK(0).
+    check result.success == false
+    check mt.sentPackets.len == 2
+    check decode(mt.sentPackets[0].data).ackBlockNum == 0
+    check decode(mt.sentPackets[1].data).ackBlockNum == 0
+
+  test "recvBlocks dallies after the final ACK and re-ACKs a retransmitted final DATA (D2)":
+    # The sender's final DATA arrives twice -- as if our first final ACK was
+    # lost and the sender retransmitted. recvBlocks' epilogue (dallyAfterFinalAck)
+    # must re-ACK the retransmit rather than returning without a second look.
+    let mt = newMock()
+    mt.addResponse(makeDataPkt(1, @[byte 0xAB]))   # final block (short -> triggers dally)
+    mt.addResponse(makeDataPkt(1, @[byte 0xAB]))   # sender's retransmitted final DATA
+    let config = newTransferConfig()
+    let peer = newPeer("10.0.0.1", 5000, locked = true)
+    let onData = proc(blockNum: uint16, data: seq[byte]) = discard
+    let result = waitFor recvBlocks(mt.toTransport, config, peer, 1, onData)
+    check result.success == true
+    check mt.sentPackets.len == 2
+    check decode(mt.sentPackets[0].data).ackBlockNum == 1
+    check decode(mt.sentPackets[1].data).ackBlockNum == 1
+
+# ============================================================
+# dallyAfterFinalAck tests (RFC conformance-closure D2, policy R5)
+# ============================================================
+
+suite "dallyAfterFinalAck":
+  test "re-ACKs a single retransmitted final DATA exactly once":
+    let mt = newMock()
+    mt.addResponse(makeDataPkt(5, @[byte 0xAB]))  # retransmitted final DATA
+    let config = newTransferConfig()
+    let peer = newPeer("10.0.0.1", 5000, locked = true)
+    let finalAck = encode(makeAckPkt(5))
+    waitFor dallyAfterFinalAck(mt.toTransport, peer, config, finalAck, 5'u16)
+    check mt.sentPackets.len == 1
+    check decode(mt.sentPackets[0].data).ackBlockNum == 5
+
+  test "re-ACK count is bounded by MaxDallyReacks even if more retransmits arrive":
+    let mt = newMock()
+    for i in 0 ..< MaxDallyReacks + 1:
+      mt.addResponse(makeDataPkt(5, @[byte 0xAB]))
+    let config = newTransferConfig()
+    let peer = newPeer("10.0.0.1", 5000, locked = true)
+    let finalAck = encode(makeAckPkt(5))
+    waitFor dallyAfterFinalAck(mt.toTransport, peer, config, finalAck, 5'u16)
+    check mt.sentPackets.len == MaxDallyReacks
+
+  test "exits on the deadline with no spurious resend when nothing arrives":
+    let mt = newMock()  # no responses queued: every recv times out
+    let config = newTransferConfig()
+    let peer = newPeer("10.0.0.1", 5000, locked = true)
+    let finalAck = encode(makeAckPkt(5))
+    waitFor dallyAfterFinalAck(mt.toTransport, peer, config, finalAck, 5'u16)
+    check mt.sentPackets.len == 0
+
+  test "off-target packets are ignored without consuming a re-ACK":
+    let mt = newMock()
+    mt.addResponse(makeAckPkt(5))               # off-target: wrong opcode
+    mt.addResponse(makeDataPkt(3, @[byte 1]))   # off-target: wrong block number
+    let config = newTransferConfig()
+    let peer = newPeer("10.0.0.1", 5000, locked = true)
+    let finalAck = encode(makeAckPkt(5))
+    waitFor dallyAfterFinalAck(mt.toTransport, peer, config, finalAck, 5'u16)
+    check mt.sentPackets.len == 0
+
 # ============================================================
 # sendBlocks tests
 # ============================================================
@@ -347,6 +604,36 @@ suite "sendBlocks":
     let result = waitFor sendBlocks(mt.toTransport, config, peer, 1, readData)
     check result.success == true
     check result.bytesTransferred == 3
+
+  test "a readData that raises CatchableError fails sendBlocks' Future cleanly (L1, never-throw hazard)":
+    # netasciiReader's readData used to `doAssert` on a broken invariant --
+    # an uncatchable AssertionDefect that would crash the process. It now
+    # raises a plain CatchableError instead. sendBlocks itself has no
+    # try/except around its readData call (see fillWindow/sendOneBlock
+    # above) -- under Nim's async transform, a synchronous raise inside an
+    # {.async.} proc's body is captured into the returned Future's failure
+    # state, not thrown at the call site. This test confirms that: the
+    # Future sendBlocks returns is `failed`, carrying the original message,
+    # and is observable via an ordinary `except CatchableError` -- exactly
+    # the shape api.nim's `fut.addCallback`/`fut.failed` and server.nim's
+    # `run`'s `hf.addCallback`/`hf.failed` already handle, so this
+    # degrades to a clean transfer failure rather than a new escape.
+    let mt = newMock()
+    let config = newTransferConfig()
+    let peer = newPeer("10.0.0.1", 5000, locked = true)
+    let readData = proc(blockNum: uint16, blocksize: int): seq[byte] =
+      raise newException(ValueError, "simulated reader invariant violation")
+    let fut = sendBlocks(mt.toTransport, config, peer, 1, readData)
+    var caught = false
+    var msg = ""
+    try:
+      discard waitFor fut
+    except CatchableError as e:
+      caught = true
+      msg = e.msg
+    check caught
+    check msg.contains("simulated reader invariant violation")
+    check fut.failed
 
   test "multi-block upload":
     let mt = newMock()

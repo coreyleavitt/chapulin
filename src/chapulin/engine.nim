@@ -3,6 +3,7 @@
 
 import std/asyncdispatch
 import std/times
+import std/options
 import protocol
 import transfer
 import options
@@ -67,7 +68,7 @@ proc sendOackFailure(transport: Transport, host: string, port: int,
   await transport.send(encode(errPkt), host, port)
   return TransferResult(success: false, bytesTransferred: 0,
                         errorMsg: OptionNegotiationFailedMsg,
-                        errorCode: ord(errOptionNegotiation),
+                        errorCode: some(errOptionNegotiation),
                         totalSize: totalSize)
 
 # --- awaitHandshakeReply: the shared bounded-wait-and-resend handshake loop ---
@@ -265,7 +266,7 @@ proc getFile*(transport: Transport, config: TftpClientConfig,
   of opError:
     return TransferResult(success: false, bytesTransferred: 0,
                           errorMsg: pkt.errorMsg,
-                          errorCode: ord(pkt.errorCode),
+                          errorCode: some(pkt.errorCode),
                           totalSize: xferConfig.totalSize)
 
   else:
@@ -350,7 +351,7 @@ proc putFile*(transport: Transport, config: TftpClientConfig,
   of opError:
     return TransferResult(success: false, bytesTransferred: 0,
                           errorMsg: pkt.errorMsg,
-                          errorCode: ord(pkt.errorCode),
+                          errorCode: some(pkt.errorCode),
                           totalSize: xferConfig.totalSize)
 
   else:

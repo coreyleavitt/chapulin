@@ -181,12 +181,20 @@ proc negotiateServerOptions*(clientOpts: seq[(string, string)],
       # `suppressTsize` from its own `netasciiPolicyFor(request.mode)` and
       # passes the plain bool in, rather than this negotiator importing
       # netascii itself just to re-derive one boolean from a mode.
-      if clientTsize == 0 and fileSize >= 0:
-        result.negotiated.totalSize = fileSize
-      else:
-        result.negotiated.totalSize = clientTsize
-      if not suppressTsize:
-        result.oackOptions.add ("tsize", $result.negotiated.totalSize)
+      # L8 (code review): a negative tsize is malformed per RFC 2349 -- mirror
+      # the client-side `validateAndParseOack`'s `< 0` rejection instead of
+      # silently storing/echoing it. Treated the same as an absent tsize
+      # option (negotiated.totalSize stays at the defaultNegotiated() seed,
+      # nothing added to the OACK) rather than clamped or dropped-but-noted,
+      # matching this proc's own "can't honor within limits -> omit" pattern
+      # used above for blksize/timeout.
+      if clientTsize >= 0:
+        if clientTsize == 0 and fileSize >= 0:
+          result.negotiated.totalSize = fileSize
+        else:
+          result.negotiated.totalSize = clientTsize
+        if not suppressTsize:
+          result.oackOptions.add ("tsize", $result.negotiated.totalSize)
     of "timeout":
       let t = parseInt(val)
       # R6: RFC 2349 forbids silent substitution for timeout (unlike

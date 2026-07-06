@@ -85,8 +85,6 @@ when isMainModule:
         of "octet": transferMode = tmOctet
         of "netascii":
           transferMode = tmNetascii
-          # TODO(#13): netascii byte transform is not applied — netascii.nim is orphaned;
-          # sets packet mode only.
         else: stderr.writeLine "Invalid mode: " & p.val & " (octet or netascii)"; quit(2)
       of "verbose": logLevel = llDebug
       of "quiet", "q": logLevel = llError
@@ -221,22 +219,34 @@ when isMainModule:
       quit(2)
     if port < 0: port = 69
 
-    var config = newDefaultServerConfig(rootDir)
-    config.listenPort = port
-    config.writePolicy = writePolicy
-    config.maxConcurrent = maxClients
-    config.maxBlocksize = blocksize
-    config.timeout = timeout
-    config.retries = retries
-    config.portRangeStart = portRangeStart
-    config.portRangeEnd = portRangeEnd
-    config.pxeCompat = pxeCompat
-    config.listenAddr = bindAddr
-    config.dirListFile = dirListFile
+    var parsedChecksumMode: ChecksumMode
     try:
-      config.checksumMode = parseChecksumMode(checksumMode)
+      parsedChecksumMode = parseChecksumMode(checksumMode)
     except ValueError as e:
       stderr.writeLine e.msg; quit(2)
+
+    # RFC conformance-closure D7 (slice 8a): build via the validating
+    # constructor instead of newDefaultServerConfig + direct field pokes --
+    # single-sources the bounds check that used to be re-validated ad-hoc at
+    # each server entry point.
+    let configOutcome = newServerConfig(
+      rootDir = rootDir,
+      listenAddr = bindAddr,
+      listenPort = port,
+      portRangeStart = portRangeStart,
+      portRangeEnd = portRangeEnd,
+      writePolicy = writePolicy,
+      maxConcurrent = maxClients,
+      timeout = timeout,
+      retries = retries,
+      maxBlocksize = blocksize,
+      pxeCompat = pxeCompat,
+      dirListFile = dirListFile,
+      checksumMode = parsedChecksumMode
+    )
+    if not configOutcome.ok:
+      stderr.writeLine "Error: " & configOutcome.rejectReason; quit(2)
+    let config = configOutcome.config
 
     let s = newSession(minLogLevel = logLevel)
 
@@ -266,7 +276,7 @@ when isMainModule:
         of evTransferError:
           stderr.writeLine formatLogMessage(llError, "transfer error: " & sanitizeForDisplay(ev.errorMsg))
         of evTransferStarted, evTransferProgress,
-           evTransferLog, evServerStopped:
+           evServerStopped:
           discard
 
   of "gui":

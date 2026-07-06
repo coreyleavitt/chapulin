@@ -38,7 +38,3 @@ suite "checksum.nim — Digester (RFC D1, slice 1.1)":
     d.update(empty) # empty terminating DATA block — must not raise
 
     check d.finalize() == $toMD5("hello world")
-
-  test "newDigester(csSha256) raises ValueError":
-    expect ValueError:
-      discard newDigester(csSha256)

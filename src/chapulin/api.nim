@@ -9,24 +9,23 @@ export Transport, CancelCheck, TransportTimeoutError,
        TransferResult, DefaultBlocksize, DefaultTimeout,
        DefaultRetries, DefaultWindowsize, MinWindowsize, MaxWindowsize,
        MinBlocksize, MaxBlocksize, validateBlocksize,
-       TransferMode
+       TransferMode, TftpErrorCode, TransferParams
 import std/os
-import std/[deques, tables, options, times]
+import std/[tables, options, times]
 export options
 import logging
 import transport as transportMod
 import server
 import server_config
 import format
+import eventqueue
 export LogLevel, formatLogMessage, UdpListener
 export server_config
 export fraction, formatBytes, formatSpeed, sanitizeForDisplay
+export EventKind, TransferDirection, TransferId, ServerId, NoTransfer, NoServer,
+       TransferSnapshot, Event, `==`, inEffect
 
 type
-  TransferDirection* = enum
-    tdGet
-    tdPut
-
   TransferOptions* = object
     blocksize*: int
     timeout*: int
@@ -55,62 +54,35 @@ proc newTransferRequest*(host: string, port: int, filename: string,
 # ---------------------------------------------------------------------------
 # Session API — slice 1: spine + client transfers
 # ---------------------------------------------------------------------------
-
-type
-  TransferId* = distinct uint32
-  ServerId*   = distinct uint32
-
-const
-  NoTransfer* = TransferId(0)
-  NoServer*   = ServerId(0)
-
-proc `==`*(a, b: TransferId): bool {.borrow.}
-proc `==`*(a, b: ServerId):   bool {.borrow.}
+#
+# EventKind, TransferDirection, TransferId, ServerId, TransferSnapshot, Event
+# and the EventQueue they're built on live in eventqueue.nim and are
+# re-exported above -- api.nim consumes them but is no longer their home.
 
 type
   TransportFactory* = proc(host: string, port: int): Transport {.closure.}
   ListenerFactory*  = proc(bindAddr: string, port: int): UdpListener {.closure.}
 
-  EventKind* = enum
-    evTransferStarted, evTransferProgress, evTransferComplete, evTransferError,
-    evTransferLog, evServerStarted, evServerStartFailed, evServerStopped, evServerLog
+  TransferOrigin = enum
+    ## Flat tag distinguishing client- from server-side transfers within the
+    ## single consolidated `transfers` table below. Not a case-object variant
+    ## discriminator -- no per-branch payload hangs off this, so there is no
+    ## FieldDefect surface. It exists solely so `close()`/`drain()`/
+    ## `sessionActiveCount` can single out client transfers (server transfers
+    ## are deliberately left to drain to completion on `stop()`/`close()`,
+    ## never force-cancelled).
+    toClient, toServer
 
-  TransferSnapshot* = object
-    bytes*:      int64
-    total*:      Option[int64]   ## none until tsize negotiated
-    blocksize*:  int             ## client: requested at evTransferStarted, negotiated (OACK) from first evTransferProgress onward; server: already negotiated at evTransferStarted (OACK precedes onStart)
-    windowsize*: int             ## client: requested at evTransferStarted, negotiated (OACK) from first evTransferProgress onward; server: already negotiated at evTransferStarted (OACK precedes onStart)
-    direction*:  TransferDirection
-    mode*:       TransferMode
-    startedAt*:  float           ## epochTime() at transfer start
-
-  Event* = object
-    xfrId*: TransferId
-    srvId*: ServerId
-    snap*:  TransferSnapshot   ## common field; populated for all evTransfer* kinds; zero for server events
-    case kind*: EventKind
-    of evTransferStarted, evTransferProgress, evTransferComplete:
-      discard
-    of evTransferError:
-      errorCode*: int
-      errorMsg*:  string
-    of evTransferLog:
-      xLevel*:   LogLevel
-      xMessage*: string
-    of evServerStarted:
-      boundAddr*: string
-      boundPort*: int
-    of evServerStartFailed:
-      startErr*: string
-    of evServerLog:
-      sLevel*:   LogLevel
-      sMessage*: string
-    of evServerStopped:
-      discard
-
-  TransferEntry = object
-    transport:        Transport
-    cancelRequested:  ref bool
+  TransferRecord = object
+    ## The sole per-transfer record, keyed by TransferId, for BOTH client
+    ## and server-side transfers. Replaces the old `active`/`serverXferCancel`
+    ## split -- `cancel(id)` is now one lookup + one flag set regardless of
+    ## a transfer's origin. Deliberately flat (no case-object): an audit
+    ## confirmed the old TransferEntry.transport field was dead (written
+    ## once, never read -- the transport is closed via a separately-captured
+    ## closure variable), so nothing justifies a variant here.
+    cancelFlag: ref bool
+    origin:     TransferOrigin
 
   XferKey = int  ## monotonic reqId allocated once per accepted request
 
@@ -121,70 +93,54 @@ type
     stopRequested:  bool
     stoppedEmitted: bool
     xfers:          Table[XferKey, TransferId]
+    ## Transient bridge only: `cancelFactory` (called with reqId, before a
+    ## TransferId exists) stashes the flag here; `onTransferStart` (which
+    ## mints the TransferId) immediately consumes+deletes the entry and moves
+    ## the flag into `transfers[tid]`. Never a second permanent home for
+    ## cancellation state -- entries live at most from cancelFactory's call to
+    ## the next onTransferStart/onTransferError callback.
     cancelFlags:    Table[XferKey, ref bool]
 
   TftpSession* = ref object
-    events:           Deque[Event]
+    queue:            EventQueue
     nextId:           uint32
-    active:           Table[uint32, TransferEntry]
+    transfers:        Table[uint32, TransferRecord]
     minLogLevel:      LogLevel
     transportFactory: TransportFactory
     listenerFactory:  ListenerFactory
     servers:          Table[uint32, ServerEntry]
     nextServerId:     uint32
-    serverXferCancel: Table[uint32, ref bool]
-    droppedLogCount:  int  ## FIX 7: count of log events dropped due to queue cap
 
-const MaxQueuedEvents* = 8192 ## hard cap on s.events; oldest log events evicted when full
+const MaxQueuedEvents* = 8192 ## TRUE hard cap on s.queue: log-kind events are evicted first
+                               ## when full, then the oldest event of any kind (drop-oldest) --
+                               ## len never exceeds this, even under sustained saturation. See
+                               ## eventqueue.nim's module doc-comment and docs/api-reference.md.
 const WaitCapIterations = 5_000_000 ## safety valve; hasPendingOperations early-exit fires first
 
 proc enqueue(s: TftpSession, ev: Event) =
-  ## Append ev to the session event queue.
-  ## FIX 7: bounded — drops log events when full; never drops terminals or evTransferStarted.
-  let isProtected = ev.kind in {evTransferComplete, evTransferError,
-                                 evServerStopped, evServerStartFailed, evTransferStarted}
-  # Coalesce progress: replace the existing entry for the same id so the queue
-  # never accumulates more than one evTransferProgress per transfer id.
-  if ev.kind == evTransferProgress:
-    for i in 0 ..< s.events.len:
-      if s.events[i].kind == evTransferProgress and s.events[i].xfrId == ev.xfrId:
-        s.events[i] = ev   # coalesce: latest wins, position kept
-        return
-    # No existing entry — fall through to bounded add.
+  ## Push ev onto the session event queue. Coalescing (progress), bounded
+  ## eviction, and dropped-count bookkeeping all live in EventQueue.push
+  ## (eventqueue.nim) -- this is a thin delegate kept so the many
+  ## `s.enqueue(...)` call sites below don't need to change.
+  s.queue.push(ev)
 
-  if s.events.len >= MaxQueuedEvents:
-    if not isProtected:
-      # Log / progress event: drop and count.
-      inc s.droppedLogCount
-      return
-    else:
-      # Protected event: evict the oldest log event to make room.
-      var newDq = initDeque[Event]()
-      var evicted = false
-      for item in s.events:
-        if not evicted and item.kind in {evServerLog, evTransferLog}:
-          evicted = true
-          inc s.droppedLogCount   # count the evicted log as dropped
-        else:
-          newDq.addLast(item)
-      if evicted:
-        s.events = newDq
-      # If no log found, fall through and temporarily exceed the cap for this critical event.
-
-  # If previous calls dropped events and we now have room, emit one warning.
-  if s.droppedLogCount > 0:
-    let n = s.droppedLogCount
-    s.droppedLogCount = 0
-    # Direct addLast — do NOT call enqueue() recursively to avoid re-triggering.
-    s.events.addLast(Event(xfrId: NoTransfer, srvId: NoServer, kind: evServerLog,
-                           sLevel: llWarn,
-                           sMessage: "dropped " & $n & " log events (queue cap)"))
-  s.events.addLast(ev)
+proc activeClientCount(s: TftpSession): int =
+  ## Number of client-originated (toClient) transfers still in `s.transfers`.
+  ## Server-side transfers share the same table but are excluded here: they
+  ## are deliberately left to drain, not force-cancelled, by close()/drain().
+  for _, rec in s.transfers.pairs:
+    if rec.origin == toClient: inc result
 
 proc mkSnap(bytes: int64, total: Option[int64],
             direction: TransferDirection, mode: TransferMode,
-            bs, ws: int, startedAt: float): TransferSnapshot =
-  TransferSnapshot(bytes: bytes, total: total, blocksize: bs, windowsize: ws,
+            requested: TransferParams, effective: Option[TransferParams],
+            startedAt: float): TransferSnapshot =
+  ## `requested` is ALWAYS the clamped ask; `effective` is `none` until
+  ## the handshake resolves and `some(params)` once in-effect -- see
+  ## startTransfer's `zeroSnap`/evTransferStarted call sites and
+  ## server.nim's TransferSeam-sourced call sites below.
+  TransferSnapshot(bytes: bytes, total: total, requested: requested,
+                   effective: effective,
                    direction: direction, mode: mode, startedAt: startedAt)
 
 proc newSession*(minLogLevel: LogLevel = llInfo,
@@ -196,16 +152,121 @@ proc newSession*(minLogLevel: LogLevel = llInfo,
       proc(host: string, port: int): Transport =
         transportMod.newUdpTransport(0, transportMod.isIPv6(host))
   TftpSession(
-    events:           initDeque[Event](),
+    queue:            initEventQueue(MaxQueuedEvents),
     nextId:           0,
-    active:           initTable[uint32, TransferEntry](),
+    transfers:        initTable[uint32, TransferRecord](),
     minLogLevel:      minLogLevel,
     transportFactory: factory,
     listenerFactory:  listenerFactory,
     servers:          initTable[uint32, ServerEntry](),
-    nextServerId:     0,
-    serverXferCancel: initTable[uint32, ref bool]()
+    nextServerId:     0
   )
+
+proc setupGetTransfer(req: TransferRequest, md: TransferMode,
+                      requestedParams: TransferParams,
+                      getEffective: proc(): Option[TransferParams] {.closure.},
+                      xport: Transport, config: TftpClientConfig,
+                      progressCb: ProgressCallback,
+                      onNegCb: proc(blocksize: int, windowsize: int) {.closure.},
+                      flag: ref bool
+                      ): tuple[fut: Future[TransferResult], cleanup: proc() {.closure.}] =
+  ## tdGet's setup, extracted verbatim from startTransfer's former inline
+  ## branch -- builds the lazily-opened receive file + sink, the
+  ## write-error/cancel wiring, and launches getFile. `getEffective` reads the
+  ## live `effectiveParams` that lives in startTransfer's scope and that
+  ## onNegCb mutates; it's passed as a closure (not a `var` param) because a
+  ## `var` param captured by a NEW closure built in this proc would reference
+  ## a stack slot that outlives this call -- Nim's compiler rejects that
+  ## ("cannot be captured... violate memory safety") and suggests exactly
+  ## this: a capturable reference. A closure over the caller's own local is
+  ## the safe equivalent of a `ref` here.
+  var gfile:       File
+  var writeError:  string = ""
+  # The RECEIVE-side counterpart of tdPut's readData -- api.nim owns
+  # this file handle directly (not via engine.nim), so it builds its own
+  # `makeRecvSink` once the file is open (it can't be built up front like
+  # server.handleWrq's, since the file open itself is lazy here -- deferred
+  # to the first onData call rather than done eagerly).
+  #
+  # Structural nil-invariant fix: there is deliberately NO separate
+  # "is the file open" bool. `recvSink != nil` IS the single source of
+  # truth for "the file is open and its sink is ready" -- the open and the
+  # sink construction happen in the same branch, guarded by the same check
+  # that gates every call to `recvSink` below. A prior version tracked
+  # file-openness with its own `gfileOpened` flag, separate from
+  # `recvSink`'s nil-ness; a future edit could then in principle flip one
+  # without the other and reach `recvSink(...)` while it was still nil
+  # (NilAccessDefect, the tracked never-throw hazard). Collapsing both onto
+  # one variable makes that ordering a compile-time-adjacent impossibility
+  # rather than a doAssert/runtime check.
+  var recvSink: proc(data: seq[byte], isFinal: bool): bool
+
+  let onData: proc(blockNum: uint16, data: seq[byte]) =
+    proc(blockNum: uint16, data: seq[byte]) =
+      if writeError.len > 0: return
+      if recvSink == nil:
+        try:
+          gfile = open(req.localPath, fmWrite)
+          recvSink = makeRecvSink(gfile, md)
+        except IOError as e:
+          writeError = "Cannot open file for writing: " & e.msg
+          return
+      # Same final-block signal recvBlocks/getFile's single-block branch
+      # use (`data.len < negotiated blocksize`); `effectiveParams`
+      # (Option[TransferParams]) tracks the negotiated value from the
+      # moment onNegCb fires -- `inEffect` (the same never-raising
+      # accessor as `TransferSnapshot.inEffect`) falls back to the
+      # pre-negotiation requested blocksize before any DATA arrives, the
+      # same starting point the old bare `effBs` variable had. A
+      # short/failed terminal write is no longer silently discarded --
+      # makeRecvSink folds it into its return value exactly like a
+      # per-block write mismatch, so combinedCancel below (and the
+      # caller's failure path) observes it.
+      if not recvSink(data, data.len < getEffective().inEffect(requestedParams).blocksize):
+        writeError = "Write failed"
+
+  let combinedCancel: CancelCheck = proc(): bool = writeError.len > 0 or flag[]
+
+  let cleanup = proc() {.closure.} =
+    if recvSink != nil: gfile.close()
+
+  let fut = getFile(xport, config, req.host, req.port, req.filename,
+                    onData, progressCb, combinedCancel, onNegCb)
+  result = (fut, cleanup)
+
+proc setupPutTransfer(req: TransferRequest, md: TransferMode,
+                      xport: Transport, config: var TftpClientConfig,
+                      progressCb: ProgressCallback,
+                      onNegCb: proc(blocksize: int, windowsize: int) {.closure.},
+                      flag: ref bool
+                      ): tuple[fut: Future[TransferResult], cleanup: proc() {.closure.},
+                               startTotal: Option[int64]] =
+  ## tdPut's setup, extracted verbatim from startTransfer's former inline
+  ## branch -- opens the send file, sizes it into config.tsize, builds the
+  ## netascii-aware reader, and launches putFile. File open is pre-launch;
+  ## failure propagates to the caller's outer try/except -> evTransferError,
+  ## not a raise out of the public API. `config` is a `var` param (this proc
+  ## is NOT `{.async.}`, so that's allowed) purely so `config.tsize` can be
+  ## set here instead of the caller doing it after the call.
+  var pfile = open(req.localPath, fmRead)
+  let fileSize = getFileSize(req.localPath)
+  config.tsize = fileSize
+  let netasciiPolicy = netasciiPolicyFor(md)
+  # Client PUT: `.bytes` counts post-translation wire bytes while
+  # `fileSize` is pre-translation local bytes -- under netascii the two
+  # can diverge (progress could otherwise exceed 100%), so the reported
+  # total is unknown rather than the (wrong) pre-translation size.
+  let startTotal = if netasciiPolicy.reportTotalUnknown: none(int64)
+                  else: some(fileSize)
+
+  var netasciiEnc: NetasciiEncoder
+  let readData = makeSendReader(pfile, md, netasciiEnc)
+
+  let cleanup = proc() {.closure.} = pfile.close()
+
+  let fut = putFile(xport, config, req.host, req.port, req.filename,
+                    readData, progressCb, proc(): bool = flag[], onNegCb)
+  result = (fut, cleanup, startTotal)
 
 proc startTransfer*(s: TftpSession, req: TransferRequest): TransferId =
   ## Returns immediately with a valid id.  Never raises (Invariant 2).
@@ -213,39 +274,54 @@ proc startTransfer*(s: TftpSession, req: TransferRequest): TransferId =
   if s.nextId == 0: inc s.nextId   # wrap: skip 0
   let id  = TransferId(s.nextId)
   let t0  = epochTime()
-  let bs  = req.options.blocksize
-  let ws  = req.options.windowsize
+  # Clamp ONCE, up front, before bs/ws are first captured -- this is the
+  # structural fix for a verified pre-clamp echo bug (evTransferStarted.snap
+  # used to echo the RAW req.options values, while the wire request a few
+  # lines below always sent the clamped ones). Reuses the exact same clamp
+  # calls the TftpClientConfig construction below already applied; that
+  # construction now just reads the already-clamped bs/ws rather than
+  # re-deriving them.
+  let bs  = validateBlocksize(req.options.blocksize)
+  let ws  = max(MinWindowsize, min(MaxWindowsize, req.options.windowsize))
   let dir = req.direction
   let md  = req.options.mode
 
-  ## effBs/effWs start at the requested values (best-effort pre-OACK).
-  ## onNegCb updates them once the handshake settles so all subsequent
-  ## snapshots (evTransferProgress, evTransferComplete) report the negotiated values.
-  var effBs = bs
-  var effWs = ws
+  ## `requested` is the clamped ask, constant for the whole transfer.
+  let requestedParams = TransferParams(blocksize: bs, windowsize: ws)
+
+  ## `effectiveParams` starts `none` (handshake not yet resolved) and
+  ## onNegCb sets it to `some(negotiated)` once the handshake settles, so all
+  ## subsequent snapshots (evTransferProgress, evTransferComplete) report the
+  ## negotiated values. In practice this always happens strictly before the
+  ## first evTransferProgress (engine.nim fires onNegotiated before the first
+  ## onData/progress callback on every path).
+  var effectiveParams: Option[TransferParams] = none(TransferParams)
 
   let onNegCb = proc(blocksize: int, windowsize: int) {.closure.} =
-    effBs = blocksize
-    effWs = windowsize
+    effectiveParams = some(TransferParams(blocksize: blocksize, windowsize: windowsize))
+
+  ## Read-only view of `effectiveParams` for setupGetTransfer -- see that
+  ## proc's doc comment for why this is a closure rather than a `var` param.
+  let getEffective = proc(): Option[TransferParams] {.closure.} = effectiveParams
 
   template zeroSnap(): TransferSnapshot =
-    mkSnap(0, none(int64), dir, md, bs, ws, t0)
+    mkSnap(0, none(int64), dir, md, requestedParams, none(TransferParams), t0)
 
   try:
     let xport = s.transportFactory(req.host, req.port)
 
     var config = TftpClientConfig(
-      # R2-3 fix (b): clamp into [MinTimeoutOpt, MaxTimeoutOpt] here, same as
-      # blocksize/windowsize just below -- D7 belt-and-suspenders so the
-      # public API can never hand engine.getFile/putFile an out-of-range (or
-      # zero) timeout in the first place. engine.nim's toTransferConfig
-      # clamps too (fix a), but that second layer should never be the ONLY
-      # thing standing between a bad public-API input and a zero timeout
-      # reaching validateAndParseOack's configuredTimeout fallback.
+      # Clamp into [MinTimeoutOpt, MaxTimeoutOpt] here, same spirit as bs/ws
+      # above (clamped once, up front) -- belt-and-suspenders so the public
+      # API can never hand engine.getFile/putFile an out-of-range (or zero)
+      # timeout in the first place. engine.nim's toTransferConfig clamps
+      # too, but that second layer should never be the ONLY thing standing
+      # between a bad public-API input and a zero timeout reaching
+      # validateAndParseOack's configuredTimeout fallback.
       timeout:      max(MinTimeoutOpt, min(MaxTimeoutOpt, req.options.timeout)),
       retries:      req.options.retries,
-      blocksize:    validateBlocksize(bs),
-      windowsize:   max(MinWindowsize, min(MaxWindowsize, ws)),
+      blocksize:    bs,
+      windowsize:   ws,
       mode:         md,
       requestTsize: true,
       tsize:        -1
@@ -260,88 +336,38 @@ proc startTransfer*(s: TftpSession, req: TransferRequest): TransferId =
     var startTotal: Option[int64] = none(int64)  ## known for PUT, none for GET
 
     let progressCb: ProgressCallback = proc(bytes, total: int64) =
+      # `effectiveParams` is always `some` by the time any progress callback
+      # fires -- onNegCb (which sets it) runs strictly before the first
+      # onData/progress callback on every engine.nim path (RRQ OACK, RRQ
+      # bare-DATA, and the WRQ mirror).
       s.enqueue(Event(xfrId: id, srvId: NoServer, kind: evTransferProgress,
                       snap: mkSnap(bytes,
                                    (if total >= 0: some(total) else: none(int64)),
-                                   dir, md, effBs, effWs, t0)))
+                                   dir, md, requestedParams,
+                                   effectiveParams, t0)))
 
     case req.direction
     of tdGet:
-      var gfile:       File
-      var writeError:  string = ""
-      # D1c: the RECEIVE-side counterpart of tdPut's readData above -- api.nim
-      # owns this file handle directly (not via engine.nim), so it builds its
-      # own `makeRecvSink` once the file is open (it can't be built up front
-      # like server.handleWrq's, since the file open itself is lazy here --
-      # deferred to the first onData call rather than done eagerly).
-      #
-      # L2 (structural nil-invariant fix): there is deliberately NO separate
-      # "is the file open" bool. `recvSink != nil` IS the single source of
-      # truth for "the file is open and its sink is ready" -- the open and
-      # the sink construction happen in the same branch, guarded by the same
-      # check that gates every call to `recvSink` below. A prior version
-      # tracked file-openness with its own `gfileOpened` flag, separate from
-      # `recvSink`'s nil-ness; a future edit could then in principle flip one
-      # without the other and reach `recvSink(...)` while it was still nil
-      # (NilAccessDefect, the tracked never-throw hazard). Collapsing both
-      # onto one variable makes that ordering a compile-time-adjacent
-      # impossibility rather than a doAssert/runtime check.
-      var recvSink: proc(data: seq[byte], isFinal: bool): bool
-
-      let onData: proc(blockNum: uint16, data: seq[byte]) =
-        proc(blockNum: uint16, data: seq[byte]) =
-          if writeError.len > 0: return
-          if recvSink == nil:
-            try:
-              gfile = open(req.localPath, fmWrite)
-              recvSink = makeRecvSink(gfile, md)
-            except IOError as e:
-              writeError = "Cannot open file for writing: " & e.msg
-              return
-          # Same final-block signal recvBlocks/getFile's single-block branch
-          # use (`data.len < negotiated blocksize`); `effBs` tracks the
-          # negotiated value from the moment onNegCb fires, before any DATA
-          # arrives. Fix A: a short/failed terminal write is no longer
-          # silently discarded -- makeRecvSink folds it into its return value
-          # exactly like a per-block write mismatch, so combinedCancel below
-          # (and the caller's failure path) observes it.
-          if not recvSink(data, data.len < effBs):
-            writeError = "Write failed"
-
-      let combinedCancel: CancelCheck = proc(): bool = writeError.len > 0 or flag[]
-
-      fileCleanup = proc() {.closure.} =
-        if recvSink != nil: gfile.close()
-
-      fut = getFile(xport, config, req.host, req.port, req.filename,
-                    onData, progressCb, combinedCancel, onNegCb)
+      let setup   = setupGetTransfer(req, md, requestedParams, getEffective,
+                                     xport, config, progressCb, onNegCb, flag)
+      fut         = setup.fut
+      fileCleanup = setup.cleanup
 
     of tdPut:
       # File open is pre-launch; failure → outer except → evTransferError, not raise.
-      var pfile = open(req.localPath, fmRead)
-      let fileSize = getFileSize(req.localPath)
-      config.tsize = fileSize
-      let netasciiPolicy = netasciiPolicyFor(md)
-      # D1d(client PUT): `.bytes` counts post-translation wire bytes while
-      # `fileSize` is pre-translation local bytes -- under netascii the two
-      # can diverge (progress could otherwise exceed 100%), so the reported
-      # total is unknown rather than the (wrong) pre-translation size.
-      startTotal = if netasciiPolicy.reportTotalUnknown: none(int64)
-                  else: some(fileSize)
-
-      var netasciiEnc: NetasciiEncoder
-      let readData = makeSendReader(pfile, md, netasciiEnc)
-
-      fileCleanup = proc() {.closure.} = pfile.close()
-
-      fut = putFile(xport, config, req.host, req.port, req.filename,
-                    readData, progressCb, proc(): bool = flag[], onNegCb)
+      let setup   = setupPutTransfer(req, md, xport, config, progressCb, onNegCb, flag)
+      fut         = setup.fut
+      fileCleanup = setup.cleanup
+      startTotal  = setup.startTotal
 
     # All pre-launch setup succeeded — emit Started then register and drive.
     # startTotal is some(fileSize) for PUT (known upfront), none for GET (tsize via OACK).
+    # effective is none here -- the handshake has not resolved yet
+    # (onNegCb has not fired).
     s.enqueue(Event(xfrId: id, srvId: NoServer, kind: evTransferStarted,
-                    snap: mkSnap(0, startTotal, dir, md, bs, ws, t0)))
-    s.active[id.uint32] = TransferEntry(transport: xport, cancelRequested: flag)
+                    snap: mkSnap(0, startTotal, dir, md, requestedParams,
+                                 none(TransferParams), t0)))
+    s.transfers[id.uint32] = TransferRecord(cancelFlag: flag, origin: toClient)
 
     # Capture locals for the callback closure.
     let cId    = id
@@ -355,27 +381,36 @@ proc startTransfer*(s: TftpSession, req: TransferRequest): TransferId =
     fut.addCallback(proc() {.closure, gcsafe.} =
       {.cast(gcsafe).}:
         if cClean != nil: cClean()
+        # `cEffective` reflects whether onNegCb ever fired for this
+        # transfer -- `some` for the overwhelming common case (failure/
+        # completion after a resolved handshake), `none` only if the
+        # transfer failed before negotiation ever resolved (e.g. handshake
+        # timeout).
+        let cEffective = effectiveParams
         if fut.failed:
           cS.enqueue(Event(xfrId: cId, srvId: NoServer, kind: evTransferError,
-                           snap: mkSnap(0, none(int64), cDir, cMd, effBs, effWs, cT0),
-                           errorCode: 0, errorMsg: fut.readError().msg))
+                           snap: mkSnap(0, none(int64), cDir, cMd, requestedParams,
+                                        cEffective, cT0),
+                           errorCode: none(TftpErrorCode), errorMsg: fut.readError().msg))
         else:
           let r      = fut.read()
           let totOpt = if r.totalSize >= 0: some(r.totalSize) else: none(int64)
           if r.success:
             cS.enqueue(Event(xfrId: cId, srvId: NoServer, kind: evTransferComplete,
-                             snap: mkSnap(r.bytesTransferred, totOpt, cDir, cMd, effBs, effWs, cT0)))
+                             snap: mkSnap(r.bytesTransferred, totOpt, cDir, cMd, requestedParams,
+                                          cEffective, cT0)))
           else:
             cS.enqueue(Event(xfrId: cId, srvId: NoServer, kind: evTransferError,
-                             snap: mkSnap(r.bytesTransferred, totOpt, cDir, cMd, effBs, effWs, cT0),
+                             snap: mkSnap(r.bytesTransferred, totOpt, cDir, cMd, requestedParams,
+                                          cEffective, cT0),
                              errorCode: r.errorCode, errorMsg: r.errorMsg))
         if cXport.close != nil: cXport.close()
-        cS.active.del(cId.uint32)
+        cS.transfers.del(cId.uint32)
     )
 
   except CatchableError as e:
     s.enqueue(Event(xfrId: id, srvId: NoServer, kind: evTransferError,
-                    snap: zeroSnap(), errorCode: 0, errorMsg: e.msg))
+                    snap: zeroSnap(), errorCode: none(TftpErrorCode), errorMsg: e.msg))
 
   return id
 
@@ -384,10 +419,9 @@ proc cancel*(s: TftpSession, id: TransferId) =
   ## (already resolved, never started, or from another session) this is a
   ## no-op. Never raises. Never enqueues a terminal event directly — the
   ## transfer future's addCallback does that when it observes the flag.
-  if id.uint32 in s.active:
-    s.active[id.uint32].cancelRequested[] = true
-  elif id.uint32 in s.serverXferCancel:
-    s.serverXferCancel[id.uint32][] = true
+  if id.uint32 in s.transfers:
+    let rec = s.transfers[id.uint32]
+    if rec.cancelFlag != nil: rec.cancelFlag[] = true
 
 proc startServer*(s: TftpSession, config: ServerConfig): ServerId =
   ## Start a TFTP server and return its id immediately.  Never raises (Invariant 2).
@@ -398,20 +432,9 @@ proc startServer*(s: TftpSession, config: ServerConfig): ServerId =
   let srvId = ServerId(s.nextServerId)
 
   try:
-    # Routes through the single shared authority (server_config.checksum-
-    # ModeImplemented) so this rejection can never drift from parseChecksum-
-    # Mode's (CLI boundary) or handleRrq's (RRQ hot-path boundary) copy of
-    # the same rule. Reject here, at server construction, so no RRQ handler
-    # ever sees a csSha256 config from this path — belt-and-suspenders with
-    # both newDigester's own raise and handleRrq's own guard.
-    if not checksumModeImplemented(config.checksumMode):
-      raise newException(ValueError,
-        "checksum mode '" & $config.checksumMode & "' is not yet implemented (use md5 or none)")
-
     # RFC conformance-closure D7: reject an out-of-RFC-bound config (blksize,
     # windowsize, timeout) at server construction, before any listener binds
-    # or RRQ is served -- same rationale/channel as the checksumMode guard
-    # above. Routes through the single shared authority (server_config.
+    # or RRQ is served. Routes through the single shared authority (server_config.
     # serverConfigBoundsValid) so this can never drift from handleRrq's/
     # handleWrq's own copy of the same rule.
     if not serverConfigBoundsValid(config):
@@ -444,14 +467,22 @@ proc startServer*(s: TftpSession, config: ServerConfig): ServerId =
           let k32  = cSrvId.uint32
           if k32 in cS.servers:
             cS.servers[k32].xfers[key] = tid
+            # Consume the transient cancelFactory->onTransferStart bridge:
+            # move the flag into the single consolidated transfers table.
             let cancelFlag = cS.servers[k32].cancelFlags.getOrDefault(key, nil)
-            if cancelFlag != nil:
-              cS.serverXferCancel[tid.uint32] = cancelFlag
+            cS.servers[k32].cancelFlags.del(key)
+            cS.transfers[tid.uint32] = TransferRecord(cancelFlag: cancelFlag, origin: toServer)
           let dir    = if info.direction == "RRQ": tdGet else: tdPut
           let totOpt = if info.totalBytes >= 0: some(info.totalBytes) else: none(int64)
+          # Server-side effective is always some(...) here (OACK, if any,
+          # precedes onStart) -- some(defaults) even for a bare RRQ/WRQ with
+          # zero options, meaning "in-effect defaults," not "an OACK occurred."
           cS.enqueue(Event(xfrId: tid, srvId: cSrvId, kind: evTransferStarted,
                            snap: mkSnap(0, totOpt, dir, info.mode,
-                                        info.blocksize, info.windowsize, info.startedAt)))
+                                        info.requestedParams,
+                                        some(TransferParams(blocksize: info.blocksize,
+                                                        windowsize: info.windowsize)),
+                                        info.startedAt)))
       ,
       onTransferProgress: proc(info: TransferInfo) {.closure.} =
         {.cast(gcsafe).}:
@@ -464,7 +495,10 @@ proc startServer*(s: TftpSession, config: ServerConfig): ServerId =
           let totOpt = if info.totalBytes >= 0: some(info.totalBytes) else: none(int64)
           cS.enqueue(Event(xfrId: tid, srvId: cSrvId, kind: evTransferProgress,
                            snap: mkSnap(info.bytesTransferred, totOpt, dir, info.mode,
-                                        info.blocksize, info.windowsize, info.startedAt)))
+                                        info.requestedParams,
+                                        some(TransferParams(blocksize: info.blocksize,
+                                                        windowsize: info.windowsize)),
+                                        info.startedAt)))
       ,
       onTransferComplete: proc(info: TransferInfo) {.closure.} =
         {.cast(gcsafe).}:
@@ -474,29 +508,34 @@ proc startServer*(s: TftpSession, config: ServerConfig): ServerId =
           let tid  = cS.servers[k32].xfers.getOrDefault(key, NoTransfer)
           if tid == NoTransfer: return
           cS.servers[k32].xfers.del(key)
-          cS.servers[k32].cancelFlags.del(key)
-          cS.serverXferCancel.del(tid.uint32)
+          cS.transfers.del(tid.uint32)
           let dir    = if info.direction == "RRQ": tdGet else: tdPut
           let totOpt = if info.totalBytes >= 0: some(info.totalBytes) else: none(int64)
           cS.enqueue(Event(xfrId: tid, srvId: cSrvId, kind: evTransferComplete,
                            snap: mkSnap(info.bytesTransferred, totOpt, dir, info.mode,
-                                        info.blocksize, info.windowsize, info.startedAt)))
+                                        info.requestedParams,
+                                        some(TransferParams(blocksize: info.blocksize,
+                                                        windowsize: info.windowsize)),
+                                        info.startedAt)))
       ,
       onTransferError: proc(info: TransferInfo, msg: string) {.closure.} =
         {.cast(gcsafe).}:
           let key: XferKey = info.reqId
           let k32  = cSrvId.uint32
           if k32 notin cS.servers: return
-          cS.servers[k32].cancelFlags.del(key)  # FIX 6b: always clean up before early return
+          cS.servers[k32].cancelFlags.del(key)  # always clean up before early return, even on the failure path
           let tid  = cS.servers[k32].xfers.getOrDefault(key, NoTransfer)
           if tid == NoTransfer: return  # failure before onStart — drop (Invariant 4)
           cS.servers[k32].xfers.del(key)
-          cS.serverXferCancel.del(tid.uint32)
+          cS.transfers.del(tid.uint32)
           let dir    = if info.direction == "RRQ": tdGet else: tdPut
           let totOpt = if info.totalBytes >= 0: some(info.totalBytes) else: none(int64)
           cS.enqueue(Event(xfrId: tid, srvId: cSrvId, kind: evTransferError,
                            snap: mkSnap(info.bytesTransferred, totOpt, dir, info.mode,
-                                        info.blocksize, info.windowsize, info.startedAt),
+                                        info.requestedParams,
+                                        some(TransferParams(blocksize: info.blocksize,
+                                                        windowsize: info.windowsize)),
+                                        info.startedAt),
                            errorCode: info.errorCode, errorMsg: msg))
     )
 
@@ -569,7 +608,8 @@ iterator poll*(s: TftpSession, timeoutMs: int = 0): Event =
       asyncdispatch.poll(timeoutMs)
     # Drain gate: emit evServerStopped exactly once when run loop exits + no
     # active transfers remain (Invariant 8).
-    # FIX 6a: collect keys to delete AFTER the loop (safe iteration).
+    # Collect keys to delete AFTER the loop (safe iteration; deleting from
+    # a Table while iterating over it is undefined behavior).
     var stoppedKeys: seq[uint32]
     for srvKey, entry in s.servers.pairs:
       if not entry.stoppedEmitted and
@@ -585,17 +625,19 @@ iterator poll*(s: TftpSession, timeoutMs: int = 0): Event =
         s.enqueue(Event(xfrId: NoTransfer, srvId: ServerId(srvKey),
                         kind: evServerStopped))
         stoppedKeys.add(srvKey)
-    # Delete stopped servers and their lingering serverXferCancel entries.
+    # Delete stopped servers and their lingering transfer records.
     for k in stoppedKeys:
       if k in s.servers:
         let ent = s.servers[k]
         for _, tid in ent.xfers.pairs:
-          s.serverXferCancel.del(tid.uint32)
+          s.transfers.del(tid.uint32)
         s.servers.del(k)
   except CatchableError:
     discard  # empty-dispatcher ValueError or any I/O escape → yield nothing
-  while s.events.len > 0:
-    yield s.events.popFirst()
+  while true:
+    let ev = s.queue.tryPopFirst()
+    if ev.isNone: break
+    yield ev.get
 
 proc close*(s: TftpSession) =
   ## Signal all active client transfers to cancel and all servers to stop.
@@ -605,8 +647,9 @@ proc close*(s: TftpSession) =
   ## and the caller needs to inspect events before draining.
   ## Do NOT force-close transports here — the in-flight futures own them; let
   ## their addCallbacks close transports after the future resolves.
-  for _, entry in s.active:
-    entry.cancelRequested[] = true
+  for _, rec in s.transfers.pairs:
+    if rec.origin == toClient and rec.cancelFlag != nil:
+      rec.cancelFlag[] = true
   for _, srvEntry in s.servers.pairs:
     if not srvEntry.stopRequested:
       srvEntry.stopRequested = true
@@ -623,8 +666,8 @@ proc drain*(s: TftpSession, timeoutMs: int = 2000) =
     try:
       for ev in s.poll(2): discard
     except CatchableError: discard
-    if s.active.len == 0 and s.servers.len == 0: break
-    if not hasPendingOperations() and s.events.len == 0: break
+    if s.activeClientCount() == 0 and s.servers.len == 0: break
+    if not hasPendingOperations() and s.queue.len == 0: break
     if epochTime() >= deadline: break
 
 proc waitTransfer*(s: TftpSession, id: TransferId): TransferResult =
@@ -649,11 +692,11 @@ proc waitTransfer*(s: TftpSession, id: TransferId): TransferResult =
                                   errorCode: ev.errorCode,
                                   errorMsg: ev.errorMsg)
         found = true
-        break   # remaining events stay in s.events (dequeue-per-yield)
+        break   # remaining events stay in s.queue (dequeue-per-yield)
       else:
         buffered.add ev
     if found: break
-    if not hasPendingOperations() and s.events.len == 0:
+    if not hasPendingOperations() and s.queue.len == 0:
       break   # no async work remains; target terminal will never arrive
   if not found:
     result = TransferResult(success: false,
@@ -674,11 +717,11 @@ proc waitServer*(s: TftpSession, id: ServerId) =
     for ev in s.poll(2):
       if ev.srvId == id and ev.kind in {evServerStopped, evServerStartFailed}:
         found = true
-        break   # remaining events stay in s.events
+        break   # remaining events stay in s.queue
       else:
         buffered.add ev
     if found: break
-    if not hasPendingOperations() and s.events.len == 0:
+    if not hasPendingOperations() and s.queue.len == 0:
       break
   for ev in buffered:
     s.enqueue(ev)
@@ -691,16 +734,18 @@ proc waitServer*(s: TftpSession, id: ServerId) =
 when defined(chapulinTest):
   proc sessionServerCount*(s: TftpSession): int =
     ## Returns the number of server entries currently retained in the session.
-    ## Zero after all servers have emitted evServerStopped (FIX 6a).
+    ## Zero after all servers have emitted evServerStopped.
     s.servers.len
 
   proc sessionActiveCount*(s: TftpSession): int =
     ## Returns the number of active client transfers currently in the session.
-    s.active.len
+    ## (Server-side transfers share the same consolidated `transfers` table
+    ## but are excluded — see `activeClientCount`.)
+    s.activeClientCount()
 
   proc sessionQueueLen*(s: TftpSession): int =
     ## Returns the current number of events waiting in the session queue.
-    s.events.len
+    s.queue.len
 
   proc injectEvent*(s: TftpSession, ev: Event) =
     ## Test helper: inject an event directly through enqueue (exercises cap logic).

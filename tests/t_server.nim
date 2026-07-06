@@ -1,5 +1,5 @@
 import unittest
-import std/[os, strutils, asyncdispatch]
+import std/[os, strutils, asyncdispatch, options]
 import ../src/chapulin/protocol
 import ../src/chapulin/transfer
 import ../src/chapulin/options
@@ -132,7 +132,7 @@ suite "handleRrq — serve file to client":
                            "10.0.0.1", 5000)
 
     check result.success == false
-    check result.errorCode == ord(errFileNotFound)  # Fix B: errorCode wired, not 0
+    check result.errorCode == some(errFileNotFound)  # Fix B: errorCode wired, not none
     # Server should have sent ERROR packet
     check sm.sentPackets.len >= 1
     let sent = decode(sm.sentPackets[0].data)
@@ -149,7 +149,7 @@ suite "handleRrq — serve file to client":
                            "10.0.0.1", 5000)
 
     check result.success == false
-    check result.errorCode == ord(errAccessViolation)  # Fix B: errorCode wired, not 0
+    check result.errorCode == some(errAccessViolation)  # Fix B: errorCode wired, not none
     check sm.sentPackets.len >= 1
     let sent = decode(sm.sentPackets[0].data)
     check sent.opcode == opError
@@ -199,11 +199,174 @@ suite "handleRrq — serve file to client":
                            "10.0.0.1", 5000)
 
     check result.success == false
-    check result.errorCode == ord(errOptionNegotiation)
+    check result.errorCode == some(errOptionNegotiation)
     check sm.sentPackets.len >= 1
     let sent = decode(sm.sentPackets[0].data)
     check sent.opcode == opError
     check sent.errorCode == errOptionNegotiation
+
+suite "negotiateCore — onStart fires before ERROR(8), exactly once, with pre-negotiation defaults (D1)":
+  # Pins an ordering invariant that has no direct test today: the existing
+  # unparseable-option tests above (and their WRQ counterpart below) pass
+  # onStart = nil, so they can't observe WHEN onStart fires relative to the
+  # ERROR(8) send. A spy onStart here checks, from INSIDE the callback, that
+  # no packet has been sent yet -- catching any future reordering that moved
+  # the ERROR(8) send ahead of the onStart call.
+  test "RRQ: onStart fires exactly once, before ERROR(8), with default blocksize/windowsize":
+    let sm = newServerMock()
+
+    let config = newDefaultServerConfig(testRoot)
+    let request = TftpPacket(opcode: opRrq, filename: "hello.txt",
+                              mode: tmOctet,
+                              options: @[("blksize", "not-a-number")])
+
+    var startFired = 0
+    var startInfo: TransferInfo
+    let onStart = proc(info: TransferInfo) {.closure.} =
+      inc startFired
+      startInfo = info
+      check sm.sentPackets.len == 0  # ordering pin: ERROR(8) not sent yet
+
+    let result = waitFor handleRrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000, nil, onStart, 0.0)
+
+    check result.success == false
+    check result.errorCode == some(errOptionNegotiation)
+    check startFired == 1
+    check startInfo.blocksize == DefaultBlocksize
+    check startInfo.windowsize == DefaultWindowsize
+    check sm.sentPackets.len == 1
+    let sent = decode(sm.sentPackets[0].data)
+    check sent.opcode == opError
+    check sent.errorCode == errOptionNegotiation
+
+  test "WRQ: onStart fires exactly once, before ERROR(8), with default blocksize/windowsize":
+    let sm = newServerMock()
+
+    var config = newDefaultServerConfig(testRoot)
+    config.writePolicy = wpCreateOrOverwrite
+    let request = TftpPacket(opcode: opWrq, filename: "onstart_bad_wrq.txt",
+                              mode: tmOctet,
+                              options: @[("windowsize", "not-a-number")])
+
+    var startFired = 0
+    var startInfo: TransferInfo
+    let onStart = proc(info: TransferInfo) {.closure.} =
+      inc startFired
+      startInfo = info
+      check sm.sentPackets.len == 0  # ordering pin: ERROR(8) not sent yet
+
+    let result = waitFor handleWrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000, nil, onStart, 0.0)
+
+    check result.success == false
+    check result.errorCode == some(errOptionNegotiation)
+    check startFired == 1
+    check startInfo.blocksize == DefaultBlocksize
+    check startInfo.windowsize == DefaultWindowsize
+    check sm.sentPackets.len == 1
+    let sent = decode(sm.sentPackets[0].data)
+    check sent.opcode == opError
+    check sent.errorCode == errOptionNegotiation
+
+  test "RRQ: failed post-OACK ACK(0) wait does NOT fire onStart":
+    # Completes the three-way onStart asymmetry: negotiateCore's ValueError
+    # path fires onStart itself (pinned above); the success path leaves
+    # onStart to the handler (pinned in "onTransferStart callback" below).
+    # This is the third branch -- negotiateRrq's own post-OACK divergence --
+    # where negotiation itself succeeds (an OACK is sent) but the client's
+    # reply to that OACK is not a valid ACK(0). That failure is Invariant-4
+    # territory (a dropped/garbled post-OACK reply), so onStart must NOT
+    # fire even though a real OACK went out over the wire.
+    let sm = newServerMock()
+    sm.addResponse(makeAckPkt(5))  # anything other than ACK(0) fails the wait
+
+    let config = newDefaultServerConfig(testRoot)
+    let request = TftpPacket(opcode: opRrq, filename: "hello.txt",
+                              mode: tmOctet,
+                              options: @[("blksize", "1024")])
+
+    var startFired = 0
+    let onStart = proc(info: TransferInfo) {.closure.} =
+      inc startFired
+
+    let result = waitFor handleRrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000, nil, onStart, 0.0)
+
+    check result.success == false
+    check startFired == 0
+    # The OACK itself was sent -- negotiateCore succeeded; only the
+    # post-OACK ACK(0) wait (negotiateRrq's own divergence) failed.
+    check sm.sentPackets.len == 1
+    let sent = decode(sm.sentPackets[0].data)
+    check sent.opcode == opOack
+
+suite "negotiateWrq — bare ACK(0) on zero requested options (D1 depth finding)":
+  test "WRQ with zero options: a bare ACK(0) is sent as the only pre-DATA packet":
+    let sm = newServerMock()
+    sm.addResponse(makeDataPkt(1, @[byte 1, 2, 3]))
+
+    var config = newDefaultServerConfig(testRoot)
+    config.writePolicy = wpCreateOrOverwrite
+    let request = TftpPacket(opcode: opWrq, filename: "bare_ack_wrq.txt",
+                              mode: tmOctet, options: @[])
+    let result = waitFor handleWrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000)
+
+    check result.success == true
+    # [0] = the bare ACK(0) negotiateWrq itself sends (no OACK, no ERROR);
+    # [1] = recvBlocks' own final ACK(1) for the DATA(1) it then receives.
+    check sm.sentPackets.len == 2
+    let sent = decode(sm.sentPackets[0].data)
+    check sent.opcode == opAck
+    check sent.ackBlockNum == 0
+
+  test "RRQ with zero options sends nothing before DATA(1) (contrast with WRQ's bare ACK(0))":
+    let sm = newServerMock()
+    sm.addResponse(makeAckPkt(1))
+
+    let config = newDefaultServerConfig(testRoot)
+    let request = TftpPacket(opcode: opRrq, filename: "hello.txt",
+                              mode: tmOctet, options: @[])
+    let result = waitFor handleRrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000)
+
+    check result.success == true
+    check sm.sentPackets.len == 1  # only DATA(1) -- no preceding ACK/OACK
+    let sent = decode(sm.sentPackets[0].data)
+    check sent.opcode == opData
+    check sent.blockNum == 1
+
+suite "askedParams — D6 best-effort client-ask parser (wired through TransferInfo.requestedParams as of slice 7)":
+  test "valid blksize and windowsize parse and clamp correctly":
+    let p = askedParams(@[("blksize", "1024"), ("windowsize", "4")])
+    check p.blocksize == 1024
+    check p.windowsize == 4
+
+  test "out-of-range-but-parseable values are RFC-clamped, not dropped":
+    let p = askedParams(@[("blksize", "99999999"), ("windowsize", "0")])
+    check p.blocksize == MaxBlocksize
+    check p.windowsize == MinWindowsize
+
+  test "unparseable value falls back to that field's default; a valid sibling is unaffected":
+    let p = askedParams(@[("blksize", "not-a-number"), ("windowsize", "4")])
+    check p.blocksize == DefaultBlocksize
+    check p.windowsize == 4
+
+  test "missing option falls back to default; the other field still parses":
+    let p = askedParams(@[("blksize", "1024")])
+    check p.blocksize == 1024
+    check p.windowsize == DefaultWindowsize
+
+  test "no options at all: both fields report their defaults":
+    let p = askedParams(@[])
+    check p.blocksize == DefaultBlocksize
+    check p.windowsize == DefaultWindowsize
+
+  test "unrecognized option key is ignored -- doesn't affect blksize/windowsize":
+    let p = askedParams(@[("tsize", "12345"), ("blksize", "2048")])
+    check p.blocksize == 2048
+    check p.windowsize == DefaultWindowsize
 
 suite "handleRrq — netascii send side (RFC-conformance-closure D1b/d, slice 7a)":
   test "LF to CR LF round trip: a real file's LF bytes arrive on the wire as CR LF":
@@ -482,7 +645,7 @@ suite "handleWrq — receive file from client":
                            "10.0.0.1", 5000)
 
     check result.success == false
-    check result.errorCode == ord(errAccessViolation)  # Fix B: errorCode wired, not 0
+    check result.errorCode == some(errAccessViolation)  # Fix B: errorCode wired, not none
     let sent = decode(sm.sentPackets[0].data)
     check sent.opcode == opError
     check sent.errorCode == errAccessViolation
@@ -498,7 +661,7 @@ suite "handleWrq — receive file from client":
                            "10.0.0.1", 5000)
 
     check result.success == false
-    check result.errorCode == ord(errFileAlreadyExists)  # Fix B: errorCode wired, not 0
+    check result.errorCode == some(errFileAlreadyExists)  # Fix B: errorCode wired, not none
     let sent = decode(sm.sentPackets[0].data)
     check sent.opcode == opError
     check sent.errorCode == errFileAlreadyExists
@@ -531,7 +694,7 @@ suite "handleWrq — receive file from client":
                            "10.0.0.1", 5000)
 
     check result.success == false
-    check result.errorCode == ord(errAccessViolation)  # Fix B: errorCode wired, not 0
+    check result.errorCode == some(errAccessViolation)  # Fix B: errorCode wired, not none
     let sent = decode(sm.sentPackets[0].data)
     check sent.opcode == opError
 
@@ -547,7 +710,7 @@ suite "handleWrq — receive file from client":
                            "10.0.0.1", 5000)
 
     check result.success == false
-    check result.errorCode == ord(errOptionNegotiation)
+    check result.errorCode == some(errOptionNegotiation)
     check sm.sentPackets.len >= 1
     let sent = decode(sm.sentPackets[0].data)
     check sent.opcode == opError
@@ -622,31 +785,49 @@ suite "handleRrq/handleWrq — R6: out-of-range timeout is dropped from the OACK
     for (key, _) in oack.oackOptions:
       check key.toLowerAscii != "timeout"
 
-suite "handleRrq — csSha256 fails loud, never a silent no-op (H2)":
-  test "csSha256 config: handleRrq fails, sends ERROR, writes no sidecar":
-    # RFC checksum-integrity-error-hygiene H2: before this fix, handleRrq's
-    # sidecar-construction guard was `config.checksumMode == csMd5`, so
-    # csSha256 fell through into the SAME branch as csNone (no digester, no
-    # error) — the RRQ silently succeeded with no sidecar and no error,
-    # reproducing the exact pre-RFC silent-no-op bug for any caller that
-    # drives handleRrq directly with a csSha256 config (bypassing the
-    # parseChecksumMode/startServer boundary guards). It must instead fail
-    # loud: no successful transfer, no sidecar, an ERROR sent to the client.
+# ---------------------------------------------------------------------------
+# L8 (code review): negotiateServerOptions' tsize branch had no `< 0` guard,
+# unlike the client-side validateAndParseOack (which rejects a negative
+# tsize). Not exploitable today -- a negative neg.totalSize never reaches
+# xferConfig thanks to the `>= 0` gate in negotiateCore -- but a negative
+# tsize should still be rejected/ignored at the parse site for parity, not
+# stored and (were suppressTsize false) echoed back on the wire.
+# ---------------------------------------------------------------------------
+suite "handleRrq — L8: negative tsize is rejected, not echoed (RFC 2349 parity)":
+  test "RRQ with tsize=-1 (only option): OACK is skipped entirely, same as tsize absent":
     let sm = newServerMock()
-    sm.addResponse(makeAckPkt(1))  # only consumed if the guard fails to fire
+    sm.addResponse(makeAckPkt(1))
 
-    var config = newDefaultServerConfig(testRoot)
-    config.checksumMode = csSha256
+    let config = newDefaultServerConfig(testRoot)
     let request = TftpPacket(opcode: opRrq, filename: "hello.txt",
-                              mode: tmOctet, options: @[])
+                              mode: tmOctet,
+                              options: @[("tsize", "-1")])
     let result = waitFor handleRrq(config, request, sm.toTransport,
                            "10.0.0.1", 5000)
 
-    check result.success == false
-    check sm.sentPackets.len >= 1
+    check result.success == true
     let sent = decode(sm.sentPackets[0].data)
-    check sent.opcode == opError
-    check not fileExists(testRoot / "hello.txt.md5")
+    check sent.opcode == opData  # NOT opOack -- negative tsize was dropped, not echoed
+    check sent.blockNum == 1
+
+  test "RRQ with tsize=-1 alongside blksize: blksize still negotiates, tsize is omitted":
+    let sm = newServerMock()
+    sm.addResponse(makeAckPkt(0))
+    sm.addResponse(makeAckPkt(1))
+
+    let config = newDefaultServerConfig(testRoot)
+    let request = TftpPacket(opcode: opRrq, filename: "hello.txt",
+                              mode: tmOctet,
+                              options: @[("blksize", "1024"), ("tsize", "-1")])
+    let result = waitFor handleRrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000)
+
+    check result.success == true
+    let oack = decode(sm.sentPackets[0].data)
+    check oack.opcode == opOack
+    check ("blksize", "1024") in oack.oackOptions
+    for (key, _) in oack.oackOptions:
+      check key.toLowerAscii != "tsize"
 
 suite "onTransferStart callback":
   test "onTransferStart fires once with correct totalBytes for RRQ":
@@ -694,6 +875,55 @@ suite "onTransferStart callback":
     check startFired == 1
     check startInfo.totalBytes == 3
 
+suite "allocateTransferTransport — port-range retry (RFC design-bar-closure D2)":
+  test "advances through the range on OSError and binds the first free port":
+    var config = newDefaultServerConfig(testRoot)
+    config.portRangeStart = 6000
+    config.portRangeEnd = 6004
+    let server = newTftpServer(config)
+    var attempted: seq[int] = @[]
+    server.transferFactory = proc(port: int): Transport =
+      attempted.add port
+      if attempted.len <= 3:
+        raise newException(OSError, "port in use")
+      return newServerMock().toTransport()
+
+    let (transport, bound) = allocateTransferTransport(server, config)
+
+    check bound == true
+    check attempted == @[6000, 6001, 6002, 6003]
+    check transport.send != nil
+
+  test "reports not-bound when the whole range is exhausted":
+    var config = newDefaultServerConfig(testRoot)
+    config.portRangeStart = 7000
+    config.portRangeEnd = 7002
+    let server = newTftpServer(config)
+    var attempted: seq[int] = @[]
+    server.transferFactory = proc(port: int): Transport =
+      attempted.add port
+      raise newException(OSError, "port in use")
+
+    let (transport, bound) = allocateTransferTransport(server, config)
+
+    check bound == false
+    check attempted == @[7000, 7001, 7002]
+
+  test "binds directly (no retry loop) when no port range is configured":
+    let config = newDefaultServerConfig(testRoot)
+    let server = newTftpServer(config)
+    var factoryCalled = 0
+    server.transferFactory = proc(port: int): Transport =
+      inc factoryCalled
+      check port == 0
+      return newServerMock().toTransport()
+
+    let (transport, bound) = allocateTransferTransport(server, config)
+
+    check bound == true
+    check factoryCalled == 1
+    check transport.send != nil
+
 suite "transferFactory injection":
   test "transferFactory is invoked for each request":
     # Re-create the test file because cleanup may have run if suites share state
@@ -716,7 +946,7 @@ suite "transferFactory injection":
 
     check factoryCalled == 1
 
-suite "parseChecksumMode — FIX 10: sha256 raises ValueError":
+suite "parseChecksumMode":
 
   test "md5 parses as csMd5":
     check parseChecksumMode("md5") == csMd5
@@ -726,14 +956,13 @@ suite "parseChecksumMode — FIX 10: sha256 raises ValueError":
     check parseChecksumMode("none") == csNone
     check parseChecksumMode("") == csNone
 
-  test "sha256 raises ValueError (not yet implemented)":
+  test "sha256 raises ValueError (RFC D9: no longer a special-cased placeholder -- rejected the same generic way as any other unrecognized string)":
     var raised = false
     try:
       discard parseChecksumMode("sha256")
     except ValueError as e:
       raised = true
       check "sha256" in e.msg
-      check "not yet implemented" in e.msg
     check raised
 
   test "unknown value raises ValueError":
@@ -774,7 +1003,7 @@ suite "sendOsErrorAndFail — no OS path/errno leak (slice 3a)":
                                               fakeOsDetail, "RRQ open failed")
 
     check outcome.xfer.success == false
-    check outcome.xfer.errorCode == ord(errAccessViolation)  # Fix B: errorCode wired, not 0
+    check outcome.xfer.errorCode == some(errAccessViolation)  # Fix B: errorCode wired, not none
     check outcome.xfer.errorMsg == clientSafeError(errAccessViolation)
     check testRoot notin outcome.xfer.errorMsg
 
@@ -807,7 +1036,7 @@ suite "WRQ open failure — no OS path/errno leak (slice 3a)":
                            "10.0.0.1", 5000)
 
     check result.success == false
-    check result.errorCode == ord(errDiskFull)  # Fix B: errorCode wired, not 0
+    check result.errorCode == some(errDiskFull)  # Fix B: errorCode wired, not none
     check testRoot notin result.errorMsg
     check result.errorMsg == clientSafeError(errDiskFull)
 

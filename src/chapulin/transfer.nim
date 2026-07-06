@@ -1,7 +1,7 @@
 ## Shared transfer primitives — the foundation for both client and server.
 ## All I/O procs are async. Pure procs (types, constants, validation) are sync.
 
-import std/[asyncdispatch, times, tables]
+import std/[asyncdispatch, times, tables, options]
 import protocol
 export protocol  ## option bounds + defaults now live in protocol.nim (D7);
                   ## re-exported so existing callers (options.nim, api.nim,
@@ -24,7 +24,11 @@ type
     success*: bool
     bytesTransferred*: int64
     errorMsg*: string
-    errorCode*: int
+    errorCode*: Option[TftpErrorCode]  ## RFC design-bar-closure D5: none = local/
+    ## transport/decode failure with NO peer-supplied code; some(c) = a peer
+    ## (or this server) actually emitted/decoded TFTP error code c. Previously
+    ## a bare `int` defaulting to 0, indistinguishable from a peer's genuine
+    ## errNotDefined (also ord 0) -- the verified errorCode==0 collision.
     totalSize*: int64     ## -1 if unknown
     ## NOTE (RFC checksum-integrity-error-hygiene, finding M3): this type is
     ## SHARED by both client transfers (engine/sendBlocks/recvBlocks, surfaced

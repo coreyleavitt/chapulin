@@ -16,23 +16,16 @@ type
       discard
     of csMd5:
       ctx: MD5Context
-    of csSha256:
-      discard
 
 proc newDigester*(mode: ChecksumMode): Digester =
   ## csNone → a no-op digester; no MD5Context allocated.
   ## csMd5  → initializes the incremental context.
-  ## csSha256 → raises ValueError (unsupported). This is a guard the RRQ path should never hit
-  ## (startServer/parseChecksumMode already reject csSha256 at construction), but it fails loud
-  ## rather than silently no-op'ing or touching the unallocated `discard` arm.
   case mode
   of csNone:
     result = Digester(mode: csNone)
   of csMd5:
     result = Digester(mode: csMd5)
     md5Init(result.ctx)
-  of csSha256:
-    raise newException(ValueError, "checksum mode sha256 is not yet implemented")
 
 proc update*(d: Digester, data: openArray[byte]) =
   ## Feeds confirmed-delivered bytes into the digest; no-op for csNone.
@@ -44,8 +37,6 @@ proc update*(d: Digester, data: openArray[byte]) =
   case d.mode
   of csNone:
     discard
-  of csSha256:
-    discard # unreachable: newDigester raises before a Digester in this mode can exist
   of csMd5:
     if data.len == 0:
       return
@@ -58,8 +49,6 @@ proc finalize*(d: Digester): string =
   case d.mode
   of csNone:
     ""
-  of csSha256:
-    "" # unreachable
   of csMd5:
     var ctxCopy = d.ctx
     var digest: MD5Digest
@@ -107,8 +96,6 @@ proc commit*(d: Digester, rootDir, resolvedPath: string): tuple[ok: bool, err: s
   case d.mode
   of csNone:
     (true, "")
-  of csSha256:
-    (true, "") # unreachable
   of csMd5:
     let digest = d.finalize()
     writeSidecar(rootDir, resolvedPath, digest)

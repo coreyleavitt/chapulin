@@ -48,6 +48,18 @@ type
 
   TftpDecodeError* = object of CatchableError
 
+  TransferParams* = object
+    ## Single-sourced blocksize/windowsize pair (RFC design-bar-closure D6,
+    ## line 344): both `api.nim`'s TransferSnapshot (requested/effective) and
+    ## `server.nim`'s D6 parity-plumbing ask helper need the identical shape,
+    ## so it lives here once rather than as two identical records in two
+    ## modules that already both import `protocol` (`api.nim` re-exports
+    ## several `protocol` symbols). Slice 1 (server.nim's `askedParams`) is
+    ## its first consumer; `api.nim`'s `TransferSnapshot` wires it in as of
+    ## slice 7 (the `requested`/`effective` fields).
+    blocksize*: int
+    windowsize*: int
+
 proc opcodeToWire*(op: TftpOpcode): uint16 =
   uint16(ord(op) + 1)
 

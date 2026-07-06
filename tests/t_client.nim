@@ -1,5 +1,5 @@
 import unittest
-import std/[strutils, asyncdispatch, os]
+import std/[strutils, asyncdispatch, os, options]
 import ../src/chapulin/protocol
 import ../src/chapulin/engine
 import ../src/chapulin/netascii
@@ -509,8 +509,8 @@ suite "RRQ OACK validation -> ERROR(8)":
     let result = waitFor getFile(mt.toTransport, config, "127.0.0.1", 69, "rogue.bin", onData)
 
     check result.success == false
-    check result.errorCode == ord(errOptionNegotiation)
-    check result.errorCode == 8
+    check result.errorCode == some(errOptionNegotiation)
+    check result.errorCode == some(TftpErrorCode(8))
 
     # The client must tell the server, not just fail locally.
     check mt.sentPackets.len == 2  # RRQ, then ERROR
@@ -787,7 +787,7 @@ suite "WRQ OACK validation -> ERROR(8)":
     let result = waitFor putFile(mt.toTransport, config, "127.0.0.1", 69, "rogue_upload.bin", readData)
 
     check result.success == false
-    check result.errorCode == ord(errOptionNegotiation)
+    check result.errorCode == some(errOptionNegotiation)
 
     check mt.sentPackets.len == 2  # WRQ, then ERROR
     let errPkt = decode(mt.sentPackets[1].data)

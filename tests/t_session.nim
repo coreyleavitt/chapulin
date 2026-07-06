@@ -18,6 +18,7 @@ import ../src/chapulin/server_config
 import ../src/chapulin/protocol
 import ../src/chapulin/transfer
 import ./wireharness
+import ./helpers
 
 # ---------------------------------------------------------------------------
 # Drive helper: pump s.poll(0) until a terminal event for `id` is seen or
@@ -630,49 +631,17 @@ suite "TftpSession — server lifecycle":
     check kinds == @[evServerStartFailed]
     check kinds[0] == evServerStartFailed
 
-  test "startServer rejects csSha256 config: evServerStartFailed, no evServerStarted (H2/M8)":
-    # RFC checksum-integrity-error-hygiene H2: csSha256 is a legal-to-construct
-    # but unimplemented ChecksumMode. startServer must reject it loud, at
-    # server construction, before any listener binds or RRQ is served — never
-    # a silent no-op. Mirrors parseChecksumMode's CLI-boundary rejection but
-    # at the embedding-API boundary (a config built programmatically, not
-    # parsed from a string, so parseChecksumMode itself is never consulted).
-    let q = newListenerQueue()
-    let s = newSession(
-      transportFactory = proc(h: string, p: int): Transport =
-        makeTransport(newWire(), sideA = false),
-      listenerFactory = proc(a: string, p: int): UdpListener = makeListener(q, p)
-    )
-
-    var cfg = newDefaultServerConfig(getTempDir())
-    cfg.listenAddr = "127.0.0.1"
-    cfg.listenPort = 6901
-    cfg.checksumMode = csSha256
-
-    var srvId: ServerId
-    var raised = false
-    try:
-      srvId = s.startServer(cfg)
-    except:
-      raised = true
-
-    check not raised
-    check srvId != NoServer
-
-    var kinds: seq[EventKind]
-    for ev in s.poll(0):
-      if ev.srvId == srvId:
-        kinds.add ev.kind
-
-    check kinds == @[evServerStartFailed]
-
-  test "startServer rejects out-of-RFC-bound config: evServerStartFailed, no evServerStarted (D7)":
+  test "startServer rejects out-of-RFC-bound config: evServerStartFailed, no evServerStarted (D7/D8)":
     # RFC conformance-closure D7: protocol.nim is the single source of truth
     # for legal option bounds (blksize 8..65464, windowsize 1..65535, timeout
-    # 1..255). ServerConfig is a plain mutable object with no construction
-    # choke point (the CLI pokes fields directly), so startServer must reject
-    # an out-of-bound config loud -- mirrors the csSha256 precedent above, at
-    # the same evServerStartFailed channel.
+    # 1..255). D8 gave the blksize/windowsize pair a bounded-range type
+    # (BlocksizeRange/WindowsizeRange, constructed validly by
+    # newServerConfig) but those range fields stay public/hand-pokable
+    # (R4) -- ServerConfig as a whole is still a plain mutable object with no
+    # sealed construction choke point, so startServer must still reject an
+    # out-of-bound config loud, at the evServerStartFailed channel, when a
+    # caller bypasses the constructor and pokes `.blocksizeRange.minVal`/
+    # `.windowsizeRange.maxVal`/etc. directly post-construction.
     proc freshSession(): TftpSession =
       let q = newListenerQueue()
       newSession(
@@ -707,12 +676,14 @@ suite "TftpSession — server lifecycle":
 
     expectRejected(proc(cfg: var ServerConfig) = cfg.timeout = 0, 6902)
     expectRejected(proc(cfg: var ServerConfig) = cfg.timeout = 256, 6903)
-    expectRejected(proc(cfg: var ServerConfig) = cfg.minBlocksize = 1, 6904)
-    expectRejected(proc(cfg: var ServerConfig) = cfg.maxBlocksize = 100_000, 6905)
-    expectRejected(proc(cfg: var ServerConfig) = (cfg.minBlocksize = 2000; cfg.maxBlocksize = 100), 6906)
-    expectRejected(proc(cfg: var ServerConfig) = cfg.minWindowsize = 0, 6907)
-    expectRejected(proc(cfg: var ServerConfig) = cfg.maxWindowsize = 100_000, 6908)
-    expectRejected(proc(cfg: var ServerConfig) = (cfg.minWindowsize = 40; cfg.maxWindowsize = 4), 6909)
+    expectRejected(proc(cfg: var ServerConfig) = cfg.blocksizeRange.minVal = 1, 6904)
+    expectRejected(proc(cfg: var ServerConfig) = cfg.blocksizeRange.maxVal = 100_000, 6905)
+    expectRejected(proc(cfg: var ServerConfig) =
+      (cfg.blocksizeRange.minVal = 2000; cfg.blocksizeRange.maxVal = 100), 6906)
+    expectRejected(proc(cfg: var ServerConfig) = cfg.windowsizeRange.minVal = 0, 6907)
+    expectRejected(proc(cfg: var ServerConfig) = cfg.windowsizeRange.maxVal = 100_000, 6908)
+    expectRejected(proc(cfg: var ServerConfig) =
+      (cfg.windowsizeRange.minVal = 40; cfg.windowsizeRange.maxVal = 4), 6909)
 
 # ---------------------------------------------------------------------------
 # Suite: server GET over wire — full transfer event sequence (slice 4)
@@ -1863,8 +1834,13 @@ suite "TftpSession — BUG 3 regression: negotiated blocksize/windowsize in snap
     check gotStarted
     check gotComplete
     # BUG 3 regression: must report negotiated values, not hardcoded 512/1
-    check startSnap.blocksize == 1024
-    check startSnap.windowsize == 2
+    check startSnap.effective.isSome
+    check startSnap.effective.get.blocksize == 1024
+    check startSnap.effective.get.windowsize == 2
+    # (c) server .effective is already `some` at evTransferStarted (OACK precedes onStart)
+    # server-side true parity (R2): requested carries the client's clamped ask
+    check startSnap.requested.blocksize == 1024
+    check startSnap.requested.windowsize == 2
 
     s.stop(srvId)
     for step in 0 .. 200_000:
@@ -2132,7 +2108,8 @@ suite "TftpSession — FIX 7: bounded queue":
     s.injectEvent(Event(xfrId: TransferId(9001), srvId: NoServer,
                         kind: evTransferComplete,
                         snap: TransferSnapshot(bytes: 42, total: some(42'i64),
-                                               blocksize: 512, windowsize: 1,
+                                               requested: TransferParams(blocksize: 512, windowsize: 1),
+                                               effective: some(TransferParams(blocksize: 512, windowsize: 1)),
                                                direction: tdGet, mode: tmOctet,
                                                startedAt: 0.0)))
 
@@ -2495,7 +2472,7 @@ suite "TftpSession — RFC conformance-closure D3: option-negotiation failure su
     # hazard): only read `.errorCode` when `.kind` is statically confirmed,
     # rather than relying on the `check` above to have passed.
     if errEv.kind == evTransferError:
-      check errEv.errorCode == ord(errOptionNegotiation)
+      check errEv.errorCode == some(errOptionNegotiation)
 
     s.stop(srvId)
     for step in 0 .. 200_000:
@@ -2643,6 +2620,70 @@ suite "TftpSession — R2-2: snap common field on evTransferError":
     # ev.snap is the common field: always accessible regardless of outcome
     check errEv.snap.bytes >= 0
     check errEv.errorMsg.len > 0
+
+# ---------------------------------------------------------------------------
+# D5 (RFC design-bar-closure, slice 6): errorCode: int -> Option[TftpErrorCode].
+# `0` used to double as BOTH TftpErrorCode.errNotDefined (a real peer-sent
+# code) AND the hardcoded default an embedder saw when chapulin never reached
+# the server at all -- an embedder could not tell the two apart. These two
+# tests are the regression coverage the verified bug deserves: the first
+# proves a local/transport failure is no longer indistinguishable from a
+# peer's errNotDefined; the second proves the waitTransfer(api.nim) terminal-
+# event round-trip (Event.errorCode -> TransferResult.errorCode) actually
+# carries a genuine peer-emitted code through, not just a bool.
+# ---------------------------------------------------------------------------
+suite "TftpSession — D5 errorCode Option[TftpErrorCode] regression (slice 6)":
+
+  test "local transport failure (never reaches a peer) yields errorCode == none, not some(errNotDefined)":
+    # makeFailingTransport(failAfter = 0) raises OSError on the very FIRST
+    # send -- the initial RRQ/WRQ itself -- so no peer packet is ever
+    # exchanged. Before this fix, api.nim hardcoded `errorCode: 0` on exactly
+    # this path, which was bit-for-bit identical to a peer's genuine
+    # errNotDefined (also ord 0). Post-fix this must be `none`, structurally
+    # distinct from `some(errNotDefined)`.
+    let s = newSession(transportFactory =
+      proc(host: string, port: int): Transport =
+        makeFailingTransport(newWire(), sideA = true, failAfter = 0))
+
+    let localOut = getTempDir() / "chapulin_d5_local_fail_out.bin"
+    defer: (try: removeFile(localOut) except: discard)
+
+    let id = s.startTransfer(newTransferRequest("peer", 0, "test.txt", localOut, tdGet))
+    check id != NoTransfer
+
+    let res = s.waitTransfer(id)
+    check not res.success
+    check res.errorCode == none(TftpErrorCode)
+    check res.errorCode != some(errNotDefined)  # the exact collision this fixes
+
+  test "waitTransfer reconstructs errorCode == some(code) from a genuine evTransferError":
+    # Drive a REAL peer interaction (a rogue OACK carrying an out-of-range
+    # "timeout" value, rejected by validateAndParseOack) through
+    # startTransfer + waitTransfer. api.nim's waitTransfer rebuilds a
+    # TransferResult from the terminal Event via `errorCode: ev.errorCode`
+    # (api.nim ~649) -- that round-trip site had no existing terminal-error
+    # test before this slice.
+    let mt = newMockTransport()
+    mt.addResponse(makeOackPkt(@[("timeout", "0")]))  # rogue: out-of-range value
+
+    let s = newSession(transportFactory =
+      proc(host: string, port: int): Transport = mt.toTransport)
+
+    let localOut = getTempDir() / "chapulin_d5_waittransfer_roundtrip_out.bin"
+    defer: (try: removeFile(localOut) except: discard)
+
+    var req = newTransferRequest("peer", 0, "rogue.bin", localOut, tdGet)
+    req.options.timeout = 10  # non-default -- makes the client actually REQUEST
+                              # "timeout", so the rogue OACK's out-of-range value
+                              # for it fails validateAndParseOack (R4 only rejects
+                              # a bad value of a REQUESTED option; an unrequested
+                              # key would be silently filtered, not rejected).
+    let id = s.startTransfer(req)
+    check id != NoTransfer
+
+    let res = s.waitTransfer(id)
+    check not res.success
+    check res.errorCode == some(errOptionNegotiation)
 
 # ---------------------------------------------------------------------------
 # R2-4: nil localPort in UdpListener must not raise NilAccessDefect
@@ -2841,18 +2882,469 @@ suite "TftpSession — client OACK negotiation: snapshot reports negotiated bloc
     check evs[0].kind  == evTransferStarted
     check evs[^1].kind == evTransferComplete
 
-    # evTransferStarted carries the REQUESTED blocksize (pre-handshake semantics)
-    check evs[0].snap.blocksize == 4096
+    # evTransferStarted carries the REQUESTED blocksize (pre-handshake semantics);
+    # effective is none since the handshake hasn't resolved yet (M5).
+    check evs[0].snap.requested.blocksize == 4096
+    check evs[0].snap.effective.isNone
 
-    # evTransferProgress and evTransferComplete must carry the NEGOTIATED blocksize
+    # evTransferProgress and evTransferComplete must carry the NEGOTIATED
+    # blocksize in `effective` (now `some`), while `requested` keeps reporting
+    # the client's original (clamped) ask -- true parity (M5).
     var sawProgress = false
     for ev in evs:
       case ev.kind
       of evTransferProgress:
         sawProgress = true
-        check ev.snap.blocksize == 1024   # negotiated, not requested
+        check ev.snap.requested.blocksize == 4096
+        check ev.snap.effective.isSome
+        check ev.snap.effective.get.blocksize == 1024   # negotiated, not requested
       of evTransferComplete:
-        check ev.snap.blocksize == 1024   # negotiated, not requested
+        check ev.snap.requested.blocksize == 4096
+        check ev.snap.effective.isSome
+        check ev.snap.effective.get.blocksize == 1024   # negotiated, not requested
       else: discard
 
     check sawProgress   # must have at least one progress event
+
+# ---------------------------------------------------------------------------
+# RFC design-bar-closure D6 (slice 7), reshaped by M5 (effective: Option):
+# requested/effective proofs not already covered above.
+#   (a) client out-of-range ask -> snap.requested is clamped, not raw (the
+#       bug-fix proof).
+#   (b) client .effective is none@Started, some@Progress -- ALREADY proven by
+#       the "GET: OACK downgrades..." suite immediately above (its
+#       requested/effective checks at evs[0]/evTransferProgress ARE this
+#       proof; not duplicated here).
+#   (c) server .effective already some@Started -- ALREADY proven by the
+#       "BUG 3 regression" suite above (`startSnap.effective.isSome`; not
+#       duplicated here).
+#   (d) server-side requested != effective.get on BOTH a progress AND a
+#       terminal snapshot (six-site threading proof: progressCb + the final
+#       complete/error `info` literal, not just onStart's mkTransferInfo).
+#   (e) bare RRQ (zero options) -> effective is some(defaults), meaning
+#       "in-effect defaults," not "an OACK occurred".
+# ---------------------------------------------------------------------------
+suite "TftpSession — D6/M5 requested/effective (slice 7)":
+
+  test "(a) out-of-range client ask is clamped in snap.requested at evTransferStarted, not echoed raw":
+    let w = newWire()
+    let s = newSession(transportFactory =
+      proc(host: string, port: int): Transport = makeTransport(w, sideA = true))
+
+    var req = newTransferRequest("peer", 0, "d6a.bin",
+                                 getTempDir() / "chapulin_t_d6a_out.bin", tdGet)
+    req.options.blocksize = 4          # below MinBlocksize (8)
+    req.options.windowsize = 999999    # above MaxWindowsize (65535)
+
+    let id = s.startTransfer(req)
+    check id != NoTransfer
+
+    var startSnap: TransferSnapshot
+    var gotStarted = false
+    for ev in s.poll(0):
+      if ev.xfrId == id and ev.kind == evTransferStarted:
+        startSnap = ev.snap
+        gotStarted = true
+    check gotStarted
+
+    # The bug-fix proof: requested is the CLAMPED value, never the raw
+    # out-of-range ask the caller supplied -- this is what the pre-fix code
+    # got wrong (bs/ws were captured from the RAW req.options and never
+    # reassigned after the clamp that only affected the wire request).
+    check startSnap.requested.blocksize == MinBlocksize
+    check startSnap.requested.windowsize == MaxWindowsize
+    check startSnap.effective.isNone   # handshake not yet resolved
+
+    s.cancel(id)
+    s.close()
+    s.drain(timeoutMs = 1000)
+
+  test "(d) server-side requested reflects the client's ask while effective reflects the negotiated value, on both a progress and a terminal snapshot":
+    let tmpDir = getTempDir() / "chapulin_t_d6d"
+    createDir(tmpDir)
+    # Large enough (16 blocks at 512) to guarantee at least one progress tick.
+    writeFile(tmpDir / "d6d.bin", "Q".repeat(8192))
+    defer: (try: removeDir(tmpDir) except: discard)
+
+    let w = newWire()
+    let q = newListenerQueue()
+
+    let s = newSession(
+      transportFactory = proc(h: string, p: int): Transport =
+        makeTransport(w, sideA = false),
+      listenerFactory = proc(a: string, p: int): UdpListener = makeListener(q, p)
+    )
+
+    var cfg = newDefaultServerConfig(tmpDir)
+    cfg.listenAddr = "127.0.0.1"
+    cfg.listenPort = 7011
+    cfg.blocksizeRange.maxVal = 512   # forces negotiation to clamp the client's 8192 ask down
+
+    let srvId = s.startServer(cfg)
+    check srvId != NoServer
+
+    var startedSeen = false
+    for step in 0 .. 2000:
+      for ev in s.poll(0):
+        if ev.srvId == srvId and ev.kind == evServerStarted: startedSeen = true
+      if startedSeen: break
+    check startedSeen
+
+    # RRQ requesting blksize=8192 -- the server config caps it at 512.
+    let rrqPkt = TftpPacket(opcode: opRrq, filename: "d6d.bin", mode: tmOctet,
+                            options: @[("blksize", "8192")])
+    q.push(encode(rrqPkt), "peer", 0)
+
+    let clientT = makeTransport(w, sideA = true)
+    proc clientGetD6d(): Future[void] {.async.} =
+      while true:
+        var tdata: seq[byte]; var host: string; var port: int
+        try:
+          (tdata, host, port) = await clientT.recv(65536, 5000)
+        except TransportTimeoutError: break
+        let pkt = decode(tdata)
+        case pkt.opcode
+        of opOack:
+          let ack = TftpPacket(opcode: opAck, ackBlockNum: 0)
+          await clientT.send(encode(ack), host, port)
+        of opData:
+          let ack = TftpPacket(opcode: opAck, ackBlockNum: pkt.blockNum)
+          await clientT.send(encode(ack), host, port)
+          if pkt.data.len < 512: break   # last (short) block
+        else: break
+    discard clientGetD6d()
+
+    var sawProgressMismatch = false
+    var termSnap: TransferSnapshot
+    var gotTerm = false
+    for step in 0 .. 200_000:
+      for ev in s.poll(0):
+        if ev.srvId == srvId:
+          case ev.kind
+          of evTransferProgress:
+            if ev.snap.requested.blocksize == 8192 and ev.snap.effective.isSome and
+               ev.snap.effective.get.blocksize == 512:
+              sawProgressMismatch = true
+          of evTransferComplete:
+            termSnap = ev.snap
+            gotTerm = true
+          else: discard
+      if gotTerm: break
+
+    check sawProgressMismatch   # threading through progressCb (server.nim:~718-726)
+    check gotTerm
+    # threading through the final complete/error `info` literal (server.nim:~778-788)
+    check termSnap.requested.blocksize == 8192
+    check termSnap.effective.isSome
+    check termSnap.effective.get.blocksize == 512
+
+    s.stop(srvId)
+    for step in 0 .. 200_000:
+      for ev in s.poll(0): discard
+      break
+
+  test "(e) bare RRQ (zero options): server effective is some(defaults) meaning in-effect defaults, not that an OACK occurred":
+    let tmpDir = getTempDir() / "chapulin_t_d6e"
+    createDir(tmpDir)
+    writeFile(tmpDir / "d6e.bin", "Z".repeat(100))
+    defer: (try: removeDir(tmpDir) except: discard)
+
+    let w = newWire()
+    let q = newListenerQueue()
+
+    let s = newSession(
+      transportFactory = proc(h: string, p: int): Transport =
+        makeTransport(w, sideA = false),
+      listenerFactory = proc(a: string, p: int): UdpListener = makeListener(q, p)
+    )
+
+    var cfg = newDefaultServerConfig(tmpDir)
+    cfg.listenAddr = "127.0.0.1"
+    cfg.listenPort = 7012
+
+    let srvId = s.startServer(cfg)
+    check srvId != NoServer
+
+    var startedSeen = false
+    for step in 0 .. 2000:
+      for ev in s.poll(0):
+        if ev.srvId == srvId and ev.kind == evServerStarted: startedSeen = true
+      if startedSeen: break
+    check startedSeen
+
+    # Bare RRQ: zero options -- no OACK is ever sent (server.nim's
+    # `if clientOpts.len > 0` branch is skipped entirely).
+    let rrqPkt = TftpPacket(opcode: opRrq, filename: "d6e.bin", mode: tmOctet,
+                            options: @[])
+    q.push(encode(rrqPkt), "peer", 0)
+
+    let clientT = makeTransport(w, sideA = true)
+    proc clientGetD6e(): Future[void] {.async.} =
+      while true:
+        var tdata: seq[byte]; var host: string; var port: int
+        try:
+          (tdata, host, port) = await clientT.recv(65536, 5000)
+        except TransportTimeoutError: break
+        let pkt = decode(tdata)
+        case pkt.opcode
+        of opData:
+          let ack = TftpPacket(opcode: opAck, ackBlockNum: pkt.blockNum)
+          await clientT.send(encode(ack), host, port)
+          if pkt.data.len < DefaultBlocksize: break
+        else: break
+    discard clientGetD6e()
+
+    var startSnap: TransferSnapshot
+    var gotStarted = false
+    for step in 0 .. 200_000:
+      for ev in s.poll(0):
+        if ev.srvId == srvId and ev.kind == evTransferStarted:
+          startSnap = ev.snap
+          gotStarted = true
+      if gotStarted: break
+
+    check gotStarted
+    check startSnap.requested == TransferParams(blocksize: DefaultBlocksize, windowsize: DefaultWindowsize)
+    check startSnap.effective.isSome   # some(defaults) -- "in-effect defaults," no OACK occurred
+    check startSnap.effective.get == TransferParams(blocksize: DefaultBlocksize, windowsize: DefaultWindowsize)
+
+    s.stop(srvId)
+    for step in 0 .. 200_000:
+      for ev in s.poll(0): discard
+      break
+
+# ---------------------------------------------------------------------------
+# Suite: newServerConfig validating constructor (D7 slice 8a)
+#
+# newDefaultServerConfig + direct field pokes leaves ServerConfig with "no
+# real construction choke point" (server_config.serverConfigBoundsValid's own
+# doc comment). newServerConfig folds that same bounds check into a single
+# validated, ergonomic construction path -- a flat ServerConfigOutcome (never
+# a raising constructor, never Result[T,E]; matches OackOutcome's shape) so
+# a caller checks `.ok` instead of catching an exception (never-throw).
+# This is purely additive: the three existing serverConfigBoundsValid guards
+# (server.nim's handleRrq/handleWrq, api.nim's startServer -- exercised just
+# above by "startServer rejects out-of-RFC-bound config") stay, since
+# ServerConfig remains fully hand-buildable/mutable regardless (R4).
+# ---------------------------------------------------------------------------
+suite "ServerConfig — newServerConfig validating constructor (D7 slice 8a)":
+
+  test "valid field set: ok == true, config carries every supplied field":
+    let outcome = newServerConfig(
+      rootDir = "/srv/tftp",
+      listenAddr = "127.0.0.1",
+      listenPort = 6969,
+      portRangeStart = 50000,
+      portRangeEnd = 50100,
+      writePolicy = wpCreateOnly,
+      maxConcurrent = 5,
+      allowedHosts = @["10.0.0.1"],
+      deniedHosts = @["10.0.0.2"],
+      timeout = 10,
+      retries = 4,
+      minBlocksize = 16,
+      maxBlocksize = 4096,
+      minWindowsize = 1,
+      maxWindowsize = 8,
+      pxeCompat = true,
+      dirListFile = "ls.txt",
+      checksumMode = csMd5
+    )
+
+    check outcome.ok
+    check outcome.rejectReason == ""
+    check outcome.config.rootDir == "/srv/tftp"
+    check outcome.config.listenAddr == "127.0.0.1"
+    check outcome.config.listenPort == 6969
+    check outcome.config.portRangeStart == 50000
+    check outcome.config.portRangeEnd == 50100
+    check outcome.config.writePolicy == wpCreateOnly
+    check outcome.config.maxConcurrent == 5
+    check outcome.config.allowedHosts == @["10.0.0.1"]
+    check outcome.config.deniedHosts == @["10.0.0.2"]
+    check outcome.config.timeout == 10
+    check outcome.config.retries == 4
+    check outcome.config.blocksizeRange.minVal == 16
+    check outcome.config.blocksizeRange.maxVal == 4096
+    check outcome.config.windowsizeRange.minVal == 1
+    check outcome.config.windowsizeRange.maxVal == 8
+    check outcome.config.pxeCompat == true
+    check outcome.config.dirListFile == "ls.txt"
+    check outcome.config.checksumMode == csMd5
+
+  test "defaults match newDefaultServerConfig when only rootDir is supplied":
+    let outcome = newServerConfig(rootDir = "/srv/tftp")
+    let want = newDefaultServerConfig("/srv/tftp")
+
+    check outcome.ok
+    check outcome.config == want
+
+  test "invalid bounds (minBlocksize > maxBlocksize): ok == false, non-empty rejectReason, never raises":
+    var raised = false
+    var outcome: ServerConfigOutcome
+    try:
+      outcome = newServerConfig(
+        rootDir = "/srv/tftp",
+        minBlocksize = 4096,
+        maxBlocksize = 100
+      )
+    except:
+      raised = true
+
+    check not raised
+    check not outcome.ok
+    check outcome.rejectReason.len > 0
+
+  test "invalid timeout (out of 1..255): ok == false, non-empty rejectReason, never raises":
+    var raised = false
+    var outcome: ServerConfigOutcome
+    try:
+      outcome = newServerConfig(rootDir = "/srv/tftp", timeout = 0)
+    except:
+      raised = true
+
+    check not raised
+    check not outcome.ok
+    check outcome.rejectReason.len > 0
+
+  test "invalid windowsize (minWindowsize > maxWindowsize): ok == false, non-empty rejectReason, never raises":
+    var raised = false
+    var outcome: ServerConfigOutcome
+    try:
+      outcome = newServerConfig(
+        rootDir = "/srv/tftp",
+        minWindowsize = 100,
+        maxWindowsize = 4
+      )
+    except:
+      raised = true
+
+    check not raised
+    check not outcome.ok
+    check outcome.rejectReason.len > 0
+
+# ---------------------------------------------------------------------------
+# Suite: BlocksizeRange / WindowsizeRange — bounded-range constructors (D8
+# slice 8b)
+# ---------------------------------------------------------------------------
+# RFC conformance-closure D8: the server's blksize/windowsize min/max PAIR
+# (the actual asymmetry vs. the client's single scalar ask, R3) becomes a
+# bounded-range type instead of two unlinked bare ints. newBlocksizeRange/
+# newWindowsizeRange are RAISING constructors -- a min>max pair, or either
+# endpoint outside protocol.nim's RFC bounds, raises ValueError -- unlike
+# newServerConfig/api.nim, which are never-throw and instead WRAP that raise
+# into ServerConfigOutcome.ok == false (proven by the last two tests below,
+# which duplicate the D7 suite's "invalid bounds"/"invalid windowsize" tests
+# on purpose: those tests already prove the wrap by param name, these
+# re-prove it explicitly tied to the new range-constructor's raise).
+#
+# The range fields (`minVal`/`maxVal`) stay public/hand-pokable (R4) -- see
+# "startServer rejects out-of-RFC-bound config" above for the
+# post-construction-mutation belt-and-suspenders coverage that
+# serverConfigBoundsValid still provides once a range escapes its
+# constructor.
+suite "BlocksizeRange / WindowsizeRange — constructor-level rejection (D8 slice 8b)":
+
+  test "newBlocksizeRange(min > max) raises ValueError":
+    expect ValueError:
+      discard newBlocksizeRange(4096, 100)
+
+  test "newBlocksizeRange below MinBlocksize raises ValueError":
+    expect ValueError:
+      discard newBlocksizeRange(1, MaxBlocksize)
+
+  test "newBlocksizeRange above MaxBlocksize raises ValueError":
+    expect ValueError:
+      discard newBlocksizeRange(MinBlocksize, 100_000)
+
+  test "newBlocksizeRange with a valid pair constructs and carries both fields":
+    let r = newBlocksizeRange(512, 4096)
+    check r.minVal == 512
+    check r.maxVal == 4096
+
+  test "newWindowsizeRange(min > max) raises ValueError":
+    expect ValueError:
+      discard newWindowsizeRange(100, 4)
+
+  test "newWindowsizeRange below MinWindowsize raises ValueError":
+    expect ValueError:
+      discard newWindowsizeRange(0, MaxWindowsize)
+
+  test "newWindowsizeRange above MaxWindowsize raises ValueError":
+    expect ValueError:
+      discard newWindowsizeRange(MinWindowsize, 100_000)
+
+  test "newWindowsizeRange with a valid pair constructs and carries both fields":
+    let r = newWindowsizeRange(1, 8)
+    check r.minVal == 1
+    check r.maxVal == 8
+
+  test "newServerConfig wraps newBlocksizeRange's raise: ok == false, non-empty rejectReason, never raises":
+    var raised = false
+    var outcome: ServerConfigOutcome
+    try:
+      outcome = newServerConfig(rootDir = "/srv/tftp", minBlocksize = 4096, maxBlocksize = 100)
+    except:
+      raised = true
+
+    check not raised
+    check not outcome.ok
+    check outcome.rejectReason.len > 0
+
+  test "newServerConfig wraps newWindowsizeRange's raise: ok == false, non-empty rejectReason, never raises":
+    var raised = false
+    var outcome: ServerConfigOutcome
+    try:
+      outcome = newServerConfig(rootDir = "/srv/tftp", minWindowsize = 100, maxWindowsize = 4)
+    except:
+      raised = true
+
+    check not raised
+    check not outcome.ok
+    check outcome.rejectReason.len > 0
+
+  # -------------------------------------------------------------------------
+  # newServerConfig range-accepting overload (M7): a caller who already holds
+  # validated BlocksizeRange/WindowsizeRange values (built through
+  # newBlocksizeRange/newWindowsizeRange) can hand them straight to
+  # newServerConfig instead of re-deriving them from four loose ints. The
+  # "invalid pair is unrepresentable at this boundary" guarantee comes from
+  # newBlocksizeRange/newWindowsizeRange themselves (already proven above to
+  # raise on min>max / out-of-RFC-bounds) -- there is no invalid
+  # BlocksizeRange/WindowsizeRange value to pass here in the first place.
+  # -------------------------------------------------------------------------
+
+  test "newServerConfig(range overload) with valid pre-validated ranges: ok == true, ranges carried through":
+    let bsRange = newBlocksizeRange(512, 4096)
+    let wsRange = newWindowsizeRange(1, 8)
+    var raised = false
+    var outcome: ServerConfigOutcome
+    try:
+      outcome = newServerConfig(
+        rootDir = "/srv/tftp",
+        blocksizeRange = bsRange,
+        windowsizeRange = wsRange)
+    except:
+      raised = true
+
+    check not raised
+    check outcome.ok
+    check outcome.rejectReason.len == 0
+    check outcome.config.blocksizeRange.minVal == 512
+    check outcome.config.blocksizeRange.maxVal == 4096
+    check outcome.config.windowsizeRange.minVal == 1
+    check outcome.config.windowsizeRange.maxVal == 8
+
+  test "newServerConfig(range overload): an invalid blocksize pair can't reach it -- newBlocksizeRange raises first":
+    expect ValueError:
+      discard newServerConfig(
+        rootDir = "/srv/tftp",
+        blocksizeRange = newBlocksizeRange(4096, 100),
+        windowsizeRange = newWindowsizeRange(1, 8))
+
+  test "newServerConfig(range overload): an invalid windowsize pair can't reach it -- newWindowsizeRange raises first":
+    expect ValueError:
+      discard newServerConfig(
+        rootDir = "/srv/tftp",
+        blocksizeRange = newBlocksizeRange(512, 4096),
+        windowsizeRange = newWindowsizeRange(100, 4))

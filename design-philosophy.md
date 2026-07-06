@@ -69,13 +69,13 @@ chapulin_gui.nim          (NiGui desktop GUI)
 
 Single-threaded async with `std/asyncdispatch`. This is the canonical Nim 2.x approach for I/O-bound network servers and the most correct choice for demonstrating idiomatic Nim.
 
-**The entire I/O stack is async.** `Transport` closures return `Future`. Transfer primitives (`sendBlocks`, `recvBlocks`) are `{.async.}`. The server dispatches concurrent transfers via `asyncCheck` — no threads, no locks, no atomics, no channels. Each concurrent transfer is an async task on the same event loop.
+**The entire I/O stack is async.** `Transport` closures return `Future`. Transfer primitives (`sendBlocks`, `recvBlocks`) are `{.async.}`. The server dispatches concurrent transfers via `addCallback` — no threads, no locks, no atomics, no channels. Each concurrent transfer is an async task on the same event loop; `addCallback` inspects and logs a failed handler future rather than leaving it as an unhandled `asyncCheck` failure that could crash the process.
 
 **Why async is canonical Nim:** The stdlib networking ecosystem (`asyncnet`, `asynchttpserver`) is built on `asyncdispatch`. Production Nim servers (Mummy, Jester, Prologue) use async event loops. ORC handles async future cycles correctly. Using threads for I/O-bound server work in Nim is fighting the language.
 
-**Why the colored-function tradeoff is worth it:** Yes, `async`/`await` propagates through the call stack. But the benefits are decisive: zero threading complexity in the server, server and client can share the same event loop in tests, the single-threaded model eliminates races and deadlocks, and concurrent transfers come for free via `asyncCheck`.
+**Why the colored-function tradeoff is worth it:** Yes, `async`/`await` propagates through the call stack. But the benefits are decisive: zero threading complexity in the server, server and client can share the same event loop in tests, the single-threaded model eliminates races and deadlocks, and concurrent transfers come for free via `addCallback`.
 
-**Client wraps async in `waitFor`.** The CLI calls `waitFor executeTransfer(...)` and `waitFor srv.run(...)`. The GUI runs transfers in a background thread with `waitFor` internally (NiGui's event loop cannot share the async dispatch loop). This is correct — the client does one operation at a time.
+**Client wraps async in `waitFor`.** The CLI calls `waitFor executeTransfer(...)` and `waitFor srv.run(...)`. The GUI instead pumps `session.poll(0)` from a repeating 50 ms UI timer (`startRepeatingTimer` in `chapulin_gui.nim`) rather than running transfers on a background thread — the timer callback drains the session's event queue on the GUI's own tick, so no thread handoff or `waitFor` is needed there. This is correct — the client does one operation at a time.
 
 ## Transport abstraction
 

@@ -287,12 +287,6 @@ proc launchGui*() =
         elif ev.srvId != NoServer:
           appendServerLog("Transfer error: " & sanitizeForDisplay(ev.errorMsg))
 
-      of evTransferLog:
-        if ev.srvId != NoServer:
-          appendServerLog("[" & $ev.xLevel & "] " & ev.xMessage)
-        else:
-          appendClientLog("[" & $ev.xLevel & "] " & ev.xMessage)
-
       of evServerLog:
         appendServerLog("[" & $ev.sLevel & "] " & ev.sMessage)
 
@@ -374,10 +368,17 @@ proc launchGui*() =
       of 3: wpCreateOrOverwrite
       else: wpDeny
 
-    var config = newDefaultServerConfig(rootDir)
-    config.listenPort = port
-    config.writePolicy = wp
-    config.maxConcurrent = maxClients
+    # RFC conformance-closure D7 (slice 8a): build via the validating
+    # constructor instead of newDefaultServerConfig + direct field pokes.
+    let configOutcome = newServerConfig(
+      rootDir = rootDir,
+      listenPort = port,
+      writePolicy = wp,
+      maxConcurrent = maxClients
+    )
+    if not configOutcome.ok:
+      window.alert(configOutcome.rejectReason); return
+    let config = configOutcome.config
 
     serverActive = true
     srvStartBtn.enabled = false

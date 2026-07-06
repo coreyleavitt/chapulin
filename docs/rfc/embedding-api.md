@@ -159,14 +159,25 @@ type
     evServerStarted, evServerStartFailed, evServerStopped, evServerLog
 
   # ONE progress payload, used identically for client and server transfers.
+  #
+  # POST-D5/D6/M5 UPDATE: this snippet originally showed `blocksize`/
+  # `windowsize: int` here (0 until handshake, from OACK). D6 replaced that
+  # flat pair with a `requested`/`effective`/`settled` shape; a later
+  # code-review pass (M5) found that shape reintroduced the plausible-
+  # sentinel hazard D5 removed for `errorCode` (`effective` was always
+  # populated and indistinguishable from `requested` until `settled`
+  # flipped, guarded only by a doc warning) and collapsed it into a single
+  # `effective: Option[TransferParams]` — see docs/api-reference.md for the
+  # current, source-verified definition. Shown below in its current form so
+  # this snippet does not go on documenting a removed shape:
   TransferSnapshot* = object
-    bytes*:      int64            # bytes transferred so far
-    total*:      Option[int64]    # none until/unless tsize is known — no -1 sentinel
-    blocksize*:  int              # 0 until handshake; from OACK
-    windowsize*: int              # 0 until handshake; from OACK
+    bytes*:      int64                  # bytes transferred so far
+    total*:      Option[int64]          # none until/unless tsize is known — no -1 sentinel
+    requested*:  TransferParams         # ALWAYS the clamped requested/opening ask
+    effective*:  Option[TransferParams] # none until the handshake resolves, THEN some(in-effect)
     direction*:  TransferDirection
     mode*:       TransferMode      # octet / netascii
-    startedAt*:  float            # epochTime() at handshake completion (speed/ETA)
+    startedAt*:  float            # epochTime() at transfer start
 
   Event* = object
     xfrId*: TransferId          # the transfer this concerns; NoTransfer for server-lifecycle/log
@@ -178,7 +189,12 @@ type
       # position (last-known is useful for resume/report UX on error); errorCode/
       # errorMsg are meaningful for evTransferError only (zero-valued otherwise).
       snap*:      TransferSnapshot
-      errorCode*: int
+      # POST-D5 UPDATE (slice 9): originally `errorCode*: int` here. D5 replaced
+      # it with `Option[TftpErrorCode]` — a bare `int` defaulting to 0 was
+      # indistinguishable from a peer's genuine `errNotDefined` (also ordinal 0).
+      # `none` = local/transport/decode failure, no peer code; `some(c)` = a
+      # genuine peer-emitted/decoded TftpErrorCode. See docs/api-reference.md.
+      errorCode*: Option[TftpErrorCode]
       errorMsg*:  string
     of evTransferLog:           # per-transfer diagnostics (retransmit/timeout); gated by minLogLevel
       xLevel*: LogLevel
@@ -216,7 +232,18 @@ for ev in session.poll(0):
   case ev.kind
   of evTransferStarted:
     if ev.srvId != NoServer: incomingList.add(ev.xfrId)     # server-side
-    else:                    modal.blocksize = ev.snap.blocksize
+    else:                    modal.blocksize = ev.snap.requested.blocksize
+      # POST-D6/M5 UPDATE: originally `ev.snap.blocksize`. At
+      # evTransferStarted, `effective` is `none` on the client side (the
+      # handshake hasn't resolved yet) — reading `requested` directly here is
+      # both correct and clearer than unwrapping a not-yet-settled `effective`.
+      # Once the handshake resolves (by the first evTransferProgress),
+      # `ev.snap.effective` becomes `some(...)`; use
+      # `ev.snap.inEffect.blocksize` if the UI wants the actually-negotiated
+      # value once settled, falling back to `requested` pre-settlement. Never
+      # write a bare `ev.snap.effective.get` -- that raises `UnpackDefect` (a
+      # Defect, not a `CatchableError`) if read before settlement. See
+      # docs/api-reference.md.
   of evTransferProgress:
     let f = fraction(ev.snap.bytes, ev.snap.total)
     if f.isSome: bar.value = f.get else: bar.setIndeterminate()
@@ -248,13 +275,26 @@ CLI: `let res = session.waitTransfer(session.startTransfer(req))`.
      `if hasPendingOperations() or timeoutMs > 0:` before calling it — the same guard the wireharness
      `driveAll` already uses. The only escapes permitted past the boundary are programmer errors (e.g. an
      id from another session, re-entrant poll) — never I/O, decode, OACK, bind, or send failures.
-3. **Terminal events bypass the bound.** The queue coalesces **progress** events per id under
-   backpressure, but `evTransferComplete` / `evTransferError` / `evServerStopped` / `evServerStartFailed`
-   are stored unbounded and always delivered. The accumulation is bounded in practice by the number of
-   concurrent transfers (itself ≤ Σ `maxConcurrent` over active servers, plus client transfers); a
-   frontend that drains every tick sees at most that many undelivered terminals. A frontend that stalls
-   its own event loop for many seconds is the cause of, and the fix for, any growth — the library does
-   not silently drop terminals to protect against a frozen UI.
+3. **Terminal events are preferred to survive, not exempt from the bound (superseded by H1 — see
+   below).** As originally written, this invariant read "terminal events bypass the bound": the queue
+   coalesced **progress** events per id under backpressure, but `evTransferComplete` /
+   `evTransferError` / `evServerStopped` / `evServerStartFailed` (plus `evTransferStarted`) were a
+   protected set stored unbounded and always delivered — accumulation was bounded only *in practice*,
+   by the number of concurrent transfers. A later code-review finding (H1) showed this made the
+   queue's cap not a true ceiling: once the queue filled entirely with protected events and no
+   log-kind event was left to reclaim, pushing one more protected event exceeded the cap outright —
+   and in a flood consisting *entirely* of protected events (e.g. malformed-option RRQ/WRQ packets,
+   each injecting an `evTransferStarted` + `evTransferError` pair per wire packet), growth was silent,
+   unbounded, and a remote denial-of-service vector for a slow-polling embedder.
+   The **current** contract (authoritative source: `src/chapulin/eventqueue.nim`'s module doc-comment
+   and `docs/api-reference.md`'s "bounded contract" section — this paragraph must not contradict
+   either) is a **true absolute cap**: `q.len <= cap` holds after every push, full stop. A log-kind
+   event (`evServerLog`) is evicted first when the queue is full — protected events are still
+   *preferred* to survive — but once no log-kind event remains to reclaim, the single **oldest**
+   queued event is dropped regardless of kind, terminal and start events included. All drops are
+   coalesced into one running count and surfaced via a single synthetic `evServerLog` warning. A
+   frontend that drains `poll()` every tick, as recommended, will not observe this in practice — this
+   is a last-resort safety valve against a hostile or pathological peer, not a normal operating mode.
 4. **Exactly one terminal per `TransferId`.** A transfer emits `evTransferStarted` (≤1) then exactly one
    of `evTransferComplete` / `evTransferError`. There is **no** cancel/complete race: execution is
    single-threaded, so when `cancel(id)` runs the transfer's future is either already resolved (cancel is
@@ -450,5 +490,6 @@ Applied directly (clear-best; four review lenses):
 
 None. Round 2 resolved the three items round 1 parked: (a) transfer event *kinds* unified (not just ids);
 (b) queue policy pinned to "coalesce progress, terminals bypass the bound, bounded by concurrency" with no
-magic capacity number; (c) `waitTransfer`/`waitServer` now buffer rather than drop. The RFC is ready for
-`/tdd` (slice 0a).
+magic capacity number (superseded by the H1 code-review finding — the queue now has a real numeric cap,
+`MaxQueuedEvents` = 8192, and terminals no longer unconditionally bypass it; see Invariant 3 above); (c)
+`waitTransfer`/`waitServer` now buffer rather than drop. The RFC is ready for `/tdd` (slice 0a).

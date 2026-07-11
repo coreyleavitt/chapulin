@@ -13,6 +13,7 @@ import std/unittest
 import proptest
 import ../src/chapulin/transfer
 import ./wireharness
+import ./fuzzsupport  # toByteSeq (R2-1: wireharness no longer re-exports it)
 
 # Drive a real sender (side A) and receiver (side B) to completion over the wire.
 proc runTransfer(content: seq[byte], blocksize, windowsize: int,

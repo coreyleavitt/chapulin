@@ -72,6 +72,12 @@ and the property tests).
 - **Host access** (`checkHostAccess`): optional `allowedHosts`/`deniedHosts`. Denylist
   takes precedence; an empty allowlist means allow-all. (Coarse, IP-based — not
   authentication; trivially spoofable on an untrusted L2 segment.)
+- **Transfer ID (TID) lock** (RFC 1350 §5, `transfer.nim`'s `recvOnce`): a transfer locks
+  onto its peer's `(host, port)` on the first valid response; every later packet from a
+  different address is bounced with `ERROR` "Unknown transfer ID" and never accepted into
+  the transfer. A forged or off-path attacker who guesses block numbers cannot inject
+  into, hijack, or derail an in-flight transfer without also spoofing the legitimate
+  peer's source address.
 
 ### Input hardening — never crash on hostile input
 - The public API (`src/chapulin/api.nim`) is a **never-throw facade**: no
@@ -101,6 +107,41 @@ and the property tests).
   server root **redacted** — they are not sent to the client.
 
 ---
+
+## Verification
+
+Every claim above is backed by a named, running test target — not code-review confidence alone.
+`file:testId`/`property` strings below are exact, taken from the source at the time of writing; if a
+target is renamed or moved, this table (not the claim above) is what's stale. The harness is described in
+[`docs/rfc/verification-harness.md`](docs/rfc/verification-harness.md); see the README's "Verification
+harness" section for how to run it. `dev-test.ps1` runs the default suite (no z3 required); `t_symex*`
+suites need the opt-in z3 image.
+
+| Claim | Verifying target(s) |
+|---|---|
+| `validatePath`/`validateWritePath` never resolve outside the configured root — `..`, absolute-path, and NUL traversal inputs are refused (lexical) | `tests/t_security.nim` coverage-guided fuzz property, `testId: "security.validatePath.lexical"` (200 examples, corpus-persisted under `tests/corpus/`) — the oracle asserts the **no-escape invariant** (any accepted path stays within root) over these traversal classes, not merely that a literal `..` is the rejection reason |
+| …symlink/junction escape refusal (needs a real reparse point — not fuzzable from a corpus, see the RFC's D3) | `tests/t_security.nim` suites "validatePath symlink containment (issue #19)" and "validatePath junction containment (K1)"; `tests/t_props_server.nim` end-to-end tests (e.g. "RRQ with md5 checksum still succeeds when the sidecar path is a pre-planted escaping symlink") |
+| Windows reparse-bit detection (symlinks/junctions unresolved by `expandFilename`) | Same junction-containment suite (`t_security.nim` "validatePath junction containment (K1)") — dynamic, built against a real NTFS junction fixture |
+| `.md5` sidecar: unconditional symlink refusal on the sidecar path itself | `tests/t_checksum.nim` fuzz property `testId: "checksum.writeSidecar"` (lexical never-escape half); `tests/t_security.nim` suite "writeSidecar containment (slice 4)" (dynamic symlink-escape refusal, e2e) |
+| Write policy (`wpDeny`/`wpCreateOnly`/`wpOverwrite`/`wpCreateOrOverwrite`) | `tests/t_security.nim` suite "checkWriteAccess" (example tests, one per policy/state combination); `tests/t_props_server.nim` suite "server write-policy enforcement (end-to-end)" |
+| Reserved `.md5` namespace refusal — lexical half | `tests/t_security.nim` coverage-guided fuzz property, `testId: "security.checkWriteAccess.reservedLexical"` |
+| …canonicalized-alias half (in-root symlink aliasing a `.md5` target) | `tests/t_security.nim` suite "checkWriteAccess reserved .md5 namespace: symlink alias (H1)"; `tests/t_props_server.nim` (e.g. "WRQ to an in-root symlink aliasing a real .md5 sidecar is rejected, sidecar unchanged (H1)") — dynamic e2e, not fuzzed (needs a real symlink) |
+| Host access (`checkHostAccess`: denylist wins, empty allowlist allows all) | `tests/t_props.nim` property "checkHostAccess: denylist wins; empty allowlist allows all"; `tests/t_security.nim` suite "checkHostAccess" |
+| Transfer ID (TID) lock rejects off-TID DATA/ACK/ERROR/garbage | `tests/t_hostile.nim` coverage-guided stateful property `testId: "hostile.offTidInjection"` ("off-TID DATA/ACK/ERROR/garbage is rejected by the TID lock, never raises a Defect", D8b), its run-level anti-vacuity assertion (`d8bLiveInjections>0` — off-TID packets genuinely land mid-flight — and `d8bBounceTotal>0` — `recvOnce`'s TID-mismatch/ERROR-bounce arm actually fired), plus the deterministic companion test "off-TID DATA is bounced" |
+| Never-throw-Defect discipline — `protocol.decode` | `tests/t_props.nim` fuzz property `testId: "protocol.decode"` (allowed: `TftpDecodeError` only) |
+| …option negotiation (`negotiateServerOptions`, `validateAndParseOack`) | `tests/t_props.nim` fuzz properties `testId: "options.negotiateServerOptions"` (allowed: `ValueError` only) and `testId: "options.validateAndParseOack"` (total — no exception at all permitted); `tests/t_symex.nim` bounded `sxUnsat` proofs (`tIndexError`/`tFieldDefect`) and validated `sxRaised` witnesses over 8 per-arm parser twins (z3 image, opt-in) |
+| …netascii decoder/encoder | `tests/t_netascii.nim` fuzz properties `testId: "netascii.NetasciiDecoder.feed"` and `testId: "netascii.NetasciiEncoder.feed"` |
+| …path/write-access parsers | `tests/t_security.nim` fuzz properties `testId: "security.validatePath.lexical"` and `testId: "security.checkWriteAccess.reservedLexical"` (both total — no exception of any kind permitted) |
+| …`.md5` sidecar writer | `tests/t_checksum.nim` fuzz property `testId: "checksum.writeSidecar"` |
+| …event queue | `tests/t_eventqueue.nim` fuzz property `testId: "eventqueue.opseq"` |
+| …a live session under forged/garbage injection | `tests/t_hostile.nim` coverage-guided stateful property `testId: "hostile.payloadInjection"` ("injected forged/garbage DATA/ACK/ERROR never raises a Defect", D8a) — drives real `sendBlocks`/`recvBlocks` (both `{.cover.}`-instrumented, along with `recvOnce`) over a `proptest/stateful` state machine, with a run-level anti-vacuity assertion (`d8aLiveInjections>0`) proving injections genuinely reach a live in-flight DATA/ACK window, not only the post-transfer dally epilogue. **Scope (R1-7, documented narrowing):** the hostile-session harness covers the post-negotiation *data phase* (`sendBlocks`/`recvBlocks`); the RRQ/WRQ + OACK *negotiation phase* (`handleRrq`/`handleWrq`) is **not** yet driven under hostile injection. Extending to it needs a real request/OACK-speaking client counterpart plus per-example disk setup/teardown — a separate harness slice, tracked as a follow-up, not closed here. |
+| …the public API facade (`src/chapulin/api.nim`) itself | **No dedicated fuzz/stateful target drives hostile bytes through `api.nim`'s own entry points** (`request`/`poll`/`drain`/session teardown). Coverage today is *transitive*: `t_hostile.nim` exercises the same `sendBlocks`/`recvBlocks` primitives `api.nim` wraps, and every parser it calls into is fuzzed individually above — but nothing proves the facade's own `except CatchableError` boundaries (`api.nim:411,586,635,668`) under load. **Follow-up, not a blocker**: a `stateful` property over a `TftpSession` (or embedding-API surface, per RFC #17) would close this directly. |
+| Option bounds-checking/clamping; numeric overflow → `ValueError` → `ERROR(8)` | `tests/t_props.nim` property "negotiateServerOptions clamps blocksize/windowsize to server limits", plus the `options.*` fuzz/symex targets listed above |
+| Event queue hard bound + oldest-drop under saturation (terminal events included) | `tests/t_eventqueue.nim` fuzz property `testId: "eventqueue.opseq"` — safety invariant `q.len <= cap` and drop-accounting invariant `pendingDropCount>0 ⇒ q.len==cap`, fuzzed over a mixed op sequence that includes terminal (`epComplete`/`epError`) event kinds |
+| `maxConcurrent` bounds simultaneous transfers | **No verifying target.** `tests/t_session.nim` only round-trips `maxConcurrent` through config parsing (`config.maxConcurrent == 5`); nothing tests that the (N+1)th concurrent transfer is actually rejected/queued. The verification-harness RFC scoped this out deliberately ("resource bookkeeping over trusted config, not a parse/Defect surface") — a reasonable call for *this* RFC, but the enforcement path itself is genuinely untested today. Flagged here as a follow-up for a future (non-fuzzing) test slice, not a gap this RFC should have closed. |
+| Transfer transports allocated from a bounded port range | `tests/t_server.nim` suite "allocateTransferTransport — port-range retry (RFC design-bar-closure D2)" — example tests (advances through the range on `OSError`, reports not-bound when exhausted, binds directly when unconfigured) |
+| Information-leak hygiene — `redactRoot` | `tests/t_server.nim` property "redactRoot never leaves rootDir as a substring of its output, never a Defect" |
+| …`sanitizeForDisplay` | `tests/t_format.nim` properties (never a raw control byte except `?`; length-preserving; high bytes pass through unchanged); `tests/t_api.nim` suite "API - sanitizeForDisplay" (example tests at the facade level) |
 
 ## Security non-goals
 

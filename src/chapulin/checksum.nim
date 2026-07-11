@@ -8,6 +8,7 @@
 import std/[os, md5]
 import server_config
 import security
+import coverpragma
 
 type
   Digester* = ref object
@@ -55,7 +56,7 @@ proc finalize*(d: Digester): string =
     md5Final(ctxCopy, digest)
     $digest
 
-proc writeSidecar*(rootDir, resolvedPath, digest: string): tuple[ok: bool, err: string] =
+proc writeSidecar*(rootDir, resolvedPath, digest: string): tuple[ok: bool, err: string] {.cover.} =
   ## Writes the `.md5` sidecar next to `resolvedPath`. NEVER raises.
   ##
   ## Sidecar text format matches the pre-existing server.nim generateChecksum: `<hexdigest>  <basename>\n`.

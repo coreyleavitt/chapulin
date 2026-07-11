@@ -12,6 +12,8 @@ import std/options
 import ../src/chapulin/eventqueue
 import ../src/chapulin/logging
 import ../src/chapulin/protocol
+import proptest
+import fuzzsupport
 
 proc mkProgress(id: TransferId, bytes: int64): Event =
   Event(xfrId: id, srvId: NoServer, kind: evTransferProgress,
@@ -364,3 +366,122 @@ suite "EventQueue — progressKey invariant (observed via push/pop behavior)":
     q.push(mkProgress(a, 2))
     q.push(mkProgress(b, 2))
     check q.len == 2   # each coalesced independently, not cross-id
+
+# ---------------------------------------------------------------------------
+# Slice 6 (RFC verification-harness.md D6): forAll over a random SEQUENCE of
+# push/pop operations -- a plain `Strategy[seq[Op]]`, not proptest `stateful`
+# (D6: this is a flat invariant, not a rule-precondition state machine).
+#
+# This REPLACES the example-only H1 suites above ("bounded eviction +
+# dropped-count", "H1: cap is a true absolute ceiling", "R2-L1: cap >= 2
+# precondition" -- those covered only hand-picked sequences) with arbitrary
+# op sequences checked after EVERY op. The coalescing invariant is carried
+# over per D6's explicit "either/or, don't drop it" allowance: it gets its
+# own per-op assertion below (`hadLiveKey` check) *and* the pre-existing
+# "coalescing" / "cross-kind ordering" / "progressKey invariant" suites
+# above are left in place (not part of the H1 replacement) as the scoped
+# examples D6 alludes to.
+#
+# Field names verified directly against src/chapulin/eventqueue.nim: `order`,
+# `payload`, `progressKey`, `cap`, `droppedLogCount` are all UNEXPORTED
+# (module-private) -- unreachable from this test module by design (the
+# module's own doc-comment calls out `progressKey`/`payload` consistency as
+# a single-owner invariant). Rather than guess around that, two minimal
+# read-only introspection procs were added to eventqueue.nim for this slice:
+# `hasLiveProgressKey(q, id)` (the observable form of the progressKey
+# invariant) and `pendingDropCount(q)` (renamed off the private field name
+# to avoid same-name field/proc shadowing) -- no mutation surface added.
+# ---------------------------------------------------------------------------
+
+type
+  EqOpKind = enum eqPush, eqPop
+  EqPushKind = enum epLog, epProgress, epStarted, epComplete, epError
+
+  EqOp = object
+    case kind: EqOpKind
+    of eqPush:
+      pk:  EqPushKind
+      id:  TransferId
+      val: int
+    of eqPop:
+      discard
+
+const EqCap = 5
+  ## Small and fixed: H1 saturation (evictOneLog/evictOldestAny/the
+  ## pending-warning reservation loop) must actually trigger within a
+  ## bounded op sequence, not just in a hypothetical overflow.
+
+proc mkErrorEv(id: TransferId): Event =
+  Event(xfrId: id, srvId: NoServer, kind: evTransferError,
+        errorCode: none(TftpErrorCode), errorMsg: "boom",
+        snap: TransferSnapshot(bytes: 0, total: none(int64),
+                               requested: TransferParams(blocksize: 512, windowsize: 1),
+                               effective: some(TransferParams(blocksize: 512, windowsize: 1)),
+                               direction: tdGet, mode: tmOctet, startedAt: 0.0))
+
+proc eventFor(op: EqOp): Event =
+  case op.pk
+  of epLog:      mkLog("m" & $op.val)
+  of epProgress: mkProgress(op.id, int64(op.val))
+  of epStarted:  mkStarted(op.id)
+  of epComplete: mkComplete(op.id)
+  of epError:    mkErrorEv(op.id)
+
+proc eqIds(): Strategy[TransferId] =
+  ## Few distinct ids (1..3): forces repeat-id pushes so the coalescing
+  ## and protected-event-eviction paths are actually exercised, not just
+  ## hit once each.
+  integers(1, 3).map(proc(n: int): TransferId = TransferId(n))
+
+proc eqPushOp(): Strategy[EqOp] =
+  sampledFrom(@[epLog, epProgress, epStarted, epComplete, epError]).flatMap(
+    proc(pk: EqPushKind): Strategy[EqOp] =
+      eqIds().flatMap(proc(id: TransferId): Strategy[EqOp] =
+        integers(0, 1000).map(proc(v: int): EqOp =
+          EqOp(kind: eqPush, pk: pk, id: id, val: v))))
+
+proc eqOp(): Strategy[EqOp] =
+  oneOf([eqPushOp(), just(EqOp(kind: eqPop))])
+
+proc eqOps(maxLen = 60): Strategy[seq[EqOp]] =
+  lists(eqOp(), minLen = 0, maxLen = maxLen)
+
+proc eventQueueOpSeqOracle(ops: seq[EqOp]): bool =
+  ## Replays `ops` against a fresh EqCap-bounded EventQueue, checking after
+  ## EVERY op:
+  ##  - safety (H1): q.len <= EqCap;
+  ##  - coalescing: a progress push for an id that already has a live key
+  ##    (`hasLiveProgressKey`) is GUARANTEED to coalesce -- `push`'s
+  ##    coalesce branch runs unconditionally, before any cap/eviction
+  ##    logic (eventqueue.nim:279-281) -- so q.len must be unchanged;
+  ## and, scoped to push ops ONLY (D6: `tryPopFirst` never touches
+  ## `droppedLogCount`, so a pop right after a saturating push leaves
+  ## `pendingDropCount > 0` with `q.len == EqCap - 1` for that one op --
+  ## asserting the drop form after every op, pops included, is a false
+  ## negative):
+  ##  - drop-accounting: `pendingDropCount > 0` implies `q.len == EqCap`
+  ##    (a pending drop can only exist while the queue is genuinely full).
+  ## Never special-cases exceptions: any Defect escaping `push`/
+  ## `tryPopFirst` propagates uncaught out of this oracle and `ensure`
+  ## reports it as the falsification (never-throw discipline).
+  var q = initEventQueue(cap = EqCap)
+  for op in ops:
+    case op.kind
+    of eqPush:
+      let hadLiveKey = op.pk == epProgress and q.hasLiveProgressKey(op.id)
+      let lenBefore = q.len
+      q.push(eventFor(op))
+      if q.len > EqCap: return false
+      if hadLiveKey and q.len != lenBefore: return false
+      if q.pendingDropCount > 0 and q.len != EqCap: return false
+    of eqPop:
+      discard q.tryPopFirst()
+      if q.len > EqCap: return false
+  true
+
+suite "EventQueue — op-sequence property (RFC D6, slice 6)":
+
+  fuzzProperty("random push/pop sequences never break the safety, coalescing, or push-scoped drop-accounting invariants, and never raise a Defect",
+               "eventqueue.opseq"):
+    given ops in eqOps()
+    ensure eventQueueOpSeqOracle(ops)

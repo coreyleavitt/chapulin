@@ -3,6 +3,7 @@ import std/[strutils, asyncdispatch, os, options]
 import ../src/chapulin/protocol
 import ../src/chapulin/engine
 import ../src/chapulin/netascii
+import ../src/chapulin/blocksource
 import ../src/chapulin/api
 import helpers
 
@@ -707,12 +708,17 @@ suite "RRQ netascii recv side (RFC-conformance-closure D1c/d, slice 7b)":
     for (k, v) in rrq.options:
       check k != "tsize"
 
-  test "client GET under netascii decodes wire CR LF as local LF via NetasciiDecoder":
-    # Mirrors tdGet's own onData shape (api.nim ~:266-296): feed each block
-    # through a NetasciiDecoder, write the decoded bytes, and call
-    # finishNetasciiDecode at the block recognized as final (data.len <
-    # negotiated blocksize) -- proving the decode+write path reproduces the
-    # api.nim client GET call site without going through the session queue.
+  test "client GET under netascii decodes wire CR LF as local LF via makeRecvHandler":
+    # Mirrors tdGet's own onData shape (api.nim's setupGetTransfer): route
+    # each block through `makeRecvHandler` (netascii.nim) over a
+    # `fileBlockSink` (blocksource.nim), calling it with isFinal = (data.len
+    # < negotiated blocksize) -- proving the decode+write path reproduces
+    # the api.nim client GET call site without going through the session
+    # queue. (Previously drove a hand-rolled `NetasciiDecoder` +
+    # `finishNetasciiDecode` directly; that seam was deleted as dead
+    # production code post-slice-2 -- code-review S4-5 -- so this now
+    # exercises the same behavior through the surviving, actually-wired
+    # `makeRecvHandler`/`BlockSink` seam.)
     let path = getTempDir() / "t_client_netascii_get.tmp"
     let mt = newMockTransport()
     let wireBytes = @[byte('A'), byte('B'), byte('\r'), byte('\n'),
@@ -723,17 +729,14 @@ suite "RRQ netascii recv side (RFC-conformance-closure D1c/d, slice 7b)":
     var config = newDefaultConfig()
     config.mode = tmNetascii
 
-    var gfile = open(path, fmWrite)
-    var dec: NetasciiDecoder
+    let gfile = open(path, fmWrite)
+    let sink = fileBlockSink(gfile)
+    let recvHandler = makeRecvHandler(sink, tmNetascii)
     let onData = proc(blockNum: uint16, data: seq[byte]) =
-      let decoded = dec.feed(data)
-      if decoded.len > 0:
-        discard gfile.writeBytes(decoded, 0, decoded.len)
-      if data.len < config.blocksize:
-        finishNetasciiDecode(gfile, dec, true)
+      discard recvHandler(data, data.len < config.blocksize)
 
     let result = waitFor getFile(mt.toTransport, config, "127.0.0.1", 69, "netascii_get.txt", onData)
-    gfile.close()
+    sink.close()
 
     check result.success == true
     let content = readFile(path)

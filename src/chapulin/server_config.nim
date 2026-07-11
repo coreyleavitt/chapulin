@@ -1,6 +1,7 @@
 ## Server configuration types.
 
 import protocol
+import blocksource
 import std/strutils
 
 type
@@ -45,6 +46,18 @@ type
     checksumMode*: ChecksumMode ## Checksum sidecar mode (csNone = disabled)
     allowedHosts*: seq[string]
     deniedHosts*: seq[string]
+    sourceFactory*: BlockSourceFactory  ## RFC in-memory-sources-sinks.md §5.1.
+      ## nil (default) => file-backed (`resolveSourceFactory` in server.nim
+      ## folds in the existing `fileExists`/`getFileSize`/`open` logic).
+      ## Lives on `ServerConfig`, not `TftpServer`, because `handleRrq`
+      ## needs it and is called directly (no `TftpServer`) by ~20 tests, and
+      ## the factory needs `resolvedPath`, known only inside `handleRrq`.
+      ## NOTE: Nim's derived `==` over a nil-default `proc` field is
+      ## referential-identity once a factory is non-nil (two configs with
+      ## *different* non-nil factory closures compare unequal even if the
+      ## closures behave identically) -- fine for every current comparison
+      ## site (`t_session.nim:3180` compares two nil-factory configs).
+    sinkFactory*: BlockSinkFactory      ## Same contract, sink side.
 
 proc validateRangePair(minVal, maxVal, hardMin, hardMax: int; label: string) =
   ## Shared bounds-check for `newBlocksizeRange`/`newWindowsizeRange` (L7):

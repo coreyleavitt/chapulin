@@ -4,6 +4,7 @@ import std/os
 import std/strutils
 import protocol
 import server_config
+import coverpragma
 
 const SidecarExt* = ".md5"
   ## The server-owned checksum sidecar suffix (RFC checksum-integrity-error-
@@ -158,7 +159,7 @@ proc validateWritePath*(rootDir, absPath: string): tuple[ok: bool, err: string] 
   return (true, "")
 
 proc validatePath*(rootDir: string, filename: string): tuple[
-    valid: bool, resolved: string, err: string] =
+    valid: bool, resolved: string, err: string] {.cover.} =
   ## Validate a requested filename is safe and resolves within rootDir.
   ## Returns the resolved absolute path if valid.
   if filename.len == 0:
@@ -221,7 +222,7 @@ proc validatePath*(rootDir: string, filename: string): tuple[
   return (true, resolved, "")
 
 proc checkWriteAccess*(config: ServerConfig, resolvedPath: string): tuple[
-    ok: bool, errCode: TftpErrorCode, err: string] =
+    ok: bool, errCode: TftpErrorCode, err: string] {.cover.} =
   ## Check if writing to resolvedPath is allowed per the server's write policy.
   ##
   ## Reserved `.md5` namespace (RFC checksum-integrity-error-hygiene, Ds,

@@ -139,6 +139,41 @@ Single-threaded async I/O (`std/asyncdispatch`). Concurrent server transfers via
 
 See [design-philosophy.md](design-philosophy.md) for architectural decisions and rationale.
 
+## Verification harness
+
+Beyond the example/property test suite (`nimble test` / `scripts/dev-test.ps1`), chapulin carries a
+coverage-guided fuzzing + bounded symbolic-execution harness over the attacker-facing parse/containment
+surface — it *proves* the never-throw-Defect claims in [SECURITY.md](SECURITY.md#verification) rather than
+resting on code-review confidence. Full design: [docs/rfc/verification-harness.md](docs/rfc/verification-harness.md).
+
+**Fuzz/property suite** (pure Nim, no z3 — this is the default suite):
+```
+pwsh scripts/dev-test.ps1
+```
+`milpa` resolves dev-deps on the host, then each `tests/t_*.nim` file compiles and runs inside the nim
+devtools container. Coverage-guided targets (e.g. `t_props`, `t_security`, `t_netascii`, `t_checksum`,
+`t_eventqueue`, `t_hostile`) are compiled with a `-d:chapulinFuzz` define (`tests/nim.cfg`) that turns on
+`{.cover.}` instrumentation (`src/chapulin/coverpragma.nim`); off that define, `{.cover.}` is an exported
+no-op, so normal/release builds of `src/` never import the fuzzer and are byte-for-byte unaffected. Each
+fuzz target's crash corpus is committed under `tests/corpus/` (binary-protected via `.gitattributes`) and
+is automatically replayed and extended on every run via its `testId`.
+
+**Symex proof/witness suite** (opt-in — needs the z3-extended image, not part of the default run):
+```
+pwsh scripts/dev-test.ps1 -Only @('t_symex') -Image chapulin-symex:2.2.10
+```
+Any suite named `t_symex*` auto-selects the `chapulin-symex:2.2.10` image (built from `Dockerfile.symex`),
+so `-Image` is optional. This is the only place `import proptest/symex` (and transitively, z3 via the
+runtime-optional `nim-z3`/`softlink` binding) is linked in — it never reaches `src/` or the default suite.
+It produces bounded no-Defect proofs (`sxUnsat`) and validated raised-exception witnesses (`sxRaised`) over
+the option/OACK parsers.
+
+**The never-throw-Defect property, in one sentence:** hostile input to any fuzzed target degrades to a
+caught `CatchableError` (or a documented per-option default) — never an escaping Nim `Defect` — enforced
+per-target by an oracle proc, not asserted by convention. See
+[SECURITY.md's Verification section](SECURITY.md#verification) for the full claim-by-claim cross-reference
+to the exact test target that proves each one.
+
 ## License
 
 Apache 2.0

@@ -12,6 +12,7 @@ import checksum
 import logging
 import format
 import netascii
+import blocksource
 export logging
 
 type
@@ -386,6 +387,19 @@ proc negotiateWrq(req: NegotiationRequest, initialCfg: TransferConfig,
 
 # --- RRQ handler: serve file to client ---
 
+proc resolveSourceFactory(config: ServerConfig): BlockSourceFactory =
+  ## RFC in-memory-sources-sinks.md §5.1 -- resolve `config`'s injected
+  ## source factory, or the file-backed default (`defaultBlockSourceFactory`,
+  ## blocksource.nim -- hoisted there, code-review S4-1/S4-3, so this and
+  ## api.nim's equivalent share one implementation instead of two
+  ## hand-rolled copies). NEVER dereference `config.sourceFactory` directly
+  ## at a call site (nil-call hazard) -- every caller goes through this.
+  if config.sourceFactory != nil: config.sourceFactory else: defaultBlockSourceFactory()
+
+proc resolveSinkFactory(config: ServerConfig): BlockSinkFactory =
+  ## Same contract, sink side (`defaultBlockSinkFactory`, blocksource.nim).
+  if config.sinkFactory != nil: config.sinkFactory else: defaultBlockSinkFactory()
+
 proc generateDirListing(rootDir: string): string =
   ## Generate a directory listing of the TFTP root.
   for kind, path in walkDir(rootDir):
@@ -457,21 +471,40 @@ proc handleRrq*(config: ServerConfig, request: TftpPacket,
     await sendError(transport, clientHost, clientPort, errAccessViolation, pathErr)
     return failResult(pathErr, some(errAccessViolation))
 
-  if not fileExists(resolvedPath):
-    await sendError(transport, clientHost, clientPort, errFileNotFound, "File not found")
-    return failResult("File not found: " & request.filename, some(errFileNotFound))
-
-  let fileSize = getFileSize(resolvedPath)
-  var file: File
+  # RFC in-memory-sources-sinks.md §5.1: the standalone fileExists/
+  # getFileSize/open sequence is now folded into ONE factory call with the
+  # same three-outcome contract -- absent (`none`) => errFileNotFound,
+  # present-but-unopenable => errAccessViolation with the existing OS-detail
+  # redaction, opened (`some`) => transfer proceeds. A nil
+  # config.sourceFactory resolves to the file-backed default
+  # (`defaultBlockSourceFactory`, blocksource.nim) below, so behavior is
+  # byte-for-byte unchanged from the old direct calls.
+  #
+  # Catches BOTH `IOError` (the built-in default's raised type, matching a
+  # real `open` failure) AND `OSError` (code-review S4-1: `std/os.
+  # getFileSize` raises `OSError`, not `IOError` -- the built-in default
+  # re-raises it as `IOError`, but this is a bare closure type, so Nim
+  # cannot enforce that on an arbitrary INJECTED factory. Without this,
+  # an injected factory that raises `OSError` directly -- e.g. one that
+  # forwards a real `getFileSize` failure without translating it -- would
+  # escape this handler entirely: no client ERROR packet, and the
+  # exception propagates out of `handleRequest` since nothing there awaits
+  # this call inside a try/except either).
+  var opened: Option[OpenedSource]
   try:
-    file = open(resolvedPath, fmRead)
-  except IOError:
+    opened = resolveSourceFactory(config)(resolvedPath)
+  except IOError, OSError:
     let osDetail = getCurrentExceptionMsg()
     let osResult = await sendOsErrorAndFail(transport, clientHost, clientPort,
       errAccessViolation, config.rootDir, osDetail, "RRQ open failed")
     diagOut[] = osResult.diag
     return osResult.xfer
-  defer: file.close()
+  if opened.isNone:
+    await sendError(transport, clientHost, clientPort, errFileNotFound, "File not found")
+    return failResult("File not found: " & request.filename, some(errFileNotFound))
+  let (source, sizeOpt) = opened.get
+  let fileSize = sizeOpt.get(0'i64)
+  defer: source.close()
 
   let initialCfg = newTransferConfig(
     blocksize = DefaultBlocksize,
@@ -491,11 +524,14 @@ proc handleRrq*(config: ServerConfig, request: TftpPacket,
 
   # netascii translation is expansive and data-dependent, so the wire
   # offset of a given local byte can't be computed from blockNum*blocksize --
-  # the seek-addressed octet closure is invalid for netascii. makeSendReader
-  # (netascii.nim) owns that choice now; octet keeps its self-correcting seek
-  # closure untouched, just relocated inside that constructor.
-  var netasciiEnc: NetasciiEncoder
-  let readData = makeSendReader(file, request.mode, netasciiEnc)
+  # a seek-addressed read is invalid for netascii. makeSendReader
+  # (netascii.nim) owns the mode choice now: it wraps `source` in the
+  # netasciiBlockSource decorator under netascii, and reads it plain (forward-only,
+  # via blocksource.nim's toReadData/fileBlockSource) under octet -- see
+  # in-memory-sources-sinks.md §2 for why forward-only is behavior-preserving
+  # for octet too (sendBlocks never re-reads a block; retransmits replay its
+  # own windowCache).
+  let readData = makeSendReader(source, request.mode)
 
   # Checksum sidecar: only constructed when csMd5 is enabled, so the
   # csNone path (default) allocates nothing and passes onDelivered = nil into
@@ -508,7 +544,7 @@ proc handleRrq*(config: ServerConfig, request: TftpPacket,
   # Never digest/commit a sidecar for a served file that is ITSELF a
   # reserved .md5 name. A client legitimately downloading an existing
   # sidecar to verify a prior transfer must still be served in full (the
-  # fileExists/open/sendBlocks path above is untouched), but generating
+  # source-factory/sendBlocks path above is untouched), but generating
   # foo.md5.md5 here would let any RRQ of the newest sidecar grow an
   # unbounded, client-driven chain. Same isReservedSidecarName authority as
   # checkWriteAccess, so "what counts as reserved" cannot drift between the
@@ -590,16 +626,16 @@ proc handleWrq*(config: ServerConfig, request: TftpPacket,
 
   var xferConfig = negOutcome.xferConfig
 
-  var file: File
+  var sink: BlockSink
   try:
-    file = open(resolvedPath, fmWrite)
-  except IOError:
+    sink = resolveSinkFactory(config)(resolvedPath)
+  except IOError, OSError:
     let osDetail = getCurrentExceptionMsg()
     let osResult = await sendOsErrorAndFail(transport, clientHost, clientPort,
       errDiskFull, config.rootDir, osDetail, "WRQ open failed")
     diagOut[] = osResult.diag
     return osResult.xfer
-  defer: file.close()
+  defer: sink.close()
 
   if onStart != nil:
     onStart(mkTransferInfo(clientHost, clientPort, request.filename, "WRQ",
@@ -607,10 +643,10 @@ proc handleWrq*(config: ServerConfig, request: TftpPacket,
                            xferConfig.windowsize, request.mode, reqId,
                            negOutcome.requestedParams))
 
-  # Writes route through makeRecvSink (netascii.nim), which owns the
+  # Writes route through makeRecvHandler (netascii.nim), which owns the
   # decode-feed (undoing the wire's CR-LF/CR-NUL escaping under netascii)
   # AND the terminal finalize/flush -- see its doc for the exact contract.
-  let recvSink = makeRecvSink(file, request.mode)
+  let recvSink = makeRecvHandler(sink, request.mode)
 
   var writeError = ""
   let onData = proc(blockNum: uint16, data: seq[byte]) =

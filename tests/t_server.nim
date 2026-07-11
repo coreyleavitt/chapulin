@@ -1,5 +1,6 @@
 import unittest
 import std/[os, strutils, asyncdispatch, options]
+import proptest
 import ../src/chapulin/protocol
 import ../src/chapulin/transfer
 import ../src/chapulin/options
@@ -7,6 +8,7 @@ import ../src/chapulin/server_config
 import ../src/chapulin/security
 import ../src/chapulin/server
 import ../src/chapulin/netascii
+import ../src/chapulin/blocksource
 
 # --- Test helpers ---
 
@@ -509,38 +511,6 @@ suite "handleRrq — netascii send side (RFC-conformance-closure D1b/d, slice 7a
     check sent.opcode == opData  # NOT opOack -- tsize was the only option and it was dropped
     check sent.blockNum == 1
 
-suite "netascii finishNetasciiDecode — shared terminal-flush helper (D1c, slice 7b)":
-  test "flushes the trailing deferred CR to disk on success":
-    let path = testRoot / "finish_decode_success.tmp"
-    var f = open(path, fmWrite)
-    var dec: NetasciiDecoder
-    # A lone wire CR fed with nothing after it: `feed` defers classification
-    # (never resolves a CR via in-call lookahead) rather than writing anything.
-    let decoded = dec.feed(@[byte('A'), byte('\r')])
-    discard f.writeBytes(decoded, 0, decoded.len)
-    check decoded == @[byte('A')]  # the CR itself is still pending, not yet written
-
-    let ok = finishNetasciiDecode(f, dec, true)
-    f.close()
-    # flush() resolves the trailing lone CR to a literal CR (R2) and it is
-    # written as the file's final byte.
-    check readFile(path) == "A\r"
-    check ok == true  # Fix A: terminal write succeeded -- surfaced, not swallowed
-
-  test "does NOT flush a partial decode on failure/abort":
-    let path = testRoot / "finish_decode_failure.tmp"
-    var f = open(path, fmWrite)
-    var dec: NetasciiDecoder
-    let decoded = dec.feed(@[byte('A'), byte('\r')])
-    discard f.writeBytes(decoded, 0, decoded.len)
-
-    # success = false: a failed/aborted transfer must not flush the pending
-    # CR as if the stream had ended cleanly.
-    let ok = finishNetasciiDecode(f, dec, false)
-    f.close()
-    check readFile(path) == "A"  # trailing CR never materialized
-    check ok == true  # nothing was attempted -- not itself a failure
-
 suite "handleWrq — netascii recv side (RFC-conformance-closure D1c, slice 7b)":
   test "CR LF to LF round trip: wire CR LF arrives as local LF on disk":
     let sm = newServerMock()
@@ -582,7 +552,7 @@ suite "handleWrq — netascii recv side (RFC-conformance-closure D1c, slice 7b)"
     let expected = "AB" & "\n" & "CD" & "\r" & "EF"
     check readFile(testRoot / "netascii_wrq_interop.txt") == expected
 
-  test "trailing deferred CR at true end-of-stream is flushed via finishNetasciiDecode":
+  test "trailing deferred CR at true end-of-stream is flushed via netasciiBlockSink.finish":
     let sm = newServerMock()
     let wireBytes = @[byte('A'), byte('B'), byte('\r')]  # ends in a lone CR
     sm.addResponse(makeDataPkt(1, wireBytes))
@@ -1219,6 +1189,213 @@ suite "Redacted operator diagnostics (slice 6, D2 follow-on)":
       removeFile(resolvedPath & ".md5")
 
     removeDir(outsideDir)
+
+suite "redactRoot — information-leak hygiene control (RFC verification-harness.md, committed fork)":
+  # Named SECURITY.md-adjacent control (RFC "Open forks" section): zero
+  # coverage before this slice. Plain `property` (not coverage-guided per
+  # the RFC's own call — a handful-of-lines pure string function, no
+  # `fuzzProperty`/`{.cover.}` needed). `redactRoot` strips every occurrence
+  # of `rootDir` from `msg`; asserted here for a `rootDir` embedded zero or
+  # more times amid arbitrary noise. `rootDir` is generated with `minLen = 1`
+  # deliberately: `redactRoot` documents `rootDir.len == 0` as a pass-through
+  # no-op, and Nim's `"" in s` is vacuously true for any `s`, so an empty
+  # `rootDir` would make the invariant `rootDir notin result` trivially and
+  # meaninglessly fail.
+  proc pathCharsToStr(cs: seq[char]): string =
+    result = newStringOfCap(cs.len)
+    for c in cs: result.add c
+
+  proc pathLikeStrings(minLen = 0, maxLen = 10): Strategy[string] =
+    lists(sampledFrom(@['a', 'b', 'c', '/', '\\', '.', '_', '0', '1']),
+          minLen = minLen, maxLen = maxLen).map(pathCharsToStr)
+
+  property "redactRoot never leaves rootDir as a substring of its output, never a Defect":
+    given root in pathLikeStrings(1, 10), noiseA in pathLikeStrings(),
+          noiseB in pathLikeStrings(), copies in integers(0, 3)
+    var msg = noiseA
+    for i in 0 ..< copies:
+      msg = msg & root & noiseB
+    ensure root notin redactRoot(root, msg)
+
+suite "handleRrq/handleWrq — injected BlockSource/BlockSink factories (RFC in-memory-sources-sinks.md §5.1, slice 4)":
+  test "RRQ serves from an injected memory sourceFactory: bytes + tsize match, zero real file I/O":
+    let sm = newServerMock()
+    sm.addResponse(makeAckPkt(0))  # client ACKs the OACK (tsize was requested)
+    sm.addResponse(makeAckPkt(1))  # client ACKs DATA(1)
+
+    let knownBytes = cast[seq[byte]]("in-memory RRQ payload, served with zero disk I/O")
+    var config = newDefaultServerConfig(testRoot)
+    config.sourceFactory = proc(path: string): Option[OpenedSource] =
+      if path.extractFilename == "memfile.bin":
+        some((memoryBlockSource(knownBytes), some(knownBytes.len.int64)))
+      else:
+        none(OpenedSource)
+
+    let request = TftpPacket(opcode: opRrq, filename: "memfile.bin",
+                              mode: tmOctet, options: @[("tsize", "0")])
+    let result = waitFor handleRrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000)
+
+    check result.success == true
+    check result.bytesTransferred == knownBytes.len
+    check not fileExists(testRoot / "memfile.bin")  # never touched real disk
+
+    let oack = decode(sm.sentPackets[0].data)
+    check oack.opcode == opOack
+    check ("tsize", $knownBytes.len) in oack.oackOptions
+
+    let dataPkt = decode(sm.sentPackets[1].data)
+    check dataPkt.opcode == opData
+    check dataPkt.data == knownBytes
+
+  test "WRQ writes through an injected memory sinkFactory: bytes accumulate, no real file created":
+    let sm = newServerMock()
+    sm.addResponse(makeDataPkt(1, @[byte 10, 20, 30, 40]))
+
+    let buf = new(seq[byte])
+    var config = newDefaultServerConfig(testRoot)
+    config.writePolicy = wpCreateOrOverwrite
+    config.sinkFactory = proc(path: string): BlockSink = memoryBlockSink(buf)
+
+    let request = TftpPacket(opcode: opWrq, filename: "memupload.bin",
+                              mode: tmOctet, options: @[])
+    let result = waitFor handleWrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000)
+
+    check result.success == true
+    check buf[] == @[byte 10, 20, 30, 40]
+    check not fileExists(testRoot / "memupload.bin")  # sink is entirely in-memory
+
+  test "injected sourceFactory returning none yields errFileNotFound (raise-preserving contract)":
+    let sm = newServerMock()
+    var config = newDefaultServerConfig(testRoot)
+    config.sourceFactory = proc(path: string): Option[OpenedSource] = none(OpenedSource)
+
+    let request = TftpPacket(opcode: opRrq, filename: "anything.bin",
+                              mode: tmOctet, options: @[])
+    let result = waitFor handleRrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000)
+
+    check result.success == false
+    check result.errorCode == some(errFileNotFound)
+    let sent = decode(sm.sentPackets[0].data)
+    check sent.opcode == opError
+    check sent.errorCode == errFileNotFound
+
+  test "injected sourceFactory raising IOError yields errAccessViolation, no OS detail leak":
+    let sm = newServerMock()
+    var config = newDefaultServerConfig(testRoot)
+    config.sourceFactory = proc(path: string): Option[OpenedSource] =
+      raise newException(IOError, "permission denied: " & (testRoot / path))
+
+    let request = TftpPacket(opcode: opRrq, filename: "anything.bin",
+                              mode: tmOctet, options: @[])
+    let result = waitFor handleRrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000)
+
+    check result.success == false
+    check result.errorCode == some(errAccessViolation)
+    check result.errorMsg == clientSafeError(errAccessViolation)
+    check testRoot notin result.errorMsg
+    let sent = decode(sm.sentPackets[0].data)
+    check sent.opcode == opError
+    check sent.errorCode == errAccessViolation
+
+  test "injected sourceFactory raising OSError (not IOError) still yields errAccessViolation, never escapes (S4-1)":
+    # Regression coverage for code-review S4-1: `std/os.getFileSize` raises
+    # `OSError`, not `IOError` -- the file-backed default factory folds a
+    # size-query failure into the same `IOError` outcome (see
+    # `defaultBlockSourceFactory`, blocksource.nim), but an arbitrary
+    # INJECTED factory is just a bare closure, so nothing stops one from
+    # raising `OSError` directly (e.g. forwarding a real `getFileSize`
+    # failure without translating it). Before this fix, `handleRrq` caught
+    # only `except IOError` here, so this `OSError` would escape the
+    # handler entirely -- no client ERROR packet, and (since nothing awaits
+    # `handleRrq` inside a try/except at the `handleRequest` call site
+    # either) it could propagate further still. This must instead behave
+    # exactly like the IOError case above: an ERROR(2)/errAccessViolation
+    # packet and a failed, non-raising TransferResult.
+    let sm = newServerMock()
+    var config = newDefaultServerConfig(testRoot)
+    config.sourceFactory = proc(path: string): Option[OpenedSource] =
+      raise newException(OSError, "getFileSize failed: " & (testRoot / path))
+
+    let request = TftpPacket(opcode: opRrq, filename: "anything.bin",
+                              mode: tmOctet, options: @[])
+    let result = waitFor handleRrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000)
+
+    check result.success == false
+    check result.errorCode == some(errAccessViolation)
+    check result.errorMsg == clientSafeError(errAccessViolation)
+    check testRoot notin result.errorMsg
+    let sent = decode(sm.sentPackets[0].data)
+    check sent.opcode == opError
+    check sent.errorCode == errAccessViolation
+
+  test "injected sinkFactory raising IOError yields errDiskFull, matching the file-backed default's path":
+    let sm = newServerMock()
+    var config = newDefaultServerConfig(testRoot)
+    config.writePolicy = wpCreateOrOverwrite
+    config.sinkFactory = proc(path: string): BlockSink =
+      raise newException(IOError, "no space left on device")
+
+    let request = TftpPacket(opcode: opWrq, filename: "anything.bin",
+                              mode: tmOctet, options: @[])
+    let result = waitFor handleWrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000)
+
+    check result.success == false
+    check result.errorCode == some(errDiskFull)
+    # No-option WRQ negotiation sends a bare ACK(0) BEFORE the sink is even
+    # constructed (negotiateCore's clientOptsFor==0 branch), so the ERROR
+    # packet from the failed sinkFactory is NOT sentPackets[0] -- scan for it,
+    # mirroring the existing "WRQ open failure" tests' pattern.
+    var foundError = false
+    for pkt in sm.sentPackets:
+      let decoded = decode(pkt.data)
+      if decoded.opcode == opError:
+        foundError = true
+        check decoded.errorCode == errDiskFull
+    check foundError
+
+  test "injected sinkFactory raising OSError (not IOError) still yields errDiskFull, never escapes (S4-1)":
+    # WRQ-side sibling of the RRQ "injected sourceFactory raising OSError"
+    # regression above: an arbitrary INJECTED sinkFactory is just a bare
+    # closure, so nothing stops one from raising `OSError` directly (e.g.
+    # forwarding a real filesystem failure without translating it to
+    # `IOError`). Before this fix, `handleWrq` caught only `except IOError`
+    # here, so this `OSError` would escape the handler entirely -- no client
+    # ERROR packet (just a timeout), and it could propagate further still
+    # since nothing awaits `handleWrq` inside a try/except at the
+    # `handleRequest` call site either. This must instead behave exactly
+    # like the IOError case above: an ERROR/errDiskFull packet (the
+    # pre-existing WRQ open-failure code, unchanged) and a failed,
+    # non-raising TransferResult.
+    let sm = newServerMock()
+    var config = newDefaultServerConfig(testRoot)
+    config.writePolicy = wpCreateOrOverwrite
+    config.sinkFactory = proc(path: string): BlockSink =
+      raise newException(OSError, "no space left on device")
+
+    let request = TftpPacket(opcode: opWrq, filename: "anything.bin",
+                              mode: tmOctet, options: @[])
+    let result = waitFor handleWrq(config, request, sm.toTransport,
+                           "10.0.0.1", 5000)
+
+    check result.success == false
+    check result.errorCode == some(errDiskFull)
+    # No-option WRQ negotiation sends a bare ACK(0) BEFORE the sink is even
+    # constructed (negotiateCore's clientOptsFor==0 branch), so the ERROR
+    # packet from the failed sinkFactory is NOT sentPackets[0] -- scan for it,
+    # mirroring the existing "WRQ open failure" tests' pattern.
+    var foundError = false
+    for pkt in sm.sentPackets:
+      let decoded = decode(pkt.data)
+      if decoded.opcode == opError:
+        foundError = true
+        check decoded.errorCode == errDiskFull
+    check foundError
 
 suite "Server test cleanup":
   test "remove test files":

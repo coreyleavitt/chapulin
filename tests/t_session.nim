@@ -17,6 +17,7 @@ import ../src/chapulin/server
 import ../src/chapulin/server_config
 import ../src/chapulin/protocol
 import ../src/chapulin/transfer
+import ../src/chapulin/blocksource
 import ./wireharness
 import ./helpers
 
@@ -3348,3 +3349,194 @@ suite "BlocksizeRange / WindowsizeRange — constructor-level rejection (D8 slic
         rootDir = "/srv/tftp",
         blocksizeRange = newBlocksizeRange(512, 4096),
         windowsizeRange = newWindowsizeRange(100, 4))
+
+# ---------------------------------------------------------------------------
+# Slice 3 (RFC in-memory-sources-sinks.md, §5.1): client-side
+# sourceFactory/sinkFactory injection on TftpSession/newSession. Mirrors the
+# transportFactory/listenerFactory test idiom used throughout this file --
+# the only difference is that the client's local file I/O is also routed
+# through an in-memory adapter (memoryBlockSource/memoryBlockSink), so a
+# full client<->server transfer runs with ZERO disk I/O on the CLIENT side.
+# The server side is untouched (real files, real handleRrq/handleWrq) --
+# server-side factory injection is slice 4, out of scope here.
+# ---------------------------------------------------------------------------
+suite "TftpSession — client BlockSource/BlockSink factory injection (slice 3)":
+
+  test "PUT with injected sourceFactory sends from memory -- never opens localPath":
+    let tmpDir = getTempDir() / "chapulin_t_session_put_mem"
+    createDir(tmpDir)
+    defer: (try: removeDir(tmpDir) except: discard)
+
+    var serverCfg = newDefaultServerConfig(tmpDir)
+    serverCfg.writePolicy = wpCreateOrOverwrite
+
+    let w = newWire()
+    let serverT = makeTransport(w, sideA = false)
+    proc serverRespond(): Future[void] {.async.} =
+      let (data, host, port) = await serverT.recv(576, 5000)
+      let pkt = decode(data)
+      discard await handleWrq(serverCfg, pkt, serverT, host, port)
+    discard serverRespond()
+
+    let payloadStr = "Upload this from RAM, never touching disk!"
+    let knownBytes = cast[seq[byte]](payloadStr)
+
+    # localPath deliberately points at a file that does NOT exist -- the
+    # injected sourceFactory must be the ONLY thing consulted; if the old
+    # hardcoded `open(req.localPath, fmRead)` path were still live, this
+    # would fail pre-launch instead of transferring knownBytes.
+    let phantomPath = getTempDir() / "chapulin_t_session_put_mem_NOFILE.bin"
+    check not fileExists(phantomPath)
+
+    let s = newSession(
+      transportFactory = proc(h: string, p: int): Transport = makeTransport(w, sideA = true),
+      sourceFactory = proc(path: string): Option[OpenedSource] =
+        some((memoryBlockSource(knownBytes), some(knownBytes.len.int64))))
+
+    var req = newTransferRequest("peer", 0, "mem_upload.bin", phantomPath, tdPut)
+    let id = s.startTransfer(req)
+    check id != NoTransfer
+
+    let evs = driveSession(s, id)
+    check evs[^1].kind == evTransferComplete
+
+    # Peer (real server) received exactly the in-memory bytes.
+    let receivedFile = tmpDir / "mem_upload.bin"
+    check fileExists(receivedFile)
+    check readFile(receivedFile) == payloadStr
+
+    # localPath was never touched -- still absent.
+    check not fileExists(phantomPath)
+
+  test "GET with injected sinkFactory writes to memory -- never creates localPath":
+    let tmpDir = getTempDir() / "chapulin_t_session_get_mem"
+    createDir(tmpDir)
+    let serverFile = tmpDir / "hello.txt"
+    let payloadStr = "Hello from an in-memory sink!"
+    let expectedBytes = cast[seq[byte]](payloadStr)
+    writeFile(serverFile, payloadStr)
+    defer: (try: removeDir(tmpDir) except: discard)
+
+    let serverCfg = newDefaultServerConfig(tmpDir)
+    let w = newWire()
+    let serverT = makeTransport(w, sideA = false)
+    proc serverRespond(): Future[void] {.async.} =
+      let (data, host, port) = await serverT.recv(576, 5000)
+      let pkt = decode(data)
+      discard await handleRrq(serverCfg, pkt, serverT, host, port)
+    discard serverRespond()
+
+    var memBuf = new(seq[byte])
+
+    # localOut deliberately points at a path that does NOT exist -- if the
+    # old hardcoded lazy `open(req.localPath, fmWrite)` were still live, this
+    # would create the file on the first DATA packet.
+    let localOut = getTempDir() / "chapulin_t_session_get_mem_NOFILE.bin"
+    check not fileExists(localOut)
+
+    let s = newSession(
+      transportFactory = proc(h: string, p: int): Transport = makeTransport(w, sideA = true),
+      sinkFactory = proc(path: string): BlockSink = memoryBlockSink(memBuf))
+
+    var req = newTransferRequest("peer", 0, "hello.txt", localOut, tdGet)
+    let id = s.startTransfer(req)
+    check id != NoTransfer
+
+    let evs = driveSession(s, id)
+    check evs[^1].kind == evTransferComplete
+
+    check memBuf[] == expectedBytes
+    check not fileExists(localOut)   # zero client-side disk I/O
+
+  # --- S4-2 (code-review): error-path coverage. The above two tests only
+  # exercised the `some`/success outcome for each injected factory; the
+  # public facade's "never raises" promise is only actually proven by also
+  # driving the failure outcomes to `evTransferError` rather than a raw
+  # exception escaping `startTransfer`/onData. Mirrors the server-side
+  # (handleRrq/handleWrq) injected-factory failure tests in t_server.nim.
+
+  test "PUT with injected sourceFactory returning none surfaces as evTransferError, never raises":
+    let w = newWire()
+    let s = newSession(
+      transportFactory = proc(h: string, p: int): Transport = makeTransport(w, sideA = true),
+      sourceFactory = proc(path: string): Option[OpenedSource] = none(OpenedSource))
+
+    var req = newTransferRequest("peer", 0, "mem_upload.bin", "irrelevant_local_path.bin", tdPut)
+    let id = s.startTransfer(req)
+    check id != NoTransfer   # startTransfer itself never raises (Invariant 2)
+
+    let evs = driveSession(s, id)
+    check evs[^1].kind == evTransferError
+    check evs[^1].errorMsg.len > 0
+
+  test "PUT with injected sourceFactory raising IOError (present-but-unopenable) surfaces as evTransferError, never raises":
+    let w = newWire()
+    let s = newSession(
+      transportFactory = proc(h: string, p: int): Transport = makeTransport(w, sideA = true),
+      sourceFactory = proc(path: string): Option[OpenedSource] =
+        raise newException(IOError, "simulated present-but-unopenable source"))
+
+    var req = newTransferRequest("peer", 0, "mem_upload.bin", "irrelevant_local_path.bin", tdPut)
+    let id = s.startTransfer(req)
+    check id != NoTransfer
+
+    let evs = driveSession(s, id)
+    check evs[^1].kind == evTransferError
+    check "simulated present-but-unopenable source" in evs[^1].errorMsg
+
+  test "GET with injected sinkFactory raising IOError on first onData surfaces as evTransferError, without crashing (recvSink stays nil -- cleanup guard, api.nim)":
+    # Before the sink is ever successfully opened, `recvSink` (the onData
+    # write handler) is still nil -- setupGetTransfer's cleanup closure
+    # gates on `recvSink != nil` before calling `gsink.close()` precisely so
+    # a not-yet-constructed `gsink` (whose closure fields are all nil,
+    # since the factory raised before ever returning a BlockSink) is never
+    # `.close()`-d. Were that guard removed or miswired, this test would
+    # crash the whole process with a NilAccessDefect (uncatchable) rather
+    # than failing a `check` -- the crash itself is the regression signal.
+    let tmpDir = getTempDir() / "chapulin_t_session_get_sink_ioerror"
+    createDir(tmpDir)
+    let serverFile = tmpDir / "hello.txt"
+    # Deliberately > DefaultBlocksize (512) so the transfer spans at least
+    # two DATA blocks: `recvBlocks` (transfer.nim) only re-checks
+    # `cancelCheck` at the TOP of its loop, before receiving the NEXT
+    # packet -- a single-block (all-in-one-final-block) payload would
+    # `break` straight to the success epilogue right after the one onData
+    # call that set `writeError`, without ever re-observing it. A
+    # non-final first block forces a second loop iteration, where
+    # `combinedCancel` (api.nim) is actually consulted.
+    writeFile(serverFile, "x".repeat(600))
+    defer: (try: removeDir(tmpDir) except: discard)
+
+    let serverCfg = newDefaultServerConfig(tmpDir)
+    let w = newWire()
+    let serverT = makeTransport(w, sideA = false)
+    proc serverRespond(): Future[void] {.async.} =
+      let (data, host, port) = await serverT.recv(576, 5000)
+      let pkt = decode(data)
+      discard await handleRrq(serverCfg, pkt, serverT, host, port)
+    discard serverRespond()
+
+    let localOut = getTempDir() / "chapulin_t_session_get_sink_ioerror_NOFILE.bin"
+    check not fileExists(localOut)
+
+    let s = newSession(
+      transportFactory = proc(h: string, p: int): Transport = makeTransport(w, sideA = true),
+      sinkFactory = proc(path: string): BlockSink =
+        raise newException(IOError, "cannot open sink for writing"))
+
+    var req = newTransferRequest("peer", 0, "hello.txt", localOut, tdGet)
+    let id = s.startTransfer(req)
+    check id != NoTransfer
+
+    let evs = driveSession(s, id)
+    check evs[^1].kind == evTransferError
+    # The specific "Cannot open file for writing" text lives in
+    # setupGetTransfer's local `writeError` -- recvBlocks (transfer.nim)
+    # only sees it through the boolean `combinedCancel` gate, so the
+    # TransferResult it returns carries the generic cancellation message,
+    # not the original cause. What this test actually pins is the
+    # never-raises/never-crashes contract: `evTransferError`, not a
+    # raw exception or a NilAccessDefect from cleanup calling `gsink.close()`
+    # on a never-successfully-constructed sink.
+    check evs[^1].errorMsg.len > 0
+    check not fileExists(localOut)   # the sink was never opened, let alone written to

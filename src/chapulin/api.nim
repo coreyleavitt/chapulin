@@ -5,6 +5,7 @@ import std/asyncdispatch
 import engine
 import protocol
 import netascii
+import blocksource
 export Transport, CancelCheck, TransportTimeoutError,
        TransferResult, DefaultBlocksize, DefaultTimeout,
        DefaultRetries, DefaultWindowsize, MinWindowsize, MaxWindowsize,
@@ -108,6 +109,8 @@ type
     minLogLevel:      LogLevel
     transportFactory: TransportFactory
     listenerFactory:  ListenerFactory
+    sourceFactory:    BlockSourceFactory
+    sinkFactory:      BlockSinkFactory
     servers:          Table[uint32, ServerEntry]
     nextServerId:     uint32
 
@@ -145,7 +148,9 @@ proc mkSnap(bytes: int64, total: Option[int64],
 
 proc newSession*(minLogLevel: LogLevel = llInfo,
                  transportFactory: TransportFactory = nil,
-                 listenerFactory:  ListenerFactory = nil): TftpSession =
+                 listenerFactory:  ListenerFactory = nil,
+                 sourceFactory:    BlockSourceFactory = nil,
+                 sinkFactory:      BlockSinkFactory = nil): TftpSession =
   let factory =
     if transportFactory != nil: transportFactory
     else:
@@ -158,11 +163,27 @@ proc newSession*(minLogLevel: LogLevel = llInfo,
     minLogLevel:      minLogLevel,
     transportFactory: factory,
     listenerFactory:  listenerFactory,
+    sourceFactory:    sourceFactory,
+    sinkFactory:      sinkFactory,
     servers:          initTable[uint32, ServerEntry](),
     nextServerId:     0
   )
 
-proc setupGetTransfer(req: TransferRequest, md: TransferMode,
+proc resolveSourceFactory(s: TftpSession): BlockSourceFactory =
+  ## RFC §5.1 -- resolve the session's injected source factory, or the
+  ## file-backed default (`defaultBlockSourceFactory`, blocksource.nim --
+  ## hoisted there, code-review S4-1/S4-3, so this and server.nim's
+  ## equivalent share one implementation instead of two hand-rolled
+  ## copies). NEVER dereferences `s.sourceFactory` directly at the call site
+  ## (nil-call hazard) -- every caller goes through this.
+  if s.sourceFactory != nil: s.sourceFactory else: defaultBlockSourceFactory()
+
+proc resolveSinkFactory(s: TftpSession): BlockSinkFactory =
+  ## RFC §5.1 -- resolve the session's injected sink factory, or the
+  ## file-backed default (`defaultBlockSinkFactory`, blocksource.nim).
+  if s.sinkFactory != nil: s.sinkFactory else: defaultBlockSinkFactory()
+
+proc setupGetTransfer(s: TftpSession, req: TransferRequest, md: TransferMode,
                       requestedParams: TransferParams,
                       getEffective: proc(): Option[TransferParams] {.closure.},
                       xport: Transport, config: TftpClientConfig,
@@ -180,13 +201,17 @@ proc setupGetTransfer(req: TransferRequest, md: TransferMode,
   ## ("cannot be captured... violate memory safety") and suggests exactly
   ## this: a capturable reference. A closure over the caller's own local is
   ## the safe equivalent of a `ref` here.
-  var gfile:       File
+  var gsink:       BlockSink
   var writeError:  string = ""
   # The RECEIVE-side counterpart of tdPut's readData -- api.nim owns
-  # this file handle directly (not via engine.nim), so it builds its own
-  # `makeRecvSink` once the file is open (it can't be built up front like
-  # server.handleWrq's, since the file open itself is lazy here -- deferred
-  # to the first onData call rather than done eagerly).
+  # this sink directly (not via engine.nim), so it builds its own
+  # `makeRecvHandler` once the sink is open (it can't be built up front like
+  # server.handleWrq's, since the open itself is lazy here -- deferred
+  # to the first onData call rather than done eagerly). The sink is
+  # constructed via `resolveSinkFactory(s)` (RFC in-memory-sources-sinks.md
+  # §5.1) -- nil session factory => file-backed default (`open(req.localPath,
+  # fmWrite)`), so behavior with no injected factory is byte-for-byte
+  # unchanged from the old direct `open`+`fileBlockSink` call.
   #
   # Structural nil-invariant fix: there is deliberately NO separate
   # "is the file open" bool. `recvSink != nil` IS the single source of
@@ -206,8 +231,8 @@ proc setupGetTransfer(req: TransferRequest, md: TransferMode,
       if writeError.len > 0: return
       if recvSink == nil:
         try:
-          gfile = open(req.localPath, fmWrite)
-          recvSink = makeRecvSink(gfile, md)
+          gsink = resolveSinkFactory(s)(req.localPath)
+          recvSink = makeRecvHandler(gsink, md)
         except IOError as e:
           writeError = "Cannot open file for writing: " & e.msg
           return
@@ -219,7 +244,7 @@ proc setupGetTransfer(req: TransferRequest, md: TransferMode,
       # pre-negotiation requested blocksize before any DATA arrives, the
       # same starting point the old bare `effBs` variable had. A
       # short/failed terminal write is no longer silently discarded --
-      # makeRecvSink folds it into its return value exactly like a
+      # makeRecvHandler folds it into its return value exactly like a
       # per-block write mismatch, so combinedCancel below (and the
       # caller's failure path) observes it.
       if not recvSink(data, data.len < getEffective().inEffect(requestedParams).blocksize):
@@ -228,13 +253,13 @@ proc setupGetTransfer(req: TransferRequest, md: TransferMode,
   let combinedCancel: CancelCheck = proc(): bool = writeError.len > 0 or flag[]
 
   let cleanup = proc() {.closure.} =
-    if recvSink != nil: gfile.close()
+    if recvSink != nil: gsink.close()
 
   let fut = getFile(xport, config, req.host, req.port, req.filename,
                     onData, progressCb, combinedCancel, onNegCb)
   result = (fut, cleanup)
 
-proc setupPutTransfer(req: TransferRequest, md: TransferMode,
+proc setupPutTransfer(s: TftpSession, req: TransferRequest, md: TransferMode,
                       xport: Transport, config: var TftpClientConfig,
                       progressCb: ProgressCallback,
                       onNegCb: proc(blocksize: int, windowsize: int) {.closure.},
@@ -242,14 +267,28 @@ proc setupPutTransfer(req: TransferRequest, md: TransferMode,
                       ): tuple[fut: Future[TransferResult], cleanup: proc() {.closure.},
                                startTotal: Option[int64]] =
   ## tdPut's setup, extracted verbatim from startTransfer's former inline
-  ## branch -- opens the send file, sizes it into config.tsize, builds the
-  ## netascii-aware reader, and launches putFile. File open is pre-launch;
+  ## branch -- opens the send source, sizes it into config.tsize, builds the
+  ## netascii-aware reader, and launches putFile. Source open is pre-launch;
   ## failure propagates to the caller's outer try/except -> evTransferError,
   ## not a raise out of the public API. `config` is a `var` param (this proc
   ## is NOT `{.async.}`, so that's allowed) purely so `config.tsize` can be
   ## set here instead of the caller doing it after the call.
-  var pfile = open(req.localPath, fmRead)
-  let fileSize = getFileSize(req.localPath)
+  ##
+  ## The source is constructed via `resolveSourceFactory(s)` (RFC
+  ## in-memory-sources-sinks.md §5.1): nil session factory => file-backed
+  ## default, preserving today's eager `open(req.localPath, fmRead)` +
+  ## `getFileSize` behavior byte-for-byte. The factory's `Option[OpenedSource]`
+  ## folds the old "does it exist" / "can it open" distinction into one call:
+  ## `none` (not found) is raised here as an IOError so it reaches the exact
+  ## same evTransferError outcome the old direct `open` produced for a
+  ## missing file; a present-but-unopenable path still raises IOError from
+  ## inside the factory itself, propagating unchanged.
+  let opened = resolveSourceFactory(s)(req.localPath)
+  if opened.isNone:
+    raise newException(IOError,
+      "Cannot open file for reading: " & req.localPath & " (No such file or directory)")
+  let (source, sizeOpt) = opened.get
+  let fileSize = sizeOpt.get(0'i64)
   config.tsize = fileSize
   let netasciiPolicy = netasciiPolicyFor(md)
   # Client PUT: `.bytes` counts post-translation wire bytes while
@@ -259,10 +298,9 @@ proc setupPutTransfer(req: TransferRequest, md: TransferMode,
   let startTotal = if netasciiPolicy.reportTotalUnknown: none(int64)
                   else: some(fileSize)
 
-  var netasciiEnc: NetasciiEncoder
-  let readData = makeSendReader(pfile, md, netasciiEnc)
+  let readData = makeSendReader(source, md)
 
-  let cleanup = proc() {.closure.} = pfile.close()
+  let cleanup = proc() {.closure.} = source.close()
 
   let fut = putFile(xport, config, req.host, req.port, req.filename,
                     readData, progressCb, proc(): bool = flag[], onNegCb)
@@ -348,14 +386,14 @@ proc startTransfer*(s: TftpSession, req: TransferRequest): TransferId =
 
     case req.direction
     of tdGet:
-      let setup   = setupGetTransfer(req, md, requestedParams, getEffective,
+      let setup   = setupGetTransfer(s, req, md, requestedParams, getEffective,
                                      xport, config, progressCb, onNegCb, flag)
       fut         = setup.fut
       fileCleanup = setup.cleanup
 
     of tdPut:
-      # File open is pre-launch; failure → outer except → evTransferError, not raise.
-      let setup   = setupPutTransfer(req, md, xport, config, progressCb, onNegCb, flag)
+      # Source open is pre-launch; failure → outer except → evTransferError, not raise.
+      let setup   = setupPutTransfer(s, req, md, xport, config, progressCb, onNegCb, flag)
       fut         = setup.fut
       fileCleanup = setup.cleanup
       startTotal  = setup.startTotal

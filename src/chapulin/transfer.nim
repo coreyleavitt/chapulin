@@ -3,6 +3,13 @@
 
 import std/[asyncdispatch, times, tables, options]
 import protocol
+import coverpragma  ## R1-4 (code-review finding): `{.cover.}` on the
+                    ## hostile-session targets below (`recvOnce`/`sendBlocks`/
+                    ## `recvBlocks`) so `tests/t_hostile.nim`'s
+                    ## coverage-guided run has real edge-coverage signal to
+                    ## search against. Release no-op off `-d:chapulinFuzz`
+                    ## (see coverpragma.nim) -- `src/` stays FFI-free and
+                    ## byte-for-byte unaffected.
 export protocol  ## option bounds + defaults now live in protocol.nim (D7);
                   ## re-exported so existing callers (options.nim, api.nim,
                   ## server_config.nim, ...) see zero-diff.
@@ -147,7 +154,7 @@ type
     pkt*: TftpPacket   ## meaningful iff ok
 
 proc recvOnce*(transport: Transport, config: TransferConfig,
-               peer: PeerEndpoint, timeoutMs: int): Future[RecvOutcome] {.async.} =
+               peer: PeerEndpoint, timeoutMs: int): Future[RecvOutcome] {.async, cover.} =
   ## A single receive + TID-lock validation + decode, with NO auto-resend and
   ## NO raise on timeout (the inverse of `recvPacket`'s contract -- needed by
   ## `dallyAfterFinalAck`, where silence means "done", not "resend and raise").
@@ -286,7 +293,7 @@ proc sendBlocks*(transport: Transport, config: TransferConfig,
                  onProgress: ProgressCallback = nil,
                  cancelCheck: CancelCheck = nil,
                  onDelivered: proc(data: openArray[byte]) = nil,
-                 peakCacheBlocksOut: ref int = new(int)): Future[TransferResult] {.async.} =
+                 peakCacheBlocksOut: ref int = new(int)): Future[TransferResult] {.async, cover.} =
   ## Send DATA blocks starting at `startBlock`, driven by the receiver's ACKs
   ## (RFC 7440 windowsize supported: up to `config.windowsize` blocks may be
   ## in flight unacknowledged at once).
@@ -463,7 +470,7 @@ proc recvBlocks*(transport: Transport, config: TransferConfig,
                  peer: PeerEndpoint, startBlock: uint16,
                  onData: proc(blockNum: uint16, data: seq[byte]),
                  onProgress: ProgressCallback = nil,
-                 cancelCheck: CancelCheck = nil): Future[TransferResult] {.async.} =
+                 cancelCheck: CancelCheck = nil): Future[TransferResult] {.async, cover.} =
   var bytesReceived: int64 = 0
   var expectedBlock = startBlock
   var lastSent: seq[byte]
@@ -525,6 +532,21 @@ proc recvBlocks*(transport: Transport, config: TransferConfig,
         onData(pkt.blockNum, pkt.data)
         bytesReceived += pkt.data.len
         blocksInWindow.inc
+
+        # S4-14: onData is void -- callers surface a write failure OUT-OF-BAND
+        # through cancelCheck (e.g. api.nim/server.nim's writeError-backed
+        # combinedCancel), not through onData's return value. The loop's
+        # top-of-loop cancelCheck (line ~518) only fires on the NEXT
+        # iteration, which never happens for the FINAL block: that path ACKs
+        # immediately and breaks straight into the dally epilogue's
+        # `success: true` return, so a write failure on the final (or only)
+        # block was silently lost. Re-checking right here, immediately after
+        # the write, closes that gap for every block -- not just the final
+        # one -- so a failed write also stops us from ACKing data we didn't
+        # actually persist.
+        if cancelCheck != nil and cancelCheck():
+          return TransferResult(success: false, bytesTransferred: bytesReceived,
+                                errorMsg: "Transfer cancelled", totalSize: config.totalSize)
 
         if onProgress != nil:
           onProgress(bytesReceived, config.totalSize)

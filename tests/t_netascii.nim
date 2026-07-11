@@ -11,7 +11,10 @@ import std/unittest
 import std/sequtils
 import std/os
 import proptest
+import fuzzsupport
 import ../src/chapulin/netascii
+import ../src/chapulin/blocksource
+import ../src/chapulin/protocol
 
 const
   Cr = byte('\r')
@@ -252,60 +255,10 @@ suite "netasciiReader -- block-chunking read adapter (D1b, RFC-conformance-closu
     var trapped = false
     try:
       discard reader(1, 4)  # same block again -- not ascending
-    except NetasciiReaderError:
+    except BlockSourceOrderError:
       trapped = true
     check trapped
     f.close()
-    removeFile(path)
-
-suite "writeNetasciiTail -- terminal-write-failure seam (Fix A code-review finding)":
-  # Before this fix, `finishNetasciiDecode` did
-  # `discard file.writeBytes(tail, 0, tail.len)` on the terminal netascii
-  # tail -- the ONLY write site in the codebase that ignored its result. A
-  # short/ENOSPC write on that final <=1-byte flush was invisible: the
-  # transfer reported success with a file missing its last byte. This seam
-  # isolates the write-result-checking DECISION from the real `File` so it
-  # can be exercised with an injected short-writing sink, without faking an
-  # entire `File`.
-  test "a non-empty tail that is fully written reports ok":
-    let ok = writeNetasciiTail(@[byte('\r')], proc(data: seq[byte]): int = data.len)
-    check ok == true
-
-  test "a non-empty tail that is short-written (simulated ENOSPC) reports failure, not swallowed":
-    let ok = writeNetasciiTail(@[byte('\r')], proc(data: seq[byte]): int = 0)
-    check ok == false
-
-  test "an empty tail is trivially ok and never invokes the sink":
-    var invoked = false
-    let ok = writeNetasciiTail(@[], proc(data: seq[byte]): int =
-      invoked = true
-      data.len)
-    check ok == true
-    check invoked == false
-
-suite "finishNetasciiDecode -- return value surfaces terminal-write outcome (Fix A)":
-  test "returns true when the trailing deferred CR is written successfully":
-    let path = getTempDir() / "t_netascii_finish_ok.tmp"
-    var f = open(path, fmWrite)
-    var dec: NetasciiDecoder
-    let decoded = dec.feed(@[byte('A'), Cr])  # defers the trailing CR; "A" resolves now
-    discard f.writeBytes(decoded, 0, decoded.len)
-    let ok = finishNetasciiDecode(f, dec, true)
-    f.close()
-    check ok == true
-    check readFile(path) == "A\r"
-    removeFile(path)
-
-  test "returns true (nothing attempted) when success is false, even with a pending CR":
-    let path = getTempDir() / "t_netascii_finish_abort.tmp"
-    var f = open(path, fmWrite)
-    var dec: NetasciiDecoder
-    let decoded = dec.feed(@[byte('A'), Cr])
-    discard f.writeBytes(decoded, 0, decoded.len)
-    let ok = finishNetasciiDecode(f, dec, false)
-    f.close()
-    check ok == true  # not a failure -- the write was correctly skipped
-    check readFile(path) == "A"
     removeFile(path)
 
 # --- R2-scoped round-trip property + explicit documented collapse cases ------
@@ -378,3 +331,91 @@ suite "R2 -- documented lossy collapse cases (explicit, not round-trip-clean)":
     let back = d.feed(wire) & d.flush()
     check back == @[Cr, Lf]
     check back.len == 2  # 3 input bytes -> 2 output bytes: a documented loss
+
+# --- Coverage-guided never-Defect fuzz targets (RFC verification-harness.md,
+# --- slice 4). D3 table row: `netascii.NetasciiDecoder.feed`/`flush`
+# --- (+`NetasciiEncoder`) -- "none (total per-byte loop)": neither type's
+# --- `feed`/`flush` has an `except` clause of its own, so no exception of
+# --- any kind -- and no Defect -- may escape on arbitrary wire/local bytes.
+# --- Unlike `netasciiBytes()` above (the round-trip alphabet, limited to
+# --- Cr/Lf/Nul/A/B so the R2-scoped identity actually holds), this uses the
+# --- full 0..255 byte range -- the never-Defect surface fuzzing exists to
+# --- shake out needs the whole space, not just the round-trip-relevant
+# --- symbols.
+
+proc arbitraryBytes(maxLen = 300): Strategy[seq[byte]] =
+  lists(integers(0, 255), minLen = 0, maxLen = maxLen).map(
+    proc(xs: seq[int]): seq[byte] =
+      result = newSeq[byte](xs.len)
+      for i, x in xs: result[i] = byte(x))
+
+proc netasciiDecoderOracle(data: seq[byte]): bool =
+  ## `NetasciiDecoder.feed`/`flush`'s per-target oracle (RFC D3): TOTAL, no
+  ## `except` clause here at all -- any exception (or Defect) reaching
+  ## proptest's `ensure` is itself the finding (matches
+  ## `validateAndParseOackOracle`'s style in t_props.nim).
+  var d: NetasciiDecoder
+  discard d.feed(data) & d.flush()
+  true
+
+proc netasciiEncoderOracle(data: seq[byte]): bool =
+  ## `NetasciiEncoder.feed`/`flush`'s per-target oracle (RFC D3): same total,
+  ## no-`except` discipline as the decoder above.
+  var e: NetasciiEncoder
+  discard e.feed(data) & e.flush()
+  true
+
+suite "netasciiBlockSource / netasciiBlockSink -- close forwarding (S4-7)":
+  test "netasciiBlockSource.close forwards to the inner BlockSource's close exactly once":
+    var closed = false
+    let inner = BlockSource(
+      read: proc(n: int): seq[byte] = @[],
+      close: proc() = closed = true)
+    let wrapped = netasciiBlockSource(inner)
+    check closed == false
+    wrapped.close()
+    check closed == true
+
+  test "netasciiBlockSink.close forwards to the inner BlockSink's close exactly once":
+    var closed = false
+    let inner = BlockSink(
+      write: proc(data: seq[byte]): bool = true,
+      finish: proc(success: bool): bool = true,
+      close: proc() = closed = true)
+    let wrapped = netasciiBlockSink(inner)
+    check closed == false
+    wrapped.close()
+    check closed == true
+
+suite "makeRecvHandler -- finish-failure fold (S4-8)":
+  test "a terminal finish(true) failure flips the handler's final-call return to false":
+    # write always succeeds; finish(true) simulates a short/ENOSPC terminal
+    # flush by returning false. Non-final calls must still return true (no
+    # finish invoked yet); only the final call trips the fold.
+    let sink = BlockSink(
+      write: proc(data: seq[byte]): bool = true,
+      finish: proc(success: bool): bool = false,
+      close: proc() = discard)
+    let handler = makeRecvHandler(sink, tmOctet)
+    check handler(@[byte('A'), byte('B')], false) == true
+    check handler(@[byte('C')], true) == false
+
+  test "a terminal finish(true) success leaves the handler's final-call return true (happy path)":
+    let sink = BlockSink(
+      write: proc(data: seq[byte]): bool = true,
+      finish: proc(success: bool): bool = true,
+      close: proc() = discard)
+    let handler = makeRecvHandler(sink, tmOctet)
+    check handler(@[byte('A'), byte('B')], false) == true
+    check handler(@[byte('C')], true) == true
+
+suite "netascii coverage-guided never-Defect fuzz targets (RFC verification-harness.md, slice 4)":
+  fuzzProperty("NetasciiDecoder.feed/flush never raises, not even a Defect, on arbitrary wire bytes",
+               "netascii.NetasciiDecoder.feed"):
+    given data in arbitraryBytes()
+    ensure netasciiDecoderOracle(data)
+
+  fuzzProperty("NetasciiEncoder.feed/flush never raises, not even a Defect, on arbitrary local bytes",
+               "netascii.NetasciiEncoder.feed"):
+    given data in arbitraryBytes()
+    ensure netasciiEncoderOracle(data)

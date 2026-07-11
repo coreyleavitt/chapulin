@@ -1,5 +1,8 @@
 import unittest
 import std/os
+import std/strutils
+import proptest
+import fuzzsupport
 import ../src/chapulin/protocol
 import ../src/chapulin/server_config
 import ../src/chapulin/security
@@ -545,13 +548,142 @@ suite "writeSidecar containment (slice 4)":
     check ok == false
     check err.len > 0
 
+suite "containment LEXICAL fuzz target (RFC verification-harness.md, slice 3)":
+  # D3 table row: `validatePath` / `checkWriteAccess(config, resolvedPath)`.
+  # Fuzzes the path/name STRING, not the filesystem, against one committed,
+  # symlink-free fixture tree (`tests/corpus/fixtures/root/`) — the
+  # `canonicalize()`-based symlink/alias-forgery refusal is deliberately
+  # NOT exercised here (inert on a symlink-free tree by construction); that
+  # sub-case stays covered by the dynamic e2e tests above (the "issue #19",
+  # K1, and H1 suites), which this slice does not touch.
+  const FixtureRoot = "tests" / "corpus" / "fixtures" / "root"
+
+  # charsToStr used to be redefined here (byte-for-byte identical to
+  # t_props.nim/t_hostile.nim/t_checksum.nim's own copies); R1-6 code-review
+  # finding hoisted the one canonical definition into fuzzsupport.nim, which
+  # this file already imports. This suite's own alphabet (RawAlphabet, below)
+  # genuinely differed from fuzzsupport's SafeAlphabet, so it stayed local --
+  # but R2-2 code-review finding caught that it was byte-for-byte identical to
+  # t_checksum.nim's own "kept local" `RawSidecarAlphabet`/`rawSidecarStrings`
+  # (same alphabet, same wrapper, just a different default `maxLen`). Both are
+  # now `RawPathAlphabet`/`rawPathStrings` in fuzzsupport.nim; this file's bare
+  # `rawPathStrings()` calls below are unaffected (fuzzsupport's default
+  # matches this file's old default of 24).
+
+  proc traversalPathStrings(): Strategy[string] =
+    ## Guarantees a `..` segment lands somewhere in the middle.
+    rawPathStrings(8).flatMap(proc(a: string): Strategy[string] =
+      rawPathStrings(8).map(proc(b: string): string = a & "/../" & b))
+
+  proc driveLetterPathStrings(): Strategy[string] =
+    ## Windows drive-absolute forms: `C:\...`, `D:...` (drive-relative).
+    sampledFrom(@["C:\\", "D:", "C:/", "Z:\\"]).flatMap(
+      proc(prefix: string): Strategy[string] =
+        rawPathStrings(12).map(proc(s: string): string = prefix & s))
+
+  proc uncPathStrings(): Strategy[string] =
+    ## UNC forms: `\\server\share\...`.
+    rawPathStrings(12).map(proc(s: string): string = "\\\\server\\share\\" & s)
+
+  proc percentEncodedPathStrings(): Strategy[string] =
+    ## `%2e%2e%2f`-style encoded traversal — never decoded by validatePath,
+    ## so this exercises "does an encoded-but-undecoded traversal attempt
+    ## slip past the literal `..` check" (it must not decode-then-match).
+    sampledFrom(@["%2e%2e%2f", "%2e%2e/", "..%2f", "%2e%2e%5c"]).flatMap(
+      proc(prefix: string): Strategy[string] =
+        rawPathStrings(8).map(proc(s: string): string = prefix & s))
+
+  proc containmentFuzzStrings(): Strategy[string] =
+    oneOf([rawPathStrings(), traversalPathStrings(), driveLetterPathStrings(),
+           uncPathStrings(), percentEncodedPathStrings()])
+
+  proc validatePathOracle(fn: string): bool =
+    ## `validatePath`'s per-target oracle (RFC D3): TOTAL — no exception of
+    ## any kind (nor a Defect) is allowed to escape, so this proc has no
+    ## `except` clause; any exception reaching proptest's `ensure` is itself
+    ## the finding (matches `validateAndParseOackOracle`'s style in
+    ## t_props.nim). Additional invariant: never-escape (lexical) — when
+    ## `valid`, the resolved path must sit at or under the fixture root.
+    ## Not asserted here (deliberately): *why* an input was rejected — the
+    ## Windows-only `:` (ADS) branch inside validatePath is exercised by
+    ## this same fuzz input space, but this oracle only checks the
+    ## escape/no-escape safety property, so it holds platform-independently
+    ## with no `when defined(windows)` OS-tag needed.
+    let (valid, resolved, _) = validatePath(FixtureRoot, fn)
+    if not valid:
+      return true
+    let normRoot = absolutePath(FixtureRoot)
+    resolved == normRoot or resolved.startsWith(normRoot & $DirSep)
+
+  fuzzProperty("validatePath never lexically escapes the fixed fixture root, never a Defect",
+               "security.validatePath.lexical"):
+    given fn in containmentFuzzStrings()
+    ensure validatePathOracle(fn)
+
+  # --- checkWriteAccess: reserved-.md5 lexical refusal --------------------
+
+  proc reservedNameStrings(maxLen = 8): Strategy[string] =
+    ## Stresses `isReservedSidecarName`'s normalization rules: case folding
+    ## and trailing dot/space stripping (M5), plus plain non-reserved names.
+    let base = lists(sampledFrom(@['a', 'b', '.', '_']), minLen = 0, maxLen = maxLen).map(charsToStr)
+    let suffix = sampledFrom(@[".md5", ".MD5", ".Md5", ".md5.", ".md5 ",
+                               ".md5..", ".md5  ", ".txt", ""])
+    base.flatMap(proc(b: string): Strategy[string] =
+      suffix.map(proc(sfx: string): string = b & sfx))
+
+  proc checkWriteAccessOracle(name: string): bool =
+    ## `checkWriteAccess`'s per-target oracle (RFC D3): TOTAL, same
+    ## no-`except` discipline as above. Additional invariant asserted: the
+    ## reserved-`.md5` refusal fires IFF the resolvedPath's own lexical
+    ## basename is a reserved sidecar name (`isReservedSidecarName`) — the
+    ## LEXICAL half of checkWriteAccess's H1 defense. The canonicalize()
+    ## re-check (H1's symlink-alias half) is not asserted: it is inert on
+    ## this symlink-free fixture and stays covered by the dynamic
+    ## "symlink alias (H1)" suite above (RFC D3: "Deferred to e2e").
+    let resolvedPath = FixtureRoot / name
+    let config = ServerConfig(writePolicy: wpCreateOrOverwrite, rootDir: FixtureRoot,
+                               checksumMode: csMd5)
+    let (ok, errCode, _) = checkWriteAccess(config, resolvedPath)
+    if isReservedSidecarName(resolvedPath):
+      (not ok) and errCode == errAccessViolation
+    else:
+      true # non-reserved names: never-Defect is the only claim here
+
+  fuzzProperty("checkWriteAccess refuses a reserved .md5 name iff resolvedPath's lexical " &
+               "basename is one, never a Defect", "security.checkWriteAccess.reservedLexical"):
+    given name in oneOf([reservedNameStrings(), rawPathStrings()])
+    ensure checkWriteAccessOracle(name)
+
+proc removeSymlinkSafely(path: string) =
+  ## Pre-existing bug (commit 749555e), fixed here: on Windows, `removeFile`
+  ## (`DeleteFileW`) raises "Access is denied" on a DIRECTORY-typed reparse
+  ## point (a symlink or junction whose target is a directory) — Windows
+  ## requires `RemoveDirectoryW` semantics for those instead. A FILE-typed
+  ## symlink (e.g. `evil_link -> secret.txt`) is fine through `DeleteFileW`
+  ## (`removeFile`). `dirExists` is true for a directory-typed reparse point
+  ## whose target currently resolves, so it's the discriminator; a dangling
+  ## symlink falls through to plain `removeFile` (unaffected, matches prior
+  ## behavior for that case). Routes through `cmd /c rmdir` — the same
+  ## pattern this file's K1 Cleanup suites already use — rather than Nim's
+  ## `removeDir`: `removeDir` walks the directory's own contents to delete
+  ## them one by one, and Windows' `FindFirstFileW` FOLLOWS a reparse point
+  ## when enumerating it, so a recursive delete here would walk into (and
+  ## destroy) the symlink's OUTSIDE target instead of just unlinking the
+  ## link — exactly the bug this cleanup step must not reintroduce. Plain
+  ## `rmdir <reparse-dir>` (no `/S`) unlinks only the reparse point itself.
+  when defined(windows):
+    if dirExists(path):
+      discard execShellCmd("cmd /c rmdir \"" & path & "\" >NUL")
+      return
+  removeFile(path)
+
 suite "Cleanup":
   test "remove test directory":
     # Remove symlinks explicitly first so directory teardown never follows
     # `escape_dir` into (and deletes the contents of) the outside target.
     for link in ["evil_link", "escape_dir", "good_link", "sidecar_escape.txt.md5"]:
       if symlinkExists(testRoot / link):
-        removeFile(testRoot / link)
+        removeSymlinkSafely(testRoot / link)
     removeDir(testRoot)
     removeDir(outsideRoot)
     check not dirExists(testRoot)

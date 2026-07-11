@@ -33,7 +33,11 @@ Thumbs.db
 # milpa (dependency resolver) — generated outputs.
 # milpa.kdl (manifest) and milpa.lock (lockfile) ARE committed.
 _deps/
-nim.cfg
+# Anchored to the repo root: the unanchored form also matched
+# tests/nim.cfg, a hand-authored, committed file (RFC verification-harness
+# D2 — supplies -d:chapulinFuzz to every test compiled from tests/), and
+# would have silently dropped it from every commit with no error.
+/nim.cfg
 .milpa-cache/
 
 # Claude

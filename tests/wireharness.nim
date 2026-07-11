@@ -11,9 +11,19 @@ import std/[deques, asyncdispatch]
 import ../src/chapulin/transfer
 import ../src/chapulin/transport
 
-proc toByteSeq*(xs: seq[int]): seq[byte] =
-  result = newSeq[byte](xs.len)
-  for i, x in xs: result[i] = byte(x and 0xFF)
+# R2-1 code-review finding: this module used to `import ./fuzzsupport` and
+# `export toByteSeq` solely to save its downstream consumers a second import
+# line. That pulled all of `proptest` (via fuzzsupport) transitively into
+# EVERY wireharness consumer, including non-fuzz ones (t_wireharness.nim
+# imports only std/[asyncdispatch, unittest] + this module and does no
+# fuzzing at all). `wireharness` itself never calls `toByteSeq` — the
+# re-export was pure convenience plumbing — so the clean fix is to drop the
+# import/re-export entirely and have `toByteSeq`'s real consumers
+# (t_hostile.nim, t_props_transfer.nim, t_props_server.nim) import it from
+# `fuzzsupport` directly. All three already depend on `proptest` directly
+# (they use Strategy/property machinery), so importing `fuzzsupport` too adds
+# no new transitive dependency for them — only `wireharness`'s non-fuzz
+# consumers are freed of it.
 
 type
   WireAction* = enum
@@ -22,13 +32,32 @@ type
     waDup     ## deliver twice
     waDelay   ## hold; release after the next delivered packet (reorder)
 
+  WirePacket* = tuple[data: seq[byte], host: string, port: int]
+    ## A packet in flight, carrying its (spoofable) source address. Legit
+    ## traffic sent via `wireSend` always carries the fixed peer identity
+    ## `("peer", 0)` -- the address `makeTransport`'s `doRecv` reports for
+    ## everything, matching every real caller's `newPeer("peer", 0, ...)`.
+    ## `injectPacket` is the one place a DIFFERENT (host, port) can be
+    ## supplied -- the off-TID attacker dimension (RFC verification-harness.md
+    ## D8b, slice 8).
+
   Wire* = ref object
-    a2b*, b2a*: Deque[seq[byte]]
+    a2b*, b2a*: Deque[WirePacket]
     actions: seq[WireAction]   # consumed per send; empty = always waPass
     idx: int
-    pendA, pendB: seq[seq[byte]]
+    pendA, pendB: seq[WirePacket]
     dropAOcc, dropBOcc: int    # deterministic single drop by occurrence (-1 none)
     aSent, bSent: int
+    aBouncedCount, bBouncedCount: int
+      ## count of `Transport.send` calls whose destination (host, port) was
+      ## NOT the wire's one modeled peer identity (`WirePeerHost`,
+      ## `WirePeerPort`) -- e.g. `transfer.recvOnce`'s TID-lock ERROR-bounce
+      ## reply, addressed back to an off-TID attacker's injected source
+      ## rather than the locked peer. The mock has no third node listening
+      ## at an arbitrary address, so -- mirroring real UDP, where that
+      ## datagram lands only at (host, port) and never touches the legit
+      ## peer's stream -- such a send is counted here but never delivered
+      ## onto a2b/b2a (see `makeTransport`'s `doSend`).
     aLog*, bLog*: seq[seq[byte]]  # every packet each side attempted to send
     aRecvTimeoutsMs*, bRecvTimeoutsMs*: seq[int]
       ## every timeoutMs a side's Transport.recv was called with, in order --
@@ -39,11 +68,23 @@ type
 
 proc newWire*(actions: seq[WireAction] = @[],
               dropAOcc = -1, dropBOcc = -1): Wire =
-  Wire(a2b: initDeque[seq[byte]](), b2a: initDeque[seq[byte]](),
+  Wire(a2b: initDeque[WirePacket](), b2a: initDeque[WirePacket](),
        actions: actions, dropAOcc: dropAOcc, dropBOcc: dropBOcc)
 
 proc aSends*(w: Wire): int = w.aSent   ## packets side A has sent (incl. dropped)
 proc bSends*(w: Wire): int = w.bSent   ## packets side B has sent (incl. dropped)
+
+const
+  WirePeerHost* = "peer"  ## the wire's one modeled peer identity -- every
+  WirePeerPort* = 0       ## legit packet (wireSend) carries this source, and
+    ## every real caller's PeerEndpoint is `newPeer(WirePeerHost, WirePeerPort,
+    ## ...)`. `Transport.send` to any OTHER (host, port) targets a node this
+    ## two-side mock doesn't model (an off-TID attacker) -- see `makeTransport`.
+
+proc aBounced*(w: Wire): int = w.aBouncedCount
+  ## sends side A attempted to a non-peer destination (off-TID ERROR bounces)
+proc bBounced*(w: Wire): int = w.bBouncedCount
+  ## sends side B attempted to a non-peer destination (off-TID ERROR bounces)
 
 proc nextAction(w: Wire): WireAction =
   if w.actions.len == 0: return waPass
@@ -59,28 +100,51 @@ proc wireSend(w: Wire, sideA: bool, data: seq[byte]) =
   else:
     let occ = w.bSent; inc w.bSent
     if occ == w.dropBOcc: return
+  let pkt: WirePacket = (data, WirePeerHost, WirePeerPort)
   case w.nextAction()
   of waPass:
     if sideA:
-      w.a2b.addLast(data)
+      w.a2b.addLast(pkt)
       if w.pendA.len > 0: w.a2b.addLast(w.pendA[0]); w.pendA = @[]
     else:
-      w.b2a.addLast(data)
+      w.b2a.addLast(pkt)
       if w.pendB.len > 0: w.b2a.addLast(w.pendB[0]); w.pendB = @[]
   of waDup:
     if sideA:
-      w.a2b.addLast(data)
-      w.a2b.addLast(data)
+      w.a2b.addLast(pkt)
+      w.a2b.addLast(pkt)
     else:
-      w.b2a.addLast(data)
-      w.b2a.addLast(data)
+      w.b2a.addLast(pkt)
+      w.b2a.addLast(pkt)
   of waDrop:
     discard
   of waDelay:
     if sideA:
-      if w.pendA.len == 0: w.pendA = @[data] else: w.a2b.addLast(data)
+      if w.pendA.len == 0: w.pendA = @[pkt] else: w.a2b.addLast(pkt)
     else:
-      if w.pendB.len == 0: w.pendB = @[data] else: w.b2a.addLast(data)
+      if w.pendB.len == 0: w.pendB = @[pkt] else: w.b2a.addLast(pkt)
+
+proc injectPacket*(w: Wire, toSideA: bool, data: seq[byte],
+                    host: string = WirePeerHost, port: int = WirePeerPort) =
+  ## Deliver a forged/garbage packet directly onto the wire, bypassing
+  ## `wireSend` entirely: no `WireAction` schedule consumption, no
+  ## aSent/bSent occurrence bookkeeping, no `aLog`/`bLog` recording (nothing
+  ## legitimately "sent" this — an attacker/MITM packet has no sender-side
+  ## Transport.send call to log). `toSideA = true` delivers to side A's next
+  ## `recv` (queued on `b2a`, mirroring how a real packet *from* B reaches
+  ## A); `toSideA = false` delivers to side B (queued on `a2b`). Unconditional
+  ## and immediate — an injected packet is never dropped/duplicated/delayed.
+  ##
+  ## `host`/`port` default to `("peer", 0)` -- the SAME fixed source address
+  ## every legitimate packet carries (`wireSend`, above) -- so every slice-7
+  ## call site (same-TID payload injection, D8a) is a zero-diff caller of
+  ## this proc. Passing a DIFFERENT `(host, port)` is the off-TID attacker
+  ## dimension (RFC verification-harness.md D8b, slice 8): the packet still
+  ## reaches the victim's `recv`, but `transfer.recvOnce`'s TID-lock check
+  ## (`transfer.nim` — `resp.host != peer.host or resp.port != peer.port`)
+  ## sees a source that doesn't match the locked peer and rejects it.
+  if toSideA: w.b2a.addLast((data, host, port))
+  else: w.a2b.addLast((data, host, port))
 
 # A transport over one side of the wire. `recv` yields to the dispatcher until a
 # packet is available, bounded by a spin budget so a stall raises
@@ -95,6 +159,20 @@ proc makeTransport*(w: Wire, sideA: bool, swallowFirst = false): Transport =
     if swallowFirst and not swallowed:
       swallowed = true
       return
+    if host != WirePeerHost or port != WirePeerPort:
+      # Destined for some address other than the wire's one modeled peer --
+      # e.g. `transfer.recvOnce`'s TID-lock ERROR-bounce reply
+      # (`transport.send(errPkt, resp.host, resp.port)`), addressed back to
+      # an off-TID attacker's injected source rather than the locked peer.
+      # This two-node mock has no third party listening at an arbitrary
+      # address: mirroring real UDP, where that datagram lands only at
+      # (host, port) and never touches the legit peer's stream, the send is
+      # counted (aBounced/bBounced) but NOT delivered onto a2b/b2a. Without
+      # this gate, `wireSend` would ignore the destination entirely and
+      # misroute the bounce back onto the legit pipe, corrupting the victim's
+      # own transfer with a reply that was never addressed to it.
+      if sideA: inc w.aBouncedCount else: inc w.bBouncedCount
+      return
     w.wireSend(sideA, data)
 
   proc doRecv(bufSize: int, timeoutMs: int): Future[tuple[data: seq[byte],
@@ -103,9 +181,9 @@ proc makeTransport*(w: Wire, sideA: bool, swallowFirst = false): Transport =
     var spins = 0
     while true:
       if sideA:
-        if w.b2a.len > 0: return (w.b2a.popFirst(), "peer", 0)
+        if w.b2a.len > 0: return w.b2a.popFirst()
       else:
-        if w.a2b.len > 0: return (w.a2b.popFirst(), "peer", 0)
+        if w.a2b.len > 0: return w.a2b.popFirst()
       inc spins
       if spins > 500:
         raise newException(TransportTimeoutError, "wire idle")
@@ -208,9 +286,9 @@ proc makeFailingTransport*(w: Wire, sideA: bool, failAfter: int,
     var spins = 0
     while true:
       if sideA:
-        if w.b2a.len > 0: return (w.b2a.popFirst(), "peer", 0)
+        if w.b2a.len > 0: return w.b2a.popFirst()
       else:
-        if w.a2b.len > 0: return (w.a2b.popFirst(), "peer", 0)
+        if w.a2b.len > 0: return w.a2b.popFirst()
       inc spins
       if spins > 500:
         raise newException(TransportTimeoutError, "wire idle")

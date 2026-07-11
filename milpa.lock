@@ -17,7 +17,7 @@ dep "NiGui" {
 }
 
 dep "proptest" {
-    identity "dag-sha256:303185696041ed15e1595ff06b9939a74fdeb4c1284ed86315e89c1a8be7284e"
+    identity "dag-sha256:8050b2cda7b87dce93f14f56557f45825c09936dc4719083775a5e3acd72fc4e"
     version "0.0.1"
     src_dir "src"
     requires "softlink"
@@ -25,13 +25,13 @@ dep "proptest" {
         origin "observed"
         kind "git"
         url "https://github.com/coreyleavitt/proptest.git"
-        ref "main"
-        commit_sha "14cf5007502bbfcb61c238c5b3503cdb56eeda58"
+        ref "99fa2dbe"
+        commit_sha "99fa2dbe418ff8d2fed13bf50af9c442e4f20faa"
     }
 }
 
 dep "softlink" {
-    identity "dag-sha256:765a414b7a6bbb56e62dcdec9a26f000a059a53ddecb998f8c5b820ce8fcb9f3"
+    identity "dag-sha256:07f920621265cc03bbdf803da2ca0ba74290e1622852e6eefc9f0489d8254096"
     version "0.0.1"
     src_dir "src"
     requires
@@ -39,7 +39,21 @@ dep "softlink" {
         origin "observed"
         kind "git"
         url "https://github.com/coreyleavitt/softlink.git"
-        ref "main"
-        commit_sha "7be4d350991f8387b0f84153596e48405ed180d8"
+        ref "v0.5.1"
+        commit_sha "47b8f66048687948e9d05a4ac28d3d0f27736c86"
+    }
+}
+
+dep "z3" {
+    identity "dag-sha256:5ed430c6fbce4e647b10d7a145e23d55d2a3dbe59181699e038bc8abddbbcb11"
+    version "0.0.1"
+    src_dir "src"
+    requires "proptest" "softlink"
+    provenance {
+        origin "observed"
+        kind "git"
+        url "https://github.com/coreyleavitt/nim-z3.git"
+        ref "6a708ed"
+        commit_sha "6a708ede0c0e9c4340c3933296f850d6e11c6cee"
     }
 }

@@ -15,5 +15,15 @@ deps {
 // option parsing, validatePath, tftp_uri). Not a runtime dependency — milpa
 // resolves the root's dev-deps but never a transitive dep's dev-deps.
 dev-deps {
-    "proptest" git=(url)"https://github.com/coreyleavitt/proptest.git" ref="main"
+    // Pinned to the commit carrying the symex fixes (uninit-var zero-init +
+    // discard-raise soundness fix); revert to ref="main" once chapulin re-syncs.
+    "proptest" git=(url)"https://github.com/coreyleavitt/proptest.git" ref="99fa2dbe"
+    // TEMP local shim: proptest's manifest still pins z3 by a dead local= path,
+    // so declare nim-z3 at the root to get its --path emitted. Remove once
+    // proptest's main flips z3 to git=. See docs/rfc/verification-harness.md (D4).
+    "z3" git=(url)"https://github.com/coreyleavitt/nim-z3.git" ref="6a708ed"
+    // Root override: nim-z3 pins softlink v0.5.0, proptest pins main; force
+    // v0.5.1, which fixes softlink's MSVC _Generic const-return verification so
+    // nim-z3's Z3_string procs pass the compile-time _Static_assert under `nim c`.
+    "softlink" git=(url)"https://github.com/coreyleavitt/softlink.git" ref="v0.5.1"
 }

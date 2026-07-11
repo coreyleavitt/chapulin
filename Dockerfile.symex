@@ -1,0 +1,35 @@
+# escape=`
+# chapulin symex toolchain image: the nim base + Z3, for the OPT-IN
+# symbolic-execution test suite (tests/t_symex*.nim -> proptest/symex ->
+# coreyleavitt/nim-z3 -> softlink `dynlib "z3"`).
+#
+# Z3 is loaded at runtime by softlink's OS-expanded pattern ((libz3|z3).dll on
+# Windows) and its header is needed at COMPILE time for softlink's _Static_assert
+# signature check (the FFI procs carry `{.cdecl, header: "z3.h".}`). The default
+# suite never imports z3, so this image is a strict superset of the base — the
+# normal `dev-test.ps1` run is unaffected whether it uses this image or the base.
+#
+# Build (Windows engine):
+#   $env:DOCKER_CONTEXT="desktop-windows"
+#   docker build -f Dockerfile.symex -t chapulin-symex:2.2.10 .
+FROM ghcr.io/coreyleavitt/nim:2.2.10
+
+# Base SHELL is Windows PowerShell 5.1 (no `&&`; bare curl/tar are cmdlet
+# aliases, so call the .exe). Self-contained: no reliance on Docker ARG/ENV
+# substitution inside RUN. Bump $v to change the pinned Z3 version.
+RUN $ErrorActionPreference='Stop'; `
+    $v='4.13.4'; `
+    curl.exe -L -o C:\z3.zip "https://github.com/Z3Prover/z3/releases/download/z3-$v/z3-$v-x64-win.zip"; `
+    if ($LASTEXITCODE -ne 0) { throw 'curl failed' }; `
+    Expand-Archive -Path C:\z3.zip -DestinationPath C:\ -Force; `
+    Move-Item "C:\z3-$v-x64-win" C:\z3; `
+    Remove-Item C:\z3.zip; `
+    if (!(Test-Path C:\z3\bin\libz3.dll)) { throw 'libz3.dll missing after extract' }; `
+    if (!(Test-Path C:\z3\include\z3.h))  { throw 'z3.h missing after extract' }
+
+# Put libz3.dll on PATH so LoadLibrary resolves it at runtime. NOTE: this classic
+# Windows builder does NOT perform `${PATH}` substitution in ENV, so an
+# `ENV PATH="C:\z3\bin;${PATH}"` would clobber PATH (dropping nim). Append to the
+# live machine PATH from a RUN instead. Separate layer so the download stays cached.
+RUN $ErrorActionPreference='Stop'; `
+    [Environment]::SetEnvironmentVariable('Path', $env:Path + ';C:\z3\bin', 'Machine')

@@ -1,0 +1,4 @@
+fixture file for the slice-3 lexical containment fuzz target — committed,
+symlink-free (see docs/rfc/verification-harness.md D3: "fuzz the string,
+not the fs"). Do not add symlinks/junctions to this tree; those are
+covered by the dynamic e2e tests in t_security.nim instead.

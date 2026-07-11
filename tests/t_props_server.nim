@@ -18,6 +18,7 @@ import ../src/chapulin/server          # handleRrq, handleWrq
 import ../src/chapulin/server_config
 import ../src/chapulin/security         # canonicalize, isReservedSidecarName (H1 capability probe)
 import ./wireharness
+import ./fuzzsupport  # toByteSeq (R2-1: wireharness no longer re-exports it)
 
 let serverRoot = getTempDir() / "chapulin_props_server"
 

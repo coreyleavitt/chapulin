@@ -414,6 +414,45 @@ suite "recvBlocks":
     check result.success == false
     check "Denied" in result.errorMsg
 
+  test "S4-14 RED: write failure on the FINAL block must fail the transfer, not report success":
+    # Mirrors the api.nim/server.nim wiring: onData's write "fails" on the
+    # final (short) block, and that failure is surfaced OUT-OF-BAND via
+    # cancelCheck (writeError side-channel) -- not via onData's return value,
+    # since onData is void. Before the S4-14 fix, recvBlocks ACKs the final
+    # block and returns success:true straight out of the dally epilogue
+    # WITHOUT ever re-checking cancelCheck after that last onData call.
+    let mt = newMock()
+    let fullBlock = newSeq[byte](512)
+    mt.addResponse(makeDataPkt(1, fullBlock))
+    mt.addResponse(makeDataPkt(2, @[byte 0xFF]))  # short = final
+    let config = newTransferConfig()
+    let peer = newPeer("10.0.0.1", 5000, locked = true)
+    var writeError = ""
+    let onData = proc(blockNum: uint16, data: seq[byte]) =
+      if data.len < config.blocksize:
+        writeError = "Write failed"
+    let combinedCancel = proc(): bool = writeError.len > 0
+    let result = waitFor recvBlocks(mt.toTransport, config, peer, 1, onData,
+                                     cancelCheck = combinedCancel)
+    check result.success == false
+
+  test "S4-14 RED: write failure on a SINGLE-block (only-block) transfer must fail the transfer":
+    # Same as above, but the failing block is both the first AND the final
+    # block -- the transfer never even reaches a second loop iteration where
+    # the top-of-loop cancelCheck would otherwise have caught a non-final
+    # write failure.
+    let mt = newMock()
+    mt.addResponse(makeDataPkt(1, @[byte 1, 2, 3]))  # short = final, only block
+    let config = newTransferConfig()
+    let peer = newPeer("10.0.0.1", 5000, locked = true)
+    var writeError = ""
+    let onData = proc(blockNum: uint16, data: seq[byte]) =
+      writeError = "Write failed"
+    let combinedCancel = proc(): bool = writeError.len > 0
+    let result = waitFor recvBlocks(mt.toTransport, config, peer, 1, onData,
+                                     cancelCheck = combinedCancel)
+    check result.success == false
+
 suite "recvBlocks windowed (RFC 7440)":
   test "windowsize=2 receives 2 blocks then ACKs the last":
     let mt = newMock()

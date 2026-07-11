@@ -1,8 +1,9 @@
 ## Shared test helpers — async mock transport, packet constructors.
 
-import std/asyncdispatch
+import std/[asyncdispatch, tables, options]
 import ../src/chapulin/protocol
 import ../src/chapulin/transfer
+import ../src/chapulin/blocksource
 
 type
   MockResponse* = object
@@ -69,3 +70,32 @@ proc makeErrorPkt*(code: TftpErrorCode, msg: string): TftpPacket =
 
 proc makeOackPkt*(options: seq[(string, string)]): TftpPacket =
   TftpPacket(opcode: opOack, oackOptions: options)
+
+# ---------------------------------------------------------------------------
+# Shared in-RAM table factories (RFC in-memory-sources-sinks.md §5.1, slice
+# 5/"6") -- the harness-only composition that lets a two-session Wire demo
+# use ONE TableRef[string, seq[byte]] as both parties' "filesystem": a
+# client PUT commits into the table on finish(); a subsequent server-GET of
+# the SAME path must observe that commit, not a construction-time snapshot.
+# ---------------------------------------------------------------------------
+
+proc tableSourceFactory*(t: TableRef[string, seq[byte]]): BlockSourceFactory =
+  ## Looks the path up at CALL time (every invocation re-reads `t`), not at
+  ## the moment this factory is constructed -- otherwise a reader built
+  ## before a writer's `finish()` would capture a stale/empty view.
+  result = proc(path: string): Option[OpenedSource] =
+    if not t.hasKey(path): none(OpenedSource)
+    else: some((memoryBlockSource(t[path]), some(t[path].len.int64)))
+
+proc tableSinkFactory*(t: TableRef[string, seq[byte]]): BlockSinkFactory =
+  ## Wraps `memoryBlockSink`'s own `finish` so that on a SUCCESSFUL terminal
+  ## flush, the accumulated buffer is committed into the shared table under
+  ## `path` -- the only way a subsequent same-table read can see it.
+  result = proc(path: string): BlockSink =
+    let buf = new(seq[byte])
+    var s = memoryBlockSink(buf)
+    let inner = s.finish
+    s.finish = proc(success: bool): bool =
+      result = inner(success)
+      if success: t[path] = buf[]
+    s

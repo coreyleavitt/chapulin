@@ -59,6 +59,7 @@
 import std/[deques, tables, options]
 import logging
 import protocol
+import coverpragma
 
 type
   EventKind* = enum
@@ -197,7 +198,22 @@ proc initEventQueue*(cap: int): EventQueue =
 proc len*(q: EventQueue): int =
   q.order.len
 
-proc tryPopFirst*(q: var EventQueue): Option[Event] =
+proc hasLiveProgressKey*(q: EventQueue, id: TransferId): bool =
+  ## Introspection seam (RFC verification-harness.md D6/slice 6): true iff
+  ## `id` currently has a live (un-drained) progress event queued -- the
+  ## externally-observable form of the `progressKey` invariant documented
+  ## above. Read-only; exposes no mutation surface over `progressKey`.
+  q.progressKey.hasKey(id)
+
+proc pendingDropCount*(q: EventQueue): int =
+  ## Introspection seam (RFC verification-harness.md D6/slice 6): the
+  ## coalesced drop/eviction count still pending a synthetic warning flush
+  ## (see `droppedLogCount`/`flushWarningIfRoom`). Read-only. Named apart
+  ## from the private `droppedLogCount` field (not re-using that name) so
+  ## there's no same-name field/proc shadowing to reason about.
+  q.droppedLogCount
+
+proc tryPopFirst*(q: var EventQueue): Option[Event] {.cover.} =
   ## Never raises (unlike `deques.popFirst` on an empty deque). Pops the
   ## front key, returns its payload, and -- in the same step -- clears
   ## `progressKey[id]` if that key was id's live progress key. One code
@@ -269,7 +285,7 @@ proc flushWarningIfRoom(q: var EventQueue) =
                    sLevel: llWarn,
                    sMessage: "dropped " & $n & " events (queue cap)"))
 
-proc push*(q: var EventQueue, ev: Event) =
+proc push*(q: var EventQueue, ev: Event) {.cover.} =
   ## Coalesce (O(1), position-preserving), then bound + evict, then flush
   ## any pending dropped-count synthetic warning, then append.
   ##

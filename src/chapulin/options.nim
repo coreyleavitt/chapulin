@@ -4,6 +4,7 @@
 
 import std/strutils
 import transfer
+import coverpragma
 
 type
   NegotiatedOptions* = object
@@ -63,7 +64,7 @@ proc reject(reason: string): OackOutcome =
   OackOutcome(ok: false, negotiated: defaultNegotiated(), rejectReason: reason)
 
 proc validateAndParseOack*(returned, requested: seq[(string, string)],
-                          configuredTimeout: int = DefaultTimeout): OackOutcome =
+                          configuredTimeout: int = DefaultTimeout): OackOutcome {.cover.} =
   ## The single, pure, total gate an OACK's raw wire pairs must pass before
   ## anything from it is applied (RFC 2347 clause 9; policy R4). Runs on RAW
   ## values -- clamping a value after the fact (as the removed, dead
@@ -144,7 +145,7 @@ proc negotiateServerOptions*(clientOpts: seq[(string, string)],
                               fileSize: int64 = -1,
                               suppressTsize: bool = false
                              ): tuple[negotiated: NegotiatedOptions,
-                                      oackOptions: seq[(string, string)]] =
+                                      oackOptions: seq[(string, string)]] {.cover.} =
   result.negotiated = defaultNegotiated()
   # D5/R6: seed from the operator's configured limit, not the global protocol
   # default -- so a client that negotiates only blksize/windowsize (never

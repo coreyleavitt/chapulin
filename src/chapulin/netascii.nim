@@ -41,6 +41,8 @@
 ## byte). Both are asserted as explicit documented behavior, not round-tripped.
 
 import protocol
+import coverpragma
+import blocksource
 
 const
   Cr = byte('\r')
@@ -53,18 +55,7 @@ type
   NetasciiDecoder* = object   ## wire -> local
     pendingCr*: bool          ## last byte fed was an unresolved wire CR; deferred
 
-  NetasciiReaderError* = object of CatchableError
-    ## Raised by netasciiReader's returned closure when invoked out of its
-    ## documented contract (blockNum not exactly lastReaderBlock+1). This
-    ## used to be a `doAssert` (an uncatchable `AssertionDefect`, the tracked
-    ## never-throw hazard) -- a plain `CatchableError` subtype instead, so a
-    ## future retry-logic regression that re-invokes the reader out of order
-    ## degrades to a clean transfer failure (sendBlocks' Future fails, and
-    ## every caller already treats a failed Future as an ordinary transfer
-    ## error -- see api.nim's `fut.addCallback`/`fut.failed` and server.nim's
-    ## `run`'s `hf.addCallback`/`hf.failed`) instead of crashing the process.
-
-proc feed*(e: var NetasciiEncoder, input: openArray[byte]): seq[byte] =
+proc feed*(e: var NetasciiEncoder, input: openArray[byte]): seq[byte] {.cover.} =
   ## Encode local bytes to wire bytes. `LF` -> `CR LF`; a lone `CR` (not
   ## immediately followed by `LF`) -> `CR NUL`. Never resolves a `CR` that is
   ## the last byte of `input` by peeking past the end of this call — it sets
@@ -93,14 +84,14 @@ proc feed*(e: var NetasciiEncoder, input: openArray[byte]): seq[byte] =
     else:
       result.add b
 
-proc flush*(e: var NetasciiEncoder): seq[byte] =
+proc flush*(e: var NetasciiEncoder): seq[byte] {.cover.} =
   ## Resolve a trailing lone CR (true end-of-stream) to its lone-CR encoding.
   if e.pendingCr:
     result.add Cr
     result.add Nul
     e.pendingCr = false
 
-proc feed*(d: var NetasciiDecoder, input: openArray[byte]): seq[byte] =
+proc feed*(d: var NetasciiDecoder, input: openArray[byte]): seq[byte] {.cover.} =
   ## Decode wire bytes to local bytes. `CR LF` -> `LF`; `CR NUL` -> `CR`. A
   ## wire `CR` followed by neither (non-conformant input) decodes as a
   ## literal `CR`, and the byte after it is reprocessed fresh (see module
@@ -126,112 +117,92 @@ proc feed*(d: var NetasciiDecoder, input: openArray[byte]): seq[byte] =
     else:
       result.add b
 
-proc flush*(d: var NetasciiDecoder): seq[byte] =
+proc flush*(d: var NetasciiDecoder): seq[byte] {.cover.} =
   ## Resolve a trailing lone wire CR (true end-of-stream) to a literal CR.
   if d.pendingCr:
     result.add Cr
     d.pendingCr = false
 
-proc netasciiReader*(file: File, enc: sink NetasciiEncoder): proc(blockNum: uint16, blocksize: int): seq[byte] =
-  ## Block-chunking read adapter (D1b) for the netascii SEND side. Translation
-  ## is expansive and data-dependent, so the seek-addressed `(blockNum-1)*blocksize`
-  ## closure octet mode uses (server.nim's original RRQ readData) is invalid here
-  ## -- the wire offset of a given local byte depends on how many LFs/CRs
-  ## preceded it. This closure instead reads the *local* file strictly forward,
-  ## feeds each chunk through `enc`, and buffers translated (wire) bytes in a
-  ## `carry` seq until it can hand back a full `blocksize` chunk.
-  ##
-  ## Returned closure has the SAME type as sendBlocks' existing seek-addressed
-  ## `readData` (transfer.nim's `proc(blockNum: uint16, blocksize: int): seq[byte]`)
-  ## -- sendBlocks needs no type change. `blockNum` is used ONLY to assert
-  ## strictly-ascending, exactly-once-per-block calls (sendBlocks' load-bearing
-  ## invariant: retransmits replay its own `windowCache`, never re-invoke
-  ## `readData`) -- never for seeking, since seeking the encoded stream isn't
-  ## meaningful (the encoder carries state across calls).
-  ##
-  ## Read-ahead / EOF contract (round-2 false-EOF bug): a short return means
-  ## EOF *only* when the underlying `file` read itself returned 0 bytes. A
-  ## block landing short purely because a straddled CR deferred one byte into
-  ## `enc`'s internal state is NOT eof -- the loop below keeps pulling raw
-  ## bytes and feeding them until either the carry buffer holds >= blocksize,
-  ## or the file truly runs dry (at which point `enc.flush()` resolves any
-  ## trailing deferred CR and whatever remains, however short, is the final
-  ## return).
-  ##
-  ## `carry` (not-yet-emitted translated overflow) is distinct from
-  ## sendBlocks' `windowCache` (already-emitted bytes kept only for retransmit
-  ## replay) -- the two must never be conflated.
-  ##
-  ## `enc` is `sink` (not `var`): Nim refuses to let a closure capture a
-  ## `var` parameter at all (it is a hidden pointer into the caller's stack
-  ## frame, which the closure would outlive -- a memory-safety violation the
-  ## compiler rejects outright), so the pre-`sink` version copied `enc` into
-  ## a local (`var encState = enc`) purely to have something capturable.
-  ## `sink` expresses the real contract directly: ownership of the encoder's
-  ## state fully transfers to the returned closure from this point on; the
-  ## caller's `enc` argument is a one-shot seed (typically freshly
-  ## default-initialized) and is never read again after this call. The local
-  ## copy below is still needed (a closure can't capture a parameter, sink or
-  ## not -- only a local), but `sink` lets the compiler move rather than copy
-  ## at the call site when the caller's argument is itself a fresh value.
-  var encState = enc
+proc netasciiBlockSource*(inner: BlockSource): BlockSource =
+  ## Local -> wire. Same state machine as the old `netasciiReader` (carry
+  ## buffer + `NetasciiEncoder`), now pulling from ANY forward `BlockSource`
+  ## instead of a `File` directly (RFC in-memory-sources-sinks.md §4).
+  var enc: NetasciiEncoder
   var carry: seq[byte] = @[]
   var trueEof = false
-  var lastReaderBlock: uint16 = 0
-  result = proc(blockNum: uint16, blocksize: int): seq[byte] =
-    if blockNum != lastReaderBlock + 1:
-      raise newException(NetasciiReaderError,
-        "netasciiReader: readData must be invoked exactly once per block, " &
-        "strictly ascending -- retransmits must replay sendBlocks' windowCache, " &
-        "never re-invoke the reader (would silently corrupt a netascii transfer)")
-    lastReaderBlock = blockNum
-
+  result.read = proc(n: int): seq[byte] =
     if not trueEof:
-      while carry.len < blocksize:
-        var raw = newSeq[byte](blocksize)
-        let bytesRead = file.readBytes(raw, 0, blocksize)
-        if bytesRead == 0:
+      while carry.len < n:
+        let raw = inner.read(n)
+        if raw.len == 0:
           trueEof = true
-          carry.add encState.flush()
+          carry.add enc.flush()
           break
-        raw.setLen(bytesRead)
-        carry.add encState.feed(raw)
+        carry.add enc.feed(raw)
+    let take = min(n, carry.len)
+    result = carry[0 ..< take]
+    carry = if take < carry.len: carry[take ..< carry.len] else: @[]
+  result.close = inner.close   # a decorator MUST forward close, or the
+                               # wrapped handle leaks / a nil close crashes.
 
-    let n = min(blocksize, carry.len)
-    result = carry[0 ..< n]
-    carry = if n < carry.len: carry[n ..< carry.len] else: @[]
+proc netasciiBlockSink*(inner: BlockSink): BlockSink =
+  ## Wire -> local. Same `NetasciiDecoder` state machine, writing through
+  ## ANY inner `BlockSink`.
+  var dec: NetasciiDecoder
+  result.write = proc(data: seq[byte]): bool =
+    let decoded = dec.feed(data)
+    decoded.len == 0 or inner.write(decoded)
+  result.finish = proc(success: bool): bool =
+    if not success: return inner.finish(false)
+    let tail = dec.flush()
+    let tailOk = tail.len == 0 or inner.write(tail)
+    inner.finish(true) and tailOk
+  result.close = inner.close   # forward close through the decorator.
 
-proc makeSendReader*(file: File, mode: TransferMode, enc: var NetasciiEncoder): proc(blockNum: uint16, blocksize: int): seq[byte] =
-  ## Send-side seam (D1b/d unification, RFC code-review handoff): owns the
-  ## choice between the block-chunking netascii reader (`netasciiReader`,
-  ## above) and the seek-addressed octet closure, so callers
-  ## (`server.handleRrq`, `api.nim`'s `tdPut` closure) each call ONE
-  ## function instead of branching on a `useBlockChunkedReader` policy bit
-  ## and hand-rolling the octet fallback closure themselves at every call
-  ## site. Returns a closure of the exact same type `sendBlocks`
-  ## (transfer.nim) already expects as `readData` -- no change needed there,
-  ## and no change to sendBlocks' load-bearing "readData called at most once
-  ## per block, strictly ascending" contract (the octet closure below is
-  ## seek-addressed and idempotent regardless of call count/order; the
-  ## netascii branch's own invariant is documented on `netasciiReader`).
+proc netasciiReader*(file: File, enc: sink NetasciiEncoder): proc(blockNum: uint16, blocksize: int): seq[byte] =
+  ## Thin compat shim (RFC in-memory-sources-sinks.md, slice 2) over the
+  ## general `netasciiBlockSource`/`toReadData` seam. `enc` is accepted for
+  ## historical call-site shape only -- every caller passes a freshly
+  ## default-initialized encoder that is never read again, and
+  ## `netasciiBlockSource` now owns its own encoder state internally, so
+  ## `enc` itself is unused here. Retained as a directly-tested compat shim
+  ## (see `tests/t_netascii.nim`) -- there is no current `src/` production
+  ## caller; `makeSendReader`/`makeRecvHandler` (below) are the production
+  ## seam.
   ##
-  ## `enc` is forwarded straight through to `netasciiReader` under netascii
-  ## (see its doc for the by-value capture discipline -- ownership of the
-  ## encoder's state transfers to the returned closure); under octet it is
-  ## simply unused. Callers pass a freshly default-initialized `var`
-  ## unconditionally either way, so the call site itself needs no mode
-  ## branch.
-  if mode == tmNetascii:
-    netasciiReader(file, enc)
-  else:
-    proc(blockNum: uint16, blocksize: int): seq[byte] =
-      if blockNum == 0: return @[]
-      let offset = int64(blockNum - 1) * int64(blocksize)
-      file.setFilePos(offset)
-      var buf = newSeq[byte](blocksize)
-      let bytesRead = file.readBytes(buf, 0, blocksize)
-      buf.setLen(bytesRead)
-      return buf
+  ## The returned closure now raises `BlockSourceOrderError` (blocksource.nim)
+  ## where this used to raise `NetasciiReaderError` on an out-of-order call --
+  ## the ascending-once guard moved to `toReadData`, which applies it
+  ## uniformly to every `BlockSource`, not just netascii.
+  toReadData(netasciiBlockSource(fileBlockSource(file)))
+
+proc makeSendReader*(source: BlockSource, mode: TransferMode): proc(blockNum: uint16, blocksize: int): seq[byte] =
+  ## Send-side seam (D1b/d unification): owns the choice between wrapping
+  ## `source` in the netascii decorator (`netasciiBlockSource`, above) and
+  ## using it plain under octet, so callers (`server.handleRrq`, `api.nim`'s
+  ## `tdPut` closure) each call ONE function instead of branching on mode
+  ## themselves. Returns a closure of the exact same type `sendBlocks`
+  ## (transfer.nim) already expects as `readData` -- no change needed there.
+  ##
+  ## Callers no longer own a `var netasciiEnc: NetasciiEncoder` -- the
+  ## decorator owns its own state entirely (RFC in-memory-sources-sinks.md §4).
+  toReadData(if mode == tmNetascii: netasciiBlockSource(source) else: source)
+
+proc makeRecvHandler*(sink: BlockSink, mode: TransferMode): proc(data: seq[byte], isFinal: bool): bool =
+  ## Recv-side seam (D1c unification) -- the receive-side mirror of
+  ## `makeSendReader`: owns decode-feed + per-block write + terminal
+  ## finalize for BOTH octet and netascii RECEIVE paths, wrapping `sink` in
+  ## the netascii decorator (`netasciiBlockSink`, above) under netascii,
+  ## plain otherwise (RFC in-memory-sources-sinks.md §4).
+  ##
+  ## Renamed from `makeRecvSink` (code-review S4-6): it takes a `BlockSink`
+  ## but RETURNS an `onData`-shaped closure (`proc(data, isFinal): bool`),
+  ## NOT a `BlockSink` -- the old name mispromised the return type.
+  let s = if mode == tmNetascii: netasciiBlockSink(sink) else: sink
+  result = proc(data: seq[byte], isFinal: bool): bool =
+    result = s.write(data)
+    if isFinal:
+      if not s.finish(result): result = false
 
 proc toNetascii*(data: seq[byte]): seq[byte] =
   ## One-shot local -> wire convenience wrapper over `NetasciiEncoder`, for
@@ -246,99 +217,6 @@ proc fromNetascii*(data: seq[byte]): seq[byte] =
   ## `toNetascii` for the streaming caveat.
   var dec: NetasciiDecoder
   result = dec.feed(data) & dec.flush()
-
-proc writeNetasciiTail*(tail: seq[byte], writeBytes: proc(data: seq[byte]): int): bool =
-  ## Terminal-tail write seam (Fix A, RFC code-review handoff): performs the
-  ## actual disk write of `tail` (the netascii decoder's resolved trailing
-  ## byte, if any -- `dec.flush()`'s result) through the injected
-  ## `writeBytes` closure, and reports whether every tail byte was written.
-  ## `writeBytes` mirrors `File.writeBytes`'s contract (returns the actual
-  ## byte count written, which can be short on `ENOSPC`/similar) so tests can
-  ## inject a short-writing fake without faking an entire `File`.
-  ##
-  ## An empty tail is trivially ok and never invokes `writeBytes` at all --
-  ## most blocks have no deferred CR to resolve, and this must not be
-  ## mistaken for (or require) a zero-byte write attempt.
-  if tail.len == 0:
-    return true
-  writeBytes(tail) == tail.len
-
-proc finishNetasciiDecode*(file: File, dec: var NetasciiDecoder, success: bool): bool {.discardable.} =
-  ## Terminal decode flush (D1c), shared by BOTH netascii RECEIVE-side write
-  ## paths: `server.handleWrq` (server WRQ) and `api.nim`'s `tdGet` closure
-  ## (client GET, which owns its file handle directly rather than through
-  ## `engine.nim`). Each caller detects "this is the final block" the same
-  ## way the transfer layer does (`data.len < blocksize`) and calls this at
-  ## that point -- writing any trailing byte `dec.flush()` resolves (a
-  ## deferred lone wire `CR` at true end-of-stream) and durably flushing the
-  ## file to disk.
-  ##
-  ## `success` gates the write: called unconditionally with whatever success
-  ## state the caller has just determined, rather than each call site
-  ## wrapping the call itself in an `if`, so both callers share one shape. A
-  ## failed or aborted transfer must NOT flush a partial decode as if the
-  ## stream had ended cleanly -- the decoder's dangling `pendingCr` (if any)
-  ## does not describe the true tail of the file in that case, and writing
-  ## it would silently fabricate a byte that was never confirmed delivered.
-  ##
-  ## Returns `true` iff the terminal tail write (if any) fully succeeded, or
-  ## there was nothing to attempt (`success == false`, or an empty tail).
-  ## Returns `false` iff a non-empty tail was short-written -- the ONE write
-  ## site in this module that used to `discard` this outcome (RFC code-
-  ## review finding, Fix A): a short/`ENOSPC` write on this final ≤1-byte
-  ## flush used to be invisible, reporting a truncated file as a successful
-  ## transfer. Callers MUST fold a `false` return into the same write-
-  ## failure/`writeError` path they already use for per-block write
-  ## mismatches -- `{.discardable.}` exists only so the pre-existing direct
-  ## unit tests of this proc (which assert on file contents, not the return
-  ## value) don't need a `discard` at every call, NOT as license for a
-  ## production call site to ignore it.
-  if not success:
-    return true
-  let tail = dec.flush()
-  result = writeNetasciiTail(tail, proc(data: seq[byte]): int = file.writeBytes(data, 0, data.len))
-  flushFile(file)
-
-proc makeRecvSink*(file: File, mode: TransferMode): proc(data: seq[byte], isFinal: bool): bool =
-  ## Recv-side seam (D1c unification) -- the receive-side mirror of
-  ## `makeSendReader`: owns decode-feed + per-block write + terminal
-  ## finalize + write-failure detection for BOTH octet and netascii RECEIVE
-  ## paths, so callers (`server.handleWrq`, `api.nim`'s `tdGet` closure)
-  ## collapse their `onData` bodies to the same shape regardless of mode --
-  ## no in-body `if netascii` branch, no hand-rolled final-block
-  ## `finishNetasciiDecode` call at either site.
-  ##
-  ## The returned closure writes `data` to `file` -- decoded through a
-  ## `NetasciiDecoder` owned by this closure under netascii, verbatim under
-  ## octet -- and, when `isFinal` is true (the caller's existing
-  ## `data.len < blocksize` final-block signal, unchanged), also performs
-  ## the terminal step: netascii's `finishNetasciiDecode` (the deferred-CR
-  ## tail write + durable flush) or octet's plain `flushFile`. Octet's
-  ## terminal flush is skipped if THIS call's own per-block write already
-  ## failed -- mirrors the pre-existing
-  ## `elif writeError.len == 0: flushFile(file)` shape exactly.
-  ##
-  ## Returns `true` iff this call's write(s) fully succeeded; `false` iff
-  ## the per-block write, or (at the final block) the terminal tail write,
-  ## was short/failed. This closure has no memory of a PRIOR call's
-  ## failure -- the caller is still responsible for short-circuiting future
-  ## calls once it observes a `false`, exactly like the pre-refactor
-  ## per-call-site `if writeError.len > 0: return` guard, which stays at
-  ## the call site (it is caller-side state, not this closure's job to own).
-  var dec: NetasciiDecoder
-  result = proc(data: seq[byte], isFinal: bool): bool =
-    result = true
-    let toWrite = if mode == tmNetascii: dec.feed(data) else: data
-    if toWrite.len > 0:
-      let written = file.writeBytes(toWrite, 0, toWrite.len)
-      if written != toWrite.len:
-        result = false
-    if isFinal:
-      if mode == tmNetascii:
-        if not finishNetasciiDecode(file, dec, result):
-          result = false
-      elif result:
-        flushFile(file)
 
 # --- D1d: the netascii-mode policy seam --------------------------------------
 ##
@@ -369,7 +247,7 @@ proc makeRecvSink*(file: File, mode: TransferMode): proc(data: seq[byte], isFina
 ## What used to be separate fields here -- routing the send-side file read
 ## through `netasciiReader` vs. the seek-addressed octet closure, and routing
 ## the recv-side file write through a `NetasciiDecoder` vs. writing wire
-## bytes as-is -- is now decided INSIDE `makeSendReader`/`makeRecvSink`
+## bytes as-is -- is now decided INSIDE `makeSendReader`/`makeRecvHandler`
 ## themselves (both above), which take `mode` directly rather than exposing
 ## it as a policy bit callers had to re-read and branch on. Removing them
 ## from this object is the point of that refactor: no field survives here

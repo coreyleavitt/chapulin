@@ -2,6 +2,7 @@
 ## Implements RFC 1350 + RFC 2347/2348/2349 extensions.
 
 import std/strutils
+import coverpragma
 
 type
   TftpOpcode* = enum
@@ -147,7 +148,7 @@ proc encode*(packet: TftpPacket): seq[byte] =
   of opOack:
     result.addOptions(packet.oackOptions)
 
-proc decode*(data: seq[byte]): TftpPacket =
+proc decode*(data: seq[byte]): TftpPacket {.cover.} =
   if data.len < 2:
     raise newException(TftpDecodeError, "Packet too short: " & $data.len & " bytes")
 

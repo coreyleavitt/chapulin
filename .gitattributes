@@ -1,0 +1,12 @@
+# The fuzz/regression corpus (proptest directoryBasedDatabase, slice 5) is strict
+# binary — [u8 version][u64 counts][raw serialized choice bytes]. With
+# core.autocrlf=true (this repo's setting) git's content heuristic could rewrite
+# embedded 0x0A → 0x0D 0x0A on add/checkout, silently corrupting the replay data.
+# `-text` alone only suppresses CRLF normalization; git's diff/merge machinery
+# still falls back to its own binary-sniffing heuristic per file, which a small
+# corpus entry (a version byte + a handful of choice bytes, not guaranteed to
+# contain a NUL in the first chunk) can slip past. Use git's built-in `binary`
+# macro (`-diff -merge -text`) so corpus entries are never normalized, diffed, or
+# 3-way-merged — a merge conflict on a corpus file should hard-stop, not silently
+# splice two byte streams together.
+tests/corpus/** binary

@@ -17,7 +17,7 @@
 ##
 ## SUT procs opt in with `{.cover.}`; nothing else about them changes.
 when defined(chapulinFuzz):
-  import proptest/coverage
+  import nelli/coverage
   export cover                      # re-export the macro under its own name
 else:
   # Exported no-op user pragma. NOTE (deviation from the RFC's own sketch,

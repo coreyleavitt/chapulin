@@ -11,7 +11,7 @@
 ##     nim c -r tests/t_format.nim
 
 import std/unittest
-import proptest
+import nelli
 import ../src/chapulin/format
 
 proc arbitraryChars(maxLen = 40): Strategy[string] =

@@ -1,6 +1,6 @@
 import unittest
 import std/[os, strutils, asyncdispatch, options]
-import proptest
+import nelli
 import ../src/chapulin/protocol
 import ../src/chapulin/transfer
 import ../src/chapulin/options

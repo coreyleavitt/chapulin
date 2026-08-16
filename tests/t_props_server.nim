@@ -11,7 +11,7 @@
 ##     nim c -r tests/t_props_server.nim
 
 import std/[unittest, os, asyncdispatch, strutils, md5, tables]  # asyncdispatch: Future only
-import proptest
+import nelli
 import ../src/chapulin/protocol
 import ../src/chapulin/engine          # getFile, putFile, newDefaultConfig
 import ../src/chapulin/server          # handleRrq, handleWrq

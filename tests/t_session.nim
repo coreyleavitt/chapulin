@@ -11,7 +11,7 @@
 
 import std/unittest
 import std/[os, asyncdispatch, strutils, options, times]
-import proptest
+import nelli
 import ../src/chapulin/api
 import ../src/chapulin/server
 import ../src/chapulin/server_config

@@ -1,7 +1,7 @@
 import unittest
 import std/os
 import std/strutils
-import proptest
+import nelli
 import fuzzsupport
 import ../src/chapulin/protocol
 import ../src/chapulin/server_config

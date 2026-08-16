@@ -16,7 +16,7 @@
 
 import std/unittest
 import std/strutils
-import proptest
+import nelli
 import fuzzsupport
 
 import ../src/chapulin/protocol

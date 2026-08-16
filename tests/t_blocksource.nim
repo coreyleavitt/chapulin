@@ -7,7 +7,7 @@
 
 import std/unittest
 import std/os
-import proptest
+import nelli
 import fuzzsupport
 import ../src/chapulin/blocksource
 

@@ -10,7 +10,7 @@
 ##     nim c -r tests/t_props_transfer.nim
 
 import std/unittest
-import proptest
+import nelli
 import ../src/chapulin/transfer
 import ./wireharness
 import ./fuzzsupport  # toByteSeq (R2-1: wireharness no longer re-exports it)

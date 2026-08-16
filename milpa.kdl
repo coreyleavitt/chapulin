@@ -15,15 +15,22 @@ deps {
 // option parsing, validatePath, tftp_uri). Not a runtime dependency — milpa
 // resolves the root's dev-deps but never a transitive dep's dev-deps.
 dev-deps {
-    // Pinned to the commit carrying the symex fixes (uninit-var zero-init +
-    // discard-raise soundness fix); revert to ref="main" once chapulin re-syncs.
-    "proptest" git=(url)"https://github.com/coreyleavitt/proptest.git" ref="99fa2dbe"
-    // TEMP local shim: proptest's manifest still pins z3 by a dead local= path,
-    // so declare nim-z3 at the root to get its --path emitted. Remove once
-    // proptest's main flips z3 to git=. See docs/rfc/verification-harness.md (D4).
-    "z3" git=(url)"https://github.com/coreyleavitt/nim-z3.git" ref="6a708ed"
-    // Root override: nim-z3 pins softlink v0.5.0, proptest pins main; force
-    // v0.5.1, which fixes softlink's MSVC _Generic const-return verification so
-    // nim-z3's Z3_string procs pass the compile-time _Static_assert under `nim c`.
-    "softlink" git=(url)"https://github.com/coreyleavitt/softlink.git" ref="v0.5.1"
+    // proptest v0.3.0 — consumed from the tianguis REGISTRY (published 2026-08-07;
+    // v0.2.0 was git-tag-pinned only because a gh-actions outage delayed its
+    // publish). v0.3.2 is the current stack; the 0.1.0→0.3.2 fix batches closed
+    // the large majority of chapulin's findings (see docs/proptest-findings.md).
+    // NOTE (2026-08-07): pinned by git TAG because the live tianguis index
+    // (coreyleavitt/tianguis/main/index.kdl) still only lists proptest 0.1.0 —
+    // the publish workflow hasn't landed 0.2.x/0.3.x. Switch to the registry form
+    // `"proptest" "==0.3.2"` once the index carries it.
+    "nelli" git=(url)"https://github.com/coreyleavitt/nelli.git" ref="v0.4.0"
+    // Root pins to DISAMBIGUATE from same-named tianguis registry packages
+    // (milpa's dependency-confusion guard, 2026-08-05): the registry's "z3" is
+    // github.com/zevv/z3 — chapulin needs coreyleavitt/nim-z3, a DISTINCT fork —
+    // so it must be pinned explicitly at the root, not left transitive. softlink
+    // (our own) is pinned to v0.11.1, the version nim-z3 main now requires.
+    // (Supersedes the 2026-08-04 "shims are redundant" removal: redundant under
+    // pure-git resolution, but required once the deps landed in tianguis.)
+    "z3" git=(url)"https://github.com/coreyleavitt/nim-z3.git" ref="main"
+    "softlink" git=(url)"https://github.com/coreyleavitt/softlink.git" ref="v0.11.1"
 }

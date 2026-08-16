@@ -10,7 +10,7 @@
 import std/unittest
 import std/sequtils
 import std/os
-import proptest
+import nelli
 import fuzzsupport
 import ../src/chapulin/netascii
 import ../src/chapulin/blocksource

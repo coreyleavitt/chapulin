@@ -12,7 +12,7 @@ import std/options
 import ../src/chapulin/eventqueue
 import ../src/chapulin/logging
 import ../src/chapulin/protocol
-import proptest
+import nelli
 import fuzzsupport
 
 proc mkProgress(id: TransferId, bytes: int64): Event =

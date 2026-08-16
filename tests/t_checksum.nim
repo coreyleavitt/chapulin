@@ -2,7 +2,7 @@ import unittest
 import std/md5
 import std/os
 import std/strutils
-import proptest
+import nelli
 import fuzzsupport
 import ../src/chapulin/checksum
 import ../src/chapulin/server_config

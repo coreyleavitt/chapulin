@@ -26,9 +26,9 @@ dep "nelli" {
     source {
         kind "git"
         url (url)"https://github.com/coreyleavitt/nelli"
-        ref "v0.5.1"
+        ref "v0.5.2"
     }
-    identity "dag-sha256:408b84de2c2e06544a9917c5ac69bfed8ac1fd6c75f1389b1fb1a123b58795f5"
+    identity "dag-sha256:88cb83e25e95ba9d3f2439e51ef08f84b77351435669fdcf7e9e6da5b843b4bb"
     version "0.4.0"
     declared_version_source "manifest"
     src_dir "src"
@@ -37,8 +37,8 @@ dep "nelli" {
         origin "observed"
         kind "git"
         url "https://github.com/coreyleavitt/nelli.git"
-        ref "v0.5.1"
-        commit_sha "9aae29596c2e000997dfb688876ce1902e370c87"
+        ref "v0.5.2"
+        commit_sha "0df595ee143b2648fe6b283e5026b996b484fa33"
     }
 }
 

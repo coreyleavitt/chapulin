@@ -15,15 +15,13 @@ deps {
 // option parsing, validatePath, tftp_uri). Not a runtime dependency — milpa
 // resolves the root's dev-deps but never a transitive dep's dev-deps.
 dev-deps {
-    // proptest v0.3.0 — consumed from the tianguis REGISTRY (published 2026-08-07;
-    // v0.2.0 was git-tag-pinned only because a gh-actions outage delayed its
-    // publish). v0.3.2 is the current stack; the 0.1.0→0.3.2 fix batches closed
-    // the large majority of chapulin's findings (see docs/proptest-findings.md).
-    // NOTE (2026-08-07): pinned by git TAG because the live tianguis index
-    // (coreyleavitt/tianguis/main/index.kdl) still only lists proptest 0.1.0 —
-    // the publish workflow hasn't landed 0.2.x/0.3.x. Switch to the registry form
-    // `"proptest" "==0.3.2"` once the index carries it.
-    "nelli" git=(url)"https://github.com/coreyleavitt/nelli.git" ref="v0.5.2"
+    // nelli (the property-based testing engine formerly named `proptest`;
+    // renamed upstream, absorbed here — every test `import proptest` is now
+    // `import nelli`). Pinned by git TAG. v0.5.3 is the current stack; see
+    // docs/proptest-findings.md for the per-pin symex re-evaluations. Switch
+    // to the registry form `"nelli" "==0.5.3"` once the live tianguis index
+    // (coreyleavitt/tianguis/main/index.kdl) carries it.
+    "nelli" git=(url)"https://github.com/coreyleavitt/nelli.git" ref="v0.5.3"
     // Root pins to DISAMBIGUATE from same-named tianguis registry packages
     // (milpa's dependency-confusion guard, 2026-08-05): the registry's "z3" is
     // github.com/zevv/z3 — chapulin needs coreyleavitt/nim-z3, a DISTINCT fork —

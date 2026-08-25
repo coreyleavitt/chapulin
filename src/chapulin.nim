@@ -264,7 +264,7 @@ when isMainModule:
       for ev in s.poll(50):
         case ev.kind
         of evServerLog:
-          echo formatLogMessage(ev.sLevel, ev.sMessage)
+          echo formatLogMessage(ev.sLevel, sanitizeForDisplay(ev.sMessage))
         of evServerStarted:
           echo formatLogMessage(llInfo, "Listening on " & ev.boundAddr & ":" & $ev.boundPort)
         of evServerStartFailed:
@@ -276,7 +276,10 @@ when isMainModule:
         of evTransferError:
           stderr.writeLine formatLogMessage(llError, "transfer error: " & sanitizeForDisplay(ev.errorMsg))
         of evTransferStarted, evTransferProgress,
-           evServerStopped:
+           evServerStopped, evServerRejected:
+          # evServerRejected is already surfaced to the operator via evServerLog
+          # (server.nim logs every reject at warn level before signalling it),
+          # so the display loop has nothing extra to print for it.
           discard
 
   of "gui":

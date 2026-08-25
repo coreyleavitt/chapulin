@@ -64,7 +64,8 @@ import coverpragma
 type
   EventKind* = enum
     evTransferStarted, evTransferProgress, evTransferComplete, evTransferError,
-    evServerStarted, evServerStartFailed, evServerStopped, evServerLog
+    evServerStarted, evServerStartFailed, evServerStopped, evServerLog,
+    evServerRejected
 
   TransferDirection* = enum
     tdGet
@@ -107,16 +108,40 @@ type
   Event* = object
     xfrId*: TransferId
     srvId*: ServerId
-    snap*:  TransferSnapshot   ## common field; populated for all evTransfer* kinds; zero for server events
     case kind*: EventKind
-    of evTransferStarted, evTransferProgress, evTransferComplete:
-      discard
-    of evTransferError:
+    of evTransferStarted, evTransferProgress, evTransferComplete, evTransferError:
+      ## M2 (code-review): `snap` used to be a field OUTSIDE this `case` --
+      ## a true common field, structurally readable on every `EventKind`
+      ## including the five server kinds below, where it was always a
+      ## meaningless all-zero `TransferSnapshot` (a plausible-sentinel
+      ## hazard: nothing stopped a caller from reading `ev.snap.bytes` on
+      ## `evServerStarted` and silently getting zero, never a compile error
+      ## or Defect -- the exact hazard `TransferSnapshot.effective` was made
+      ## `Option` to kill one level down, see that type's doc comment
+      ## above). Moved into this `case` arm instead, so `ev.snap` is a
+      ## compile error on any of the five server kinds.
+      ##
+      ## `errorCode`/`errorMsg` join `snap` in this SAME arm rather than a
+      ## separate `of evTransferError:` arm -- Nim forbids two different
+      ## `case` branches from declaring a field with the same name (even
+      ## mutually-exclusive ones), so `snap` cannot live in both an
+      ## evTransferError-only arm and a separate Started/Progress/Complete
+      ## arm; merging all four `evTransfer*` kinds into one arm is the only
+      ## way a single `ev.snap` accessor works uniformly across all of them
+      ## (preserving the R2-2 ergonomics: one name, not `snap`/`errSnap`
+      ## split by kind). This does NOT reopen a plausible-sentinel hazard:
+      ## unlike `snap` on a server kind (no valid transfer-snapshot concept
+      ## applies there at all), `errorCode = none` / `errorMsg = ""` on
+      ## evTransferStarted/Progress/Complete is not a wrong reading of
+      ## meaningless data -- it IS the correct value ("no error").
+      snap*:      TransferSnapshot
       errorCode*: Option[TftpErrorCode]  ## RFC design-bar-closure D5: none =
-      ## local/transport/decode failure, no peer code; some(c) = a genuine
-      ## peer-emitted/decoded TftpErrorCode. See transfer.nim's TransferResult
-      ## .errorCode doc for the full verified-bug rationale.
-      errorMsg*:  string
+      ## local/transport/decode failure, no peer code (or: not an error
+      ## event at all); some(c) = a genuine peer-emitted/decoded
+      ## TftpErrorCode on evTransferError. See transfer.nim's
+      ## TransferResult.errorCode doc for the full verified-bug rationale.
+      errorMsg*:  string  ## "" on evTransferStarted/Progress/Complete (no
+      ## error); the failure message on evTransferError.
     of evServerStarted:
       boundAddr*: string
       boundPort*: int
@@ -127,6 +152,20 @@ type
       sMessage*: string
     of evServerStopped:
       discard
+    of evServerRejected:
+      ## RFC verification-harness-v2.md A4: the server's accept loop rejected
+      ## an inbound request BEFORE a reqId/TransferId was minted (no-available-
+      ## port, host-access denial, or maxConcurrent) -- so, unlike every
+      ## evTransfer* kind above, this carries the rejected peer's raw address
+      ## directly rather than routing through `xfrId` (always `NoTransfer`
+      ## here). `rejCode`/`rejMsg` mirror the ERROR packet actually sent to
+      ## that peer (see `clientSafeError`, server.nim) -- a structured signal
+      ## a session can assert on directly, not a free-text `evServerLog`
+      ## substring.
+      rejClientHost*: string
+      rejClientPort*: int
+      rejCode*:       TftpErrorCode
+      rejMsg*:        string
 
   EventQueue* = object
     order:           Deque[int]             ## arrival-ordered keys (FIFO); every key maps to a real payload
@@ -157,7 +196,8 @@ proc inEffect*(effective: Option[TransferParams], requested: TransferParams): Tr
   effective.get(requested)
 
 const ProtectedKinds = {evTransferComplete, evTransferError,
-                         evServerStopped, evServerStartFailed, evTransferStarted}
+                         evServerStopped, evServerStartFailed, evTransferStarted,
+                         evServerRejected}
   ## H1 (code-review, remote DoS): this used to mean "never dropped, never
   ## evicted to make room" -- but `cap` was consequently NOT a true ceiling:
   ## when the queue was full of protected events with no log-kind event to
@@ -169,6 +209,17 @@ const ProtectedKinds = {evTransferComplete, evTransferError,
   ## room for one), but under sustained saturation with no log-kind event
   ## left to reclaim, the OLDEST queued event -- protected or not -- is
   ## dropped instead of ever exceeding `cap`. See `push`.
+  ##
+  ## M3 (code-review): `evServerRejected` is a terminal-class structured
+  ## signal akin to `evTransferError` -- a server-side accept-loop rejection
+  ## carrying `rejClientHost/rejClientPort/rejCode/rejMsg`. Before this fix
+  ## it fell into the droppable branch (`push`'s `notin ProtectedKinds`
+  ## check) and, under the exact sustained-maxConcurrent saturation scenario
+  ## the reject feature exists to observe, was silently discarded and
+  ## folded into the generic coalesced "dropped N events" warning, losing
+  ## its structured payload. It is now preferred to survive like every
+  ## other terminal/start event in this set, subject to the same
+  ## drop-oldest bound under sustained saturation -- see `push`.
 
 const LogKinds = {evServerLog}
   ## The only kind bounded eviction is allowed to reclaim.

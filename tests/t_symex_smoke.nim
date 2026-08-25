@@ -18,4 +18,7 @@ suite "z3 toolchain smoke":
   test "libz3 loads and reports a version":
     let v = z3FullVersion()      # ensureLoaded() -> Z3_get_full_version()
     check v.len > 0
-    check v.startsWith("Z3")     # e.g. "Z3 4.13.4.0"
+    # nim-z3 main returns the bare dotted version, e.g. "4.13.4.0" (older
+    # bindings prefixed "Z3 "). Assert it's a real version: leading digit + dot.
+    check v[0] in {'0'..'9'}
+    check '.' in v

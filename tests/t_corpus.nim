@@ -59,8 +59,8 @@
 ##     nim c -r tests/t_corpus.nim
 
 import std/[unittest, os]
-import proptest
-import proptest/choice
+import nelli
+import nelli/choice
 import fuzzsupport
 
 suite "corpus replay round-trip (RFC verification-harness.md, slice 5)":
@@ -157,6 +157,19 @@ suite "corpus replay round-trip (RFC verification-harness.md, slice 5)":
       # (a corpus entry that was never actually reloaded), not silently.
 
   test "every committed fuzz-target corpus entry reloads without error and replays deterministically":
+    ## 0.3.1 modernization: soak-grown coverage seeds and soak-crash
+    ## witnesses no longer live in separate `.soak-corpus`/`.soak-crash`
+    ## testId-suffix files (see `soakrunner.nim`'s doc comment) -- coverage
+    ## growth now lives in a target's OWN `corpus` section (F1) and crash
+    ## witnesses in that SAME target's `primary` section, alongside
+    ## whatever a `fuzzProperty` may already keep there. So the per-testId
+    ## check below no longer branches on a filename suffix: every section
+    ## (primary/secondary/corpus) is checked for cross-load determinism
+    ## uniformly, and "not vacuous" means at least ONE of the three
+    ## sections is non-empty (which section varies by target: a pure
+    ## `fuzzProperty` target like most of these populates `secondary`; the
+    ## soak-only `soak.canary` target populates `primary`;
+    ## `protocol.decode` populates `secondary` AND `corpus`).
     let testIds = corpusTestIds()
     # Guard (R1-5): a mis-pointed CorpusDir (typo'd path, corpus dir wiped,
     # etc.) would make the loop below iterate zero times and the test
@@ -171,12 +184,15 @@ suite "corpus replay round-trip (RFC verification-harness.md, slice 5)":
       let secondaryB = dbB.loadSecondary(tid)
       let primaryA = dbA.loadPrimary(tid)
       let primaryB = dbB.loadPrimary(tid)
-      check secondaryA.len > 0   # coverage-guided interesting-input entries exist
+      let corpusA = dbA.loadCorpus(tid)
+      let corpusB = dbB.loadCorpus(tid)
+      check primaryA.len > 0 or secondaryA.len > 0 or corpusA.len > 0  # anti-vacuity
       check secondaryA == secondaryB  # deterministic: two independent loads agree
-      check primaryA == primaryB      # (empty today -- no crash ever found by
-                                       # these targets -- but the equality itself
-                                       # is the determinism claim being checked,
-                                       # independent of which list is empty)
+      check primaryA == primaryB      # (empty for PBT-property targets that never
+                                       # crashed -- but the equality itself is the
+                                       # determinism claim being checked, independent
+                                       # of which list is empty)
+      check corpusA == corpusB
 
   test "osTaggedId suffixes a base testId with the current OS tag (R1-10)":
     # `osTaggedId` is the mechanism reserved for the day a target's oracle

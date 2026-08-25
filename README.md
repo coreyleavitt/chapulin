@@ -142,9 +142,14 @@ See [design-philosophy.md](design-philosophy.md) for architectural decisions and
 ## Verification harness
 
 Beyond the example/property test suite (`nimble test` / `scripts/dev-test.ps1`), chapulin carries a
-coverage-guided fuzzing + bounded symbolic-execution harness over the attacker-facing parse/containment
-surface — it *proves* the never-throw-Defect claims in [SECURITY.md](SECURITY.md#verification) rather than
-resting on code-review confidence. Full design: [docs/rfc/verification-harness.md](docs/rfc/verification-harness.md).
+coverage-guided fuzzing + bounded symbolic-execution + stateful-property harness over the attacker-facing
+parse/containment/orchestration surface — it *proves* the never-throw-Defect claims in
+[SECURITY.md](SECURITY.md#verification) rather than resting on code-review confidence. Full design:
+[docs/rfc/verification-harness.md](docs/rfc/verification-harness.md) (v1 — fuzz + symex over parse/
+containment/queue, plus the post-negotiation data phase) and
+[docs/rfc/verification-harness-v2.md](docs/rfc/verification-harness-v2.md) (v2 — the `api.nim` facade
+itself, `maxConcurrent` enforcement, deeper symex, and the soak/corpus campaign below; see its handoff
+doc for the as-landed scope of each item).
 
 **Fuzz/property suite** (pure Nim, no z3 — this is the default suite):
 ```
@@ -158,6 +163,16 @@ no-op, so normal/release builds of `src/` never import the fuzzer and are byte-f
 fuzz target's crash corpus is committed under `tests/corpus/` (binary-protected via `.gitattributes`) and
 is automatically replayed and extended on every run via its `testId`.
 
+**Facade stateful property** (in the default suite): `tests/t_a2_facade_stateful.nim` drives a REAL
+client↔server `TftpSession` pair over a mocked `Wire` (file I/O via the in-memory BlockSource/BlockSink
+seam, so no disk is touched) through `startTransfer`(get/put)/`startServer`/`cancel`/`stop`/`close`, and
+— under coverage-guided hostile packet injection (forged/garbage/off-TID DATA/ACK/ERROR, malformed
+RRQ/WRQ, forged OACK) — asserts no Nim `Defect` ever escapes `api.nim`'s own `except CatchableError`
+boundaries. This is the never-throw claim's highest-value gap closed: earlier suites proved the layers
+*beneath* the facade never raise a Defect; this one drives hostile input through the facade's own entry
+points. `tests/t_a4_maxconcurrent.nim` proves the (N+1)th concurrent transfer is actually rejected (not
+just config-plumbed) and surfaces as a structured `evServerRejected` event through the public API.
+
 **Symex proof/witness suite** (opt-in — needs the z3-extended image, not part of the default run):
 ```
 pwsh scripts/dev-test.ps1 -Only @('t_symex') -Image chapulin-symex:2.2.10
@@ -166,7 +181,27 @@ Any suite named `t_symex*` auto-selects the `chapulin-symex:2.2.10` image (built
 so `-Image` is optional. This is the only place `import proptest/symex` (and transitively, z3 via the
 runtime-optional `nim-z3`/`softlink` binding) is linked in — it never reaches `src/` or the default suite.
 It produces bounded no-Defect proofs (`sxUnsat`) and validated raised-exception witnesses (`sxRaised`) over
-the option/OACK parsers.
+the option/OACK parsers, `protocol.decode`'s fixed-size opcode arms plus its RRQ/WRQ option-parsing header
++ first-field scan (bounded, not total — a second, chained scan hits a documented solver limit), the
+lexical prefixes of `validatePath`/`checkWriteAccess`, `tftp_uri.parseTftpUri`/`isTftpUri`,
+`checksum.writeSidecar`'s path derivation, and the netascii decoder's non-conformant-CR transition. See
+[SECURITY.md's Verification table](SECURITY.md#verification) for the exact scope/bound of each proof.
+
+**Soak campaign** (local-opt-in only — never run by CI or the default suite):
+```
+pwsh scripts/dev-test.ps1 -Soak 60         # grow the corpus for 60 seconds
+pwsh scripts/dev-test.ps1 -CorpusReport    # report a committed target's visited-edge count
+```
+`-Soak` runs a coverage-guided campaign (proptest's `fuzzWith`) against `protocol.decode`, growing
+`tests/corpus/protocol.decode.soak-corpus.bin` — a file the default suite replays on every run. The first
+Defect found stops the campaign, minimizes it, and commits it under a `.soak-crash` corpus file instead.
+Growth is periodically re-minimized and size-capped (`CorpusSizeCeiling = 16` per target, so replay time
+stays bounded) and every entry is provenance-tagged (soak / interop-capture / interop-capture-unverified +
+campaign date). `-CorpusReport` shows the coarse visited-edge count for a target before/after a campaign —
+a target already fuzzed to convergence can legitimately show no increase; that's an expected, documented
+outcome, not a bug. See [SECURITY.md](SECURITY.md#verification) for the full corpus/coverage claim rows,
+including the honest scope-down on live interop-capture (mechanism built; not exercised on this project's
+Windows-containers-only Docker environment).
 
 **The never-throw-Defect property, in one sentence:** hostile input to any fuzzed target degrades to a
 caught `CatchableError` (or a documented per-option default) — never an escaping Nim `Defect` — enforced

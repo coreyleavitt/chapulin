@@ -16,9 +16,17 @@ nimblecache/
 # Test artifacts
 test-files/large.bin
 /tmp/
+# RFC verification-harness-v2 C3: raw tcpdump-sidecar capture output (a
+# runtime artifact, not a source file -- the HARVESTED seeds it produces
+# via tests/interopcapture.nim land in tests/corpus/, which IS committed).
+/interop-captures/
 # Compiled test binaries (nim c -r artifacts, no extension); keep the sources.
 tests/t_*
 !tests/t_*.nim
+# ...and their hand-authored nim config sidecars (e.g. t_symex*.nim.cfg supply the
+# z3 include path; without this negation `tests/t_*` ignores them and the symex
+# suites silently break on a fresh clone — RFC verification-harness-v2 B1/B2).
+!tests/t_*.nim.cfg
 
 # IDE
 .vscode/

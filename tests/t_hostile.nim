@@ -50,11 +50,17 @@
 ##   pwsh scripts/dev-test.ps1 -Only @('t_hostile')
 
 import std/[asyncdispatch, unittest]
-import proptest
+import nelli
 import ../src/chapulin/protocol
 import ../src/chapulin/transfer
 import ./wireharness
 import ./fuzzsupport
+# RFC verification-harness-v2.md A-shared: the mkInject{Data,Ack,Error,
+# Garbage}/mkInjectOffTid{...} builders that used to live inline below are
+# now shared with v2 Part A's facade harness -- see injectrules.nim's
+# module doc comment. This file keeps its own HostileState, liveness
+# predicate, and VacuityCounter wiring; only the rule-building code moved.
+import ./injectrules
 
 # ---------------------------------------------------------------------------
 # A fixed, small, in-memory transfer -- no file I/O, so ~200 stateful
@@ -222,13 +228,19 @@ proc drainFully(st: HostileState) =
     except CatchableError: discard
 
 # ---------------------------------------------------------------------------
-# Injection rules -- each forges one packet shape and injects it via
-# Wire.injectPacket (tests/wireharness.nim), targeting either the client
-# (victim, recvBlocks) or the server (peer, sendBlocks) -- both named in
-# D8's scope ("...into a live sendBlocks/recvBlocks/handleRrq/handleWrq
-# exchange"). Injection only ever touches the wire and `d8aLiveInjections`,
-# never any other part of HostileState.
+# Injection rules -- built from the shared injectrules.nim builders (RFC
+# verification-harness-v2.md A-shared), each forging one packet shape and
+# injecting it via Wire.injectPacket (tests/wireharness.nim), targeting
+# either the client (victim, recvBlocks) or the server (peer, sendBlocks) --
+# both named in D8's scope ("...into a live sendBlocks/recvBlocks/
+# handleRrq/handleWrq exchange"). Injection only ever touches the wire and
+# `d8aLiveInjections`, never any other part of HostileState -- now
+# compiler-enforced by injectrules.nim's non-`var` `notify` parameter.
 # ---------------------------------------------------------------------------
+
+proc hostileWireOf(s: HostileState): Wire = s.w
+  ## `wireOf` for both HostileState-shaped StateMachines below (same-TID and
+  ## off-TID both carry their live Wire in the same `.w` field).
 
 proc inLiveDataPhase(s: HostileState): bool =
   ## True iff the sender (`serverFut`/sendBlocks) has NOT yet finished -- i.e.
@@ -254,53 +266,17 @@ proc noteD8aLiveInjection(s: HostileState, toClient: bool) =
   ## post-transfer dally epilogue.
   if inLiveDataPhase(s): d8aLiveInjections.note()
 
-proc mkInjectData(toClient: bool): Rule[HostileState] =
-  let strat = integers(0, 65535).flatMap(proc(b: int): Strategy[(int, seq[byte])] =
-    byteSeqs(300).map(proc(d: seq[byte]): (int, seq[byte]) = (b, d)))
-  rule(
-    (if toClient: "inject DATA -> client" else: "inject DATA -> server"),
-    strat,
-    proc(s: var HostileState, args: (int, seq[byte])) =
-      noteD8aLiveInjection(s, toClient)
-      let pkt = TftpPacket(opcode: opData, blockNum: uint16(args[0]), data: args[1])
-      s.w.injectPacket(toClient, encode(pkt)))
-
-proc mkInjectAck(toClient: bool): Rule[HostileState] =
-  rule(
-    (if toClient: "inject ACK -> client" else: "inject ACK -> server"),
-    integers(0, 65535),
-    proc(s: var HostileState, b: int) =
-      noteD8aLiveInjection(s, toClient)
-      let pkt = TftpPacket(opcode: opAck, ackBlockNum: uint16(b))
-      s.w.injectPacket(toClient, encode(pkt)))
-
-proc mkInjectError(toClient: bool): Rule[HostileState] =
-  let strat = integers(0, 8).flatMap(proc(c: int): Strategy[(int, string)] =
-    safeStrings(0, 16).map(proc(m: string): (int, string) = (c, m)))
-  rule(
-    (if toClient: "inject ERROR -> client" else: "inject ERROR -> server"),
-    strat,
-    proc(s: var HostileState, args: (int, string)) =
-      noteD8aLiveInjection(s, toClient)
-      let pkt = TftpPacket(opcode: opError, errorCode: TftpErrorCode(args[0]),
-                            errorMsg: args[1])
-      s.w.injectPacket(toClient, encode(pkt)))
-
-proc mkInjectGarbage(toClient: bool): Rule[HostileState] =
-  rule(
-    (if toClient: "inject garbage -> client" else: "inject garbage -> server"),
-    byteSeqs(600),
-    proc(s: var HostileState, data: seq[byte]) =
-      noteD8aLiveInjection(s, toClient)
-      s.w.injectPacket(toClient, data))
-
 let hostileSM = StateMachine[HostileState](
   initial: newStrategy(proc(src: var DataSource): HostileState = buildHostileState()),
   rules: @[
-    mkInjectData(true),    mkInjectData(false),
-    mkInjectAck(true),     mkInjectAck(false),
-    mkInjectError(true),   mkInjectError(false),
-    mkInjectGarbage(true), mkInjectGarbage(false),
+    mkInjectData(true, hostileWireOf, noteD8aLiveInjection),
+    mkInjectData(false, hostileWireOf, noteD8aLiveInjection),
+    mkInjectAck(true, hostileWireOf, noteD8aLiveInjection),
+    mkInjectAck(false, hostileWireOf, noteD8aLiveInjection),
+    mkInjectError(true, hostileWireOf, noteD8aLiveInjection),
+    mkInjectError(false, hostileWireOf, noteD8aLiveInjection),
+    mkInjectGarbage(true, hostileWireOf, noteD8aLiveInjection),
+    mkInjectGarbage(false, hostileWireOf, noteD8aLiveInjection),
   ],
   invariant: pumpAndSurface)
 
@@ -347,8 +323,8 @@ suite "hostile session -- payload injection (RFC verification-harness.md D8a)":
 #
 # `wireharness.injectPacket` now takes an optional (host, port); every rule
 # here supplies an ATTACKER address distinct from `WirePeerHost`/
-# `WirePeerPort` (`attackerAddr` below draws from a fixed non-"peer" host
-# list, so the mismatch is true by construction, not by probability). The
+# `WirePeerPort` (`injectrules.attackerAddr` draws from a fixed non-"peer"
+# host list, so the mismatch is true by construction, not by probability). The
 # companion fix in `makeTransport.doSend` (tests/wireharness.nim) makes the
 # mock route a `Transport.send` to a non-peer destination nowhere instead of
 # leaking it onto the legit pipe -- without that fix, `recvOnce`'s
@@ -379,72 +355,22 @@ proc buildOffTidState(): HostileState =
     serverFut: sendBlocks(serverT, cfg, serverPeer, 1'u16, hostileReadData),
     clientFut: recvBlocks(clientT, cfg, clientPeer, 1'u16, hostileOnData))
 
-const AttackerHosts = @["attacker", "evil.example", "10.6.6.6", "mitm"]
-  ## None equal WirePeerHost ("peer") -- so any draw from this list is an
-  ## off-TID source regardless of the port drawn alongside it.
-
-proc attackerAddr(): Strategy[(string, int)] =
-  sampledFrom(AttackerHosts).flatMap(proc(h: string): Strategy[(string, int)] =
-    integers(0, 65535).map(proc(p: int): (string, int) = (h, p)))
-
 proc noteD8bLiveInjection(s: HostileState, toClient: bool) =
   ## R1-3 counterpart to `noteD8aLiveInjection` -- same `inLiveDataPhase`
   ## predicate (keys on the sender, never the dally-parked receiver).
   if inLiveDataPhase(s): d8bLiveInjections.note()
 
-proc mkInjectOffTidData(toClient: bool): Rule[HostileState] =
-  let strat = attackerAddr().flatMap(proc(a: (string, int)): Strategy[(string, int, int, seq[byte])] =
-    integers(0, 65535).flatMap(proc(b: int): Strategy[(string, int, int, seq[byte])] =
-      byteSeqs(300).map(proc(d: seq[byte]): (string, int, int, seq[byte]) = (a[0], a[1], b, d))))
-  rule(
-    (if toClient: "inject off-TID DATA -> client" else: "inject off-TID DATA -> server"),
-    strat,
-    proc(s: var HostileState, args: (string, int, int, seq[byte])) =
-      noteD8bLiveInjection(s, toClient)
-      let pkt = TftpPacket(opcode: opData, blockNum: uint16(args[2]), data: args[3])
-      s.w.injectPacket(toClient, encode(pkt), args[0], args[1]))
-
-proc mkInjectOffTidAck(toClient: bool): Rule[HostileState] =
-  let strat = attackerAddr().flatMap(proc(a: (string, int)): Strategy[(string, int, int)] =
-    integers(0, 65535).map(proc(b: int): (string, int, int) = (a[0], a[1], b)))
-  rule(
-    (if toClient: "inject off-TID ACK -> client" else: "inject off-TID ACK -> server"),
-    strat,
-    proc(s: var HostileState, args: (string, int, int)) =
-      noteD8bLiveInjection(s, toClient)
-      let pkt = TftpPacket(opcode: opAck, ackBlockNum: uint16(args[2]))
-      s.w.injectPacket(toClient, encode(pkt), args[0], args[1]))
-
-proc mkInjectOffTidError(toClient: bool): Rule[HostileState] =
-  let strat = attackerAddr().flatMap(proc(a: (string, int)): Strategy[(string, int, int, string)] =
-    integers(0, 8).flatMap(proc(c: int): Strategy[(string, int, int, string)] =
-      safeStrings(0, 16).map(proc(m: string): (string, int, int, string) = (a[0], a[1], c, m))))
-  rule(
-    (if toClient: "inject off-TID ERROR -> client" else: "inject off-TID ERROR -> server"),
-    strat,
-    proc(s: var HostileState, args: (string, int, int, string)) =
-      noteD8bLiveInjection(s, toClient)
-      let pkt = TftpPacket(opcode: opError, errorCode: TftpErrorCode(args[2]),
-                            errorMsg: args[3])
-      s.w.injectPacket(toClient, encode(pkt), args[0], args[1]))
-
-proc mkInjectOffTidGarbage(toClient: bool): Rule[HostileState] =
-  let strat = attackerAddr().flatMap(proc(a: (string, int)): Strategy[(string, int, seq[byte])] =
-    byteSeqs(600).map(proc(d: seq[byte]): (string, int, seq[byte]) = (a[0], a[1], d)))
-  rule(
-    (if toClient: "inject off-TID garbage -> client" else: "inject off-TID garbage -> server"),
-    strat,
-    proc(s: var HostileState, args: (string, int, seq[byte])) =
-      noteD8bLiveInjection(s, toClient)
-      s.w.injectPacket(toClient, args[2], args[0], args[1]))
-
 let offTidSM = StateMachine[HostileState](
   initial: newStrategy(proc(src: var DataSource): HostileState = buildOffTidState()),
   rules: @[
-    mkInjectOffTidData(true),    mkInjectOffTidData(false),
-    mkInjectOffTidAck(true),     mkInjectOffTidAck(false),
-    mkInjectOffTidError(true),   mkInjectOffTidError(false),
-    mkInjectOffTidGarbage(true), mkInjectOffTidGarbage(false),
+    mkInjectOffTidData(true, hostileWireOf, noteD8bLiveInjection),
+    mkInjectOffTidData(false, hostileWireOf, noteD8bLiveInjection),
+    mkInjectOffTidAck(true, hostileWireOf, noteD8bLiveInjection),
+    mkInjectOffTidAck(false, hostileWireOf, noteD8bLiveInjection),
+    mkInjectOffTidError(true, hostileWireOf, noteD8bLiveInjection),
+    mkInjectOffTidError(false, hostileWireOf, noteD8bLiveInjection),
+    mkInjectOffTidGarbage(true, hostileWireOf, noteD8bLiveInjection),
+    mkInjectOffTidGarbage(false, hostileWireOf, noteD8bLiveInjection),
   ],
   invariant: pumpAndSurface)
 

@@ -288,7 +288,7 @@ proc launchGui*() =
           appendServerLog("Transfer error: " & sanitizeForDisplay(ev.errorMsg))
 
       of evServerLog:
-        appendServerLog("[" & $ev.sLevel & "] " & ev.sMessage)
+        appendServerLog("[" & $ev.sLevel & "] " & sanitizeForDisplay(ev.sMessage))
 
       of evServerStarted:
         srvStatusLabel.text = "Server running on " & ev.boundAddr & ":" & $ev.boundPort
@@ -306,6 +306,11 @@ proc launchGui*() =
         srvStopBtn.enabled = false
         srvStatusLabel.text = "Server stopped"
         appendServerLog("Server stopped")
+
+      of evServerRejected:
+        # Already surfaced via evServerLog (the server logs each reject at warn
+        # before this fires), so there is nothing extra to show in the GUI.
+        discard
   )
 
   # === Client start ===

@@ -10,6 +10,18 @@
 import std/[deques, asyncdispatch]
 import ../src/chapulin/transfer
 import ../src/chapulin/transport
+# Only `pumpSession` (below, alongside `driveOne`/`driveBoth`) needs
+# `TftpSession`/`poll` -- every other proc in this module stays confined to
+# the bare `transfer.nim`/`transport.nim` level. Unlike the R2-1 `toByteSeq`
+# re-export this file used to carry (dropped because it pulled all of
+# `proptest` into every non-fuzz consumer for one proc's convenience), this
+# is an intra-repo, already-FFI-free production module that every Part-A
+# caller of `pumpSession` (RFC verification-harness-v2.md
+# A-shared/A1a/A1b/A2/A3/A4) needs directly anyway -- not an avoidable
+# transitive cost, and `api.nim` itself already depends on
+# `transfer`/`transport`, so this adds no NEW leaf dependency to the module
+# graph, only a re-traversal of one already in it.
+import ../src/chapulin/api
 
 # R2-1 code-review finding: this module used to `import ./fuzzsupport` and
 # `export toByteSeq` solely to save its downstream consumers a second import
@@ -193,6 +205,117 @@ proc makeTransport*(w: Wire, sideA: bool, swallowFirst = false): Transport =
 
   Transport(send: doSend, recv: doRecv, close: doClose)
 
+# ---------------------------------------------------------------------------
+# WireRegistry -- a minting TransportFactory over per-call-order Wires
+# (RFC verification-harness-v2.md §3.1 "Listener seam" piece (a), slice
+# A1a-i). Lives here (not in a test file) because BOTH A1a-ii's listener
+# bridge and A4's N-transport reject path import it -- A4's registry IS this
+# generalized 1->N, not an independent design (§3.1), so it is shared infra.
+# ---------------------------------------------------------------------------
+
+type
+  WireRegistry* = ref object
+    ## A registry of freshly-minted single-peer `Wire`s backing a
+    ## `TransportFactory`. Each factory call mints a NEW `Wire` (appended to
+    ## `wires` in call order) and returns a `Transport` driving one side of
+    ## it, so N calls yield N independently-addressable Wires with NO shared
+    ## key.
+    ##
+    ## It deliberately does NOT key on the factory's `port` arg. Under the
+    ## default server config (`portRangeStart/End = 0`, `hasPortRange()`
+    ## false) `allocateTransferTransport` calls `transferFactory(0)` for
+    ## EVERY transfer (`server.nim`), so a `Table[port, Wire]` would collapse
+    ## every transfer onto key 0 -- a single entry (architect r2, HIGH). The
+    ## call-order index (the proven `t_session.nim:455-464` `wireIdx`
+    ## pattern -- which solved this exact degeneracy) sidesteps it: the
+    ## implicit index is simply `wires.len` at mint time, never the port.
+    wires*: seq[Wire]
+    sideA: bool
+    swallowFirst: bool
+
+proc newWireRegistry*(sideA = true, swallowFirst = false): WireRegistry =
+  ## A registry whose minted transports drive side `sideA` of each fresh Wire
+  ## (default `true` -- the client-side convention `makeTransport(w, sideA =
+  ## true)` every real `transportFactory` uses). `swallowFirst` is forwarded
+  ## to `makeTransport` (A1a-ii needs the client's first send discarded to the
+  ## listener, not placed on the per-transfer Wire); the default `false`
+  ## keeps every send observable for A1a-i's unit assertions.
+  WireRegistry(wires: @[], sideA: sideA, swallowFirst: swallowFirst)
+
+proc factory*(reg: WireRegistry): TransportFactory =
+  ## The minting `TransportFactory` (matches `api.TransportFactory =
+  ## proc(host, port): Transport`, `api.nim:64`). Both args are IGNORED for
+  ## keying -- each call mints a fresh `Wire`, records it in call order, and
+  ## returns a `Transport` bound to that one Wire. The k-th call returns the
+  ## transport for `reg.wires[k]`, so a test correlates a returned transport
+  ## with its Wire by index. Pass this straight to
+  ## `newSession(transportFactory = reg.factory())`.
+  proc(host: string, port: int): Transport =
+    let w = newWire()
+    reg.wires.add w
+    makeTransport(w, reg.sideA, reg.swallowFirst)
+
+proc makeAdoptingTransport*(listenerWire: Wire, reg: WireRegistry): Transport =
+  ## A1a-ii (RFC verification-harness-v2.md §3.1 "Listener seam" piece (c) --
+  ## "the genuinely novel, highest-risk part"): the client-side counterpart of
+  ## `makeListenerFromWire`. Mirrors real TFTP TID adoption -- client sends
+  ## RRQ/WRQ to the server's well-known port; server replies from a fresh
+  ## ephemeral port; client learns it and redirects every later send there --
+  ## over the Wire mock, where "port" and "Wire object" are the same fact
+  ## (see this file's header comment / t_listenerbridge.nim's module doc).
+  ##
+  ## Mechanism: starts UNADOPTED, sending onto `listenerWire` (the well-known
+  ## "port" a bridge listener drains, piece (b)) exactly like a real client's
+  ## RRQ/WRQ. The FIRST `recv` call blocks (bounded spin, like every other
+  ## Wire-backed recv here) until `reg` mints a NEW Wire beyond the count that
+  ## existed at construction time -- i.e. until the moment a per-transfer
+  ## transport gets allocated for THIS request (`allocateTransferTransport`/
+  ## `transferFactory`, server.nim:710, or A4's reject-path reroute) --
+  ## builds a `Transport` bound to THAT wire (side B, since the registry's
+  ## `factory()` always hands its caller side A -- here, the server's
+  ## per-transfer allocation), and permanently locks onto it: every
+  ## subsequent `send`/`recv` -- the ACK/DATA phase, retransmits, everything
+  ## -- delegates to the adopted transport, never back to `listenerWire`.
+  ## This is a ONE-WAY, ONE-TIME adoption (mirrors `PeerEndpoint.lockTo`'s
+  ## own one-shot TID lock in transfer.nim) -- there is exactly one
+  ## per-transfer port to learn, not a moving target.
+  var adopted: Transport
+  var hasAdopted = false
+  let preAdopt = makeTransport(listenerWire, sideA = true)
+  let baseline = reg.wires.len
+
+  proc doSend(data: seq[byte], host: string, port: int): Future[void] {.async.} =
+    if hasAdopted:
+      await adopted.send(data, host, port)
+    else:
+      await preAdopt.send(data, host, port)
+
+  proc doRecv(bufSize: int, timeoutMs: int): Future[tuple[data: seq[byte],
+              host: string, port: int]] {.async.} =
+    if not hasAdopted:
+      var spins = 0
+      while reg.wires.len <= baseline:
+        inc spins
+        if spins > 500:
+          raise newException(TransportTimeoutError,
+            "no per-transfer wire minted yet")
+        await sleepAsync(0)
+      # `reg.wires[baseline]` is the very Wire minted in response to this
+      # transfer's request -- the registry's OWN call-order-index design
+      # (A1a-i) makes "the next wire past what existed when I started" an
+      # unambiguous, single-client fact, exactly as required here.
+      adopted = makeTransport(reg.wires[baseline], sideA = false)
+      hasAdopted = true
+    return await adopted.recv(bufSize, timeoutMs)
+
+  proc doClose() =
+    if hasAdopted:
+      if adopted.close != nil: adopted.close()
+    else:
+      if preAdopt.close != nil: preAdopt.close()
+
+  Transport(send: doSend, recv: doRecv, close: doClose)
+
 proc futVal*[T](f: Future[T]): T =
   ## Read a finished future's value. (Named to avoid clashing with proptest's
   ## `read` on PromiseStore, which shadows asyncdispatch's `read` for callers
@@ -221,6 +344,90 @@ proc driveBoth*[T](a, b: Future[T], maxSteps = 100_000): bool =
   a.finished and b.finished
 
 # ---------------------------------------------------------------------------
+# pumpSession -- the fixed-tick pump for Part A's facade StateMachine
+# invariant hook (RFC verification-harness-v2.md A-shared, §3.1's "pump
+# discipline" paragraph). `driveOne`/`driveBoth`/`driveAll` above all drive
+# TO COMPLETION (or a generous step cap) -- exactly what a stateful
+# invariant must NOT do: draining a transfer to completion inside every
+# invariant call would finish the whole exchange before an injection rule
+# ever gets a turn (the same R1-1 vacuity `t_hostile.nim`'s `pumpAndSurface`
+# exists to avoid, just one layer up at the `TftpSession` facade instead of
+# bare `sendBlocks`/`recvBlocks`).
+# ---------------------------------------------------------------------------
+
+const PumpSessionTicks* = 6
+  ## Default tick count for `pumpSession` -- see its doc comment for the
+  ## sizing argument. Exported so a Part-A slice that needs a LARGER budget
+  ## for a specific op (e.g. A4's multi-hop reject chain) can state its
+  ## override as an explicit multiple of this documented baseline instead
+  ## of a bare unexplained integer literal.
+
+proc pumpSession*(s: TftpSession, ticks = PumpSessionTicks) =
+  ## Advance the shared dispatcher a SMALL, FIXED number of ticks: calls
+  ## `s.poll(0)` (`api.nim`'s iterator -- pumps `asyncdispatch.poll(0)` once
+  ## per call, then drains and discards every queued `Event`) exactly
+  ## `ticks` times. Deliberately NEVER `drain()`/`waitTransfer()`/
+  ## `waitServer()` (`api.nim` — all three loop on wall-clock `epochTime`,
+  ## not a tick count) — replaying a recorded proptest choice sequence
+  ## under container scheduling jitter would see a different number of
+  ## completed hops each run with a wall-clock budget, breaking
+  ## reproducibility. A tick count is deterministic input, not measured
+  ## time.
+  ##
+  ## One shared pump op, not per-session: `asyncdispatch` is a single
+  ## process-global dispatcher (confirmed by `api.nim`'s `poll` iterator,
+  ## which calls the bare module-level `asyncdispatch.poll`, not anything
+  ## session-scoped) — one `pumpSession` tick advances EVERY session,
+  ## transfer, and server sharing the dispatcher by one readiness pass, not
+  ## just `s`'s own coroutines. Part A's op vocabulary therefore has one
+  ## pump op shared across every live session in an example, never
+  ## per-session polling (RFC §3.1) — that would only look more
+  ## fine-grained, not actually be so.
+  ##
+  ## Sizing `PumpSessionTicks` (6): `tests/t_hostile.nim`'s `pumpAndSurface`
+  ## empirically proved 3 ticks/call sufficient to advance one
+  ## `transfer.nim`-level DATA-send / ACK-recv hop through this module's own
+  ## `doSend`/`doRecv` (each `await sleepAsync(0)` spin in `doRecv` costs one
+  ## dispatcher tick to become ready) without ever letting a single
+  ## invariant call drain an entire transfer to completion (see that file's
+  ## R1-1 comment for the empirical history). A facade-level `TftpSession`
+  ## wraps that SAME `sendBlocks`/`recvBlocks` engine inside one more layer
+  ## of orchestration (`api.nim`'s per-transfer async runner plus its own
+  ## event-enqueue bookkeeping) — so this pump needs AT LEAST that
+  ## proven per-hop granularity, with headroom for the api.nim-level
+  ## layer's own await point(s). `PumpSessionTicks = 6` (2x t_hostile's
+  ## proven-sufficient 3) is a deliberately conservative starting point, not
+  ## a re-derivation from scratch: it is a documented hypothesis for
+  ## A1a-ii/A2 (the first slices that actually drive a real Wire-backed
+  ## `TftpSession` hop chain end-to-end) to empirically confirm or tighten.
+  ## RFC §3.1 names A4's reject chain (client RRQ → `listener.recv` resolves
+  ## → reject check → `sendError` await → `Event` enqueue — roughly 2
+  ## genuine awaits) as the other data point this budget must cover; 6
+  ## comfortably exceeds that with margin to spare. Wire's callback-ready
+  ## ordering is deterministic-by-construction (software FIFO queues, never
+  ## OS-multiplexed epoll/select readiness), so a correctly-sized N is a
+  ## fixed property of the hop-chain's shape, not a source of run-to-run
+  ## flakiness — unlike a wall-clock budget, tightening or loosening it
+  ## later is a one-line, fully-reproducible change.
+  for _ in 0 ..< ticks:
+    for ev in s.poll(0): discard
+
+proc pumpSessionCollect*(s: TftpSession, ticks = PumpSessionTicks): seq[Event] =
+  ## Same fixed-tick discipline as `pumpSession` above (same default tick
+  ## count, same never-`drain()`/`waitTransfer()`/`waitServer()` contract —
+  ## see that proc's doc comment for the sizing argument), but RETURNS every
+  ## drained `Event` instead of discarding it (RFC verification-harness-v2.md
+  ## A2, §3.1's anti-vacuity paragraph: "ops actually ran against a live
+  ## session, the pump actually advanced transfers" needs something to
+  ## observe — `pumpSession`'s discard-everything body has nothing for a
+  ## caller to inspect). Deliberately a SEPARATE proc, not a flag on
+  ## `pumpSession`: `pumpSession`'s existing callers (`t_pumpsession.nim`,
+  ## any future no-observation caller) keep exactly the same body: no
+  ## `seq[Event]` allocation, no behavior change.
+  for _ in 0 ..< ticks:
+    for ev in s.poll(0): result.add ev
+
+# ---------------------------------------------------------------------------
 # makeListener — a UdpListener backed by an in-memory deque, mirroring
 # makeTransport. Feed listener.recv() in server.run()'s loop without sockets.
 # ---------------------------------------------------------------------------
@@ -237,6 +444,35 @@ proc newListenerQueue*(): ListenerQueue =
 proc push*(q: ListenerQueue, data: seq[byte], host: string, port: int) =
   ## Enqueue a fake inbound request; call from test code before or while driving.
   q.queue.addLast((data, host, port))
+
+proc makeListenerFromWire*(w: Wire, port: int = 0): UdpListener =
+  ## A1a-ii (RFC verification-harness-v2.md §3.1 "Listener seam" piece (b)):
+  ## promotes the old `swallowFirst`+manual-`ListenerQueue.push` trick into a
+  ## first-class `UdpListener` that drains the SAME queue a real client's
+  ## first send lands on -- `w.a2b`, exactly what `makeTransport(w, sideA =
+  ## true).send` pushes onto for a legit (non-injected) send. A client built
+  ## over `w` (or, once adopted, `makeAdoptingTransport`, below) therefore
+  ## needs NO `swallowFirst`/manual push: its actual RRQ/WRQ reaches this
+  ## listener the same way a real UDP listener socket receives whatever a
+  ## client's first datagram carries.
+  ##
+  ## Mirrors `makeListener`'s shape exactly (spin-then-timeout `recv`, no-op
+  ## `close`, stub `localPort`) so it's a drop-in `ListenerFactory` result --
+  ## only the backing queue differs.
+  proc doRecv(timeoutMs: int): Future[tuple[data: seq[byte],
+              host: string, port: int]] {.async.} =
+    var spins = 0
+    while true:
+      if w.a2b.len > 0:
+        return w.a2b.popFirst()
+      inc spins
+      if spins > 500:
+        raise newException(TransportTimeoutError, "listener idle")
+      await sleepAsync(0)
+
+  proc doClose() = discard
+
+  UdpListener(recv: doRecv, close: doClose, localPort: proc(): int = port)
 
 proc makeListener*(q: ListenerQueue, port: int = 0): UdpListener =
   ## Build a UdpListener whose recv pops from q. If q is empty it spins up to

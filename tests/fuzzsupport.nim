@@ -11,13 +11,26 @@
 
 import std/macros
 import std/unittest
-import proptest
-when defined(chapulinFuzz): import proptest/coverage
+import nelli
+when defined(chapulinFuzz): import nelli/coverage
 
 const
   FuzzSeed* = 0xC0FFEE
   FuzzN*    = 200
   CorpusDir* = "tests/corpus"
+
+  CorpusSizeCeiling* = 16
+    ## RFC verification-harness-v2.md §3.3/§5, slice C4: per-target ceiling
+    ## on a COMMITTED corpus file's primary-entry count, so a growing
+    ## soak/interop-capture channel can't silently slow the fast default
+    ## (replay time scales with corpus size). Not a new number invented for
+    ## C4 — `soakrunner.nim`'s `runSoak` (C1) already hardcoded `maxEntries
+    ## = 16` on every `.soak-corpus`/`.soak-crash` save; this constant names
+    ## that existing convention in one place so C4's minimization pass, its
+    ## size-ceiling test, and C3's interop-capture harvest (previously a
+    ## separate hardcoded `64`, now aligned to the same ceiling for one
+    ## predictable per-target bound) all reference the same value instead of
+    ## three independent literals.
 
   OsTag* = when defined(windows): "windows"
            elif defined(posix): "posix"
@@ -119,12 +132,15 @@ macro fuzzProperty*(name: string, tid: string, body: untyped): untyped =
   ## Deliberately a **macro**, not a template (deviation from the RFC's own
   ## sketch, confirmed empirically — this is the "slice 1 confirms
   ## empirically" check the RFC calls for): `property` is itself a macro
-  ## that indexes its `body`'s direct children (`body[0]`, `body[1]`, ...),
-  ## and a template that spliced its own `body` param as a *nested*
-  ## statement (`property name: with Settings(...); body`) hands `property`
-  ## a 2-element body (`[withClause, nestedStmtList]`) instead of the
-  ## required 3 (`[withClause, given, ensure]`) — `property` rejects it
-  ## ("body must include `given` and a predicate after `with`"). Building
+  ## (defined at `nelli/dsl.nim:23`, `macro property*(name: string, body:
+  ## untyped): untyped` — see `_deps/nelli/src/nelli/dsl.nim` under milpa's
+  ## resolved dep tree, pinned `v0.5.3`) that indexes its `body`'s direct
+  ## children (`body[0]`, `body[1]`, ...; `dsl.nim` ~37-56), and a template
+  ## that spliced its own `body` param as a *nested* statement (`property
+  ## name: with Settings(...); body`) hands `property` a 2-element body
+  ## (`[withClause, nestedStmtList]`) instead of the required 3
+  ## (`[withClause, given, ensure]`) — `property` rejects it ("body must
+  ## include `given` and a predicate after `with`", `dsl.nim:42`). Building
   ## the call by hand and appending `body`'s own children directly avoids
   ## the nesting. `bindSym` on every symbol this macro depends on
   ## (`property`, `Settings`, `currentCoverage`, `CorpusDir`/`FuzzSeed`/

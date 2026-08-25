@@ -49,20 +49,24 @@
 ## `parseInt` (the `nimParseIntRaises` ground truth below) -- the soundness
 ## check D9 requires.
 ##
-## TOOLCHAIN GAP (tsize twins): the real tsize arms (both functions) call
-## `parseBiggestInt`, not `parseInt`. Verified proptest 99fa2dbe's symex
-## engine models ONLY `parseInt` (zero hits for "parseBiggestInt" anywhere
-## under `_deps/proptest/src`) -- every target against a `parseBiggestInt`-
-## based twin came back `sxUnknown` (an inconclusive non-result: neither a
-## bounded proof nor a witness). The tsize twins below therefore stand
-## `parseInt` in for `parseBiggestInt`. This substitution is sound for the
-## property under proof here -- both raise `ValueError` identically on
-## non-numeric input, and `int`/`BiggestInt` are both 64-bit on this
-## platform -- but it is a real, load-bearing toolchain limitation, not a
-## cosmetic simplification; a future proptest that models `parseBiggestInt`
-## should have its tsize twins switched back.
+## B4 UNBLOCKED (tsize twins) -- proptest 0.1.0 models `parseBiggestInt` -----
+## The real tsize arms (both functions) call `parseBiggestInt`, not
+## `parseInt`. Under proptest 99fa2dbe the symex engine modeled ONLY
+## `parseInt` (zero hits for "parseBiggestInt" anywhere under
+## `_deps/proptest/src`) -- every target against a `parseBiggestInt`-based
+## twin came back `sxUnknown`. v2's B4 slice was gated on this.
+##
+## 0.1.0 (2026-08 re-evaluation): confirmed by reading `dsl_parser.nim`
+## directly (RFC-chapulin-hardening M2) -- `parseBiggestInt(s)` now routes to
+## the SAME `iekStrToInt` IR node as `parseInt(s)` (`BiggestInt` is 64-bit on
+## this platform, identical to `parseInt`'s result type, so no new IR kind or
+## runtime lowering was needed; only the parser's callee-name dispatch grew a
+## second name). The `parseInt` substitution is REMOVED below: both tsize
+## twins now call the REAL `parseBiggestInt` and both still prove/witness
+## exactly as before (`sxUnsat` client-side / `sxRaised` server-side) --
+## confirmed empirically, not just from reading the source. B4 is DONE.
 import std/[unittest, strutils]
-import proptest/symex
+import nelli/symex
 import ../src/chapulin/protocol
 
 # ---- Ground truth: what real Nim actually does ------------------------------
@@ -71,6 +75,18 @@ proc nimParseIntRaises(s: string): bool =
   ## True iff real Nim `parseInt(s)` raises `ValueError`.
   try:
     discard parseInt(s)
+    false
+  except ValueError:
+    true
+
+proc nimParseBiggestIntRaises(s: string): bool =
+  ## True iff real Nim `parseBiggestInt(s)` raises `ValueError`. B4:
+  ## dedicated ground truth for the tsize twins now that they call the REAL
+  ## `parseBiggestInt` (not the former `parseInt` substitution) -- exact,
+  ## not merely "both raise identically" as argued when the substitution
+  ## was load-bearing.
+  try:
+    discard parseBiggestInt(s)
     false
   except ValueError:
     true
@@ -118,12 +134,11 @@ proc twinClientWindowsize(val: string) =
     return
 
 proc twinClientTsize(val: string) =
-  ## Mirrors validateAndParseOack's "tsize" arm (options.nim:129-137).
-  ## Uses `parseInt`, not the real arm's `parseBiggestInt` -- see the
-  ## file-level TOOLCHAIN GAP note above.
-  var ts: int
+  ## Mirrors validateAndParseOack's "tsize" arm (options.nim:129-137). Uses
+  ## the REAL `parseBiggestInt` -- see the file-level B4 UNBLOCKED note above.
+  var ts: int64
   try:
-    ts = parseInt(val)
+    ts = parseBiggestInt(val)
   except ValueError:
     return
   if ts < 0:
@@ -140,41 +155,45 @@ proc twinClientTsize(val: string) =
 # plumbing.
 
 proc twinServerBlksize(val: string) =
-  ## Mirrors negotiateServerOptions's "blksize" arm (options.nim:159-172).
-  ## The real arm clamps via `min(limits.maxBlocksize, reqBs)`; the twin
-  ## inlines that as an explicit `if` rather than calling `system.min` --
-  ## symex's inter-procedural walker cannot inline `system.min`/`max`
-  ## (their stdlib body is an `if`-*expression*, an unsupported node kind
-  ## for inlining), so this sidesteps that toolchain limitation without
-  ## changing the clamp's observable semantics.
+  ## Mirrors negotiateServerOptions's "blksize" arm (options.nim:159-172),
+  ## including its REAL `min(limits.maxBlocksize, reqBs)` clamp call.
+  ## proptest 0.1.0 (2026-08 re-evaluation): `system.min`/`max` inlining
+  ## (previously unsupported -- their stdlib body is an `if`-*expression*, a
+  ## node kind the inter-procedural walker couldn't inline) now proves
+  ## `sxUnsat` directly, confirmed empirically. Workaround (explicit `if`
+  ## clamp) REMOVED.
   let reqBs = parseInt(val)
   if reqBs >= MinBlocksize:
-    var bs = reqBs
-    if bs > MaxBlocksize:
-      bs = MaxBlocksize
+    let bs = min(MaxBlocksize, reqBs)
     discard bs
 
 proc twinServerTimeout(val: string) =
   ## Mirrors negotiateServerOptions's "timeout" arm (options.nim:199-209).
+  ## PRIORITY 1 (proptest 0.3.1 discard-vacuity fix): the former
+  ## `discard validateTimeoutOpt(t)` dropped that call's expression entirely
+  ## -- dsl_parser.nim's `nnkDiscardStmt` arm only lowers a discarded call
+  ## for two allowlisted intrinsics (getCurrentException(Msg)/parseInt/
+  ## parseBiggestInt); `validateTimeoutOpt` (a real shipped proc, not one of
+  ## those) became `mkBlock(@[])` -- a complete no-op, so its own body was
+  ## never walked. Fix: bind via `let` (never `discard`ed).
   let t = parseInt(val)
-  discard validateTimeoutOpt(t)
+  let validTimeout = validateTimeoutOpt(t)
+  discard validTimeout
+    # `discard <identifier>` (not `discard <call>`) is harmless -- the call
+    # was already lowered at the `let` binding above.
 
 proc twinServerWindowsize(val: string) =
-  ## Mirrors negotiateServerOptions's "windowsize" arm (options.nim:210-214).
-  ## Same `system.min`/`max`-inlining limitation as twinServerBlksize above:
-  ## the real arm's `max(limits.minWindowsize, min(limits.maxWindowsize, ws))`
-  ## clamp is inlined here as explicit `if`s, same observable semantics.
-  var ws = parseInt(val)
-  if ws < MinWindowsize:
-    ws = MinWindowsize
-  if ws > MaxWindowsize:
-    ws = MaxWindowsize
+  ## Mirrors negotiateServerOptions's "windowsize" arm (options.nim:210-214),
+  ## including its REAL `max(limits.minWindowsize, min(limits.maxWindowsize,
+  ## ws))` clamp call -- see twinServerBlksize above (0.1.0 min/max-inlining
+  ## fix). Workaround (explicit `if` clamps) REMOVED.
+  let ws = max(MinWindowsize, min(MaxWindowsize, parseInt(val)))
+  discard ws
 
 proc twinServerTsize(val: string) =
-  ## Mirrors negotiateServerOptions's "tsize" arm (options.nim:173-198).
-  ## Uses `parseInt`, not the real arm's `parseBiggestInt` -- see the
-  ## file-level TOOLCHAIN GAP note above.
-  let clientTsize = parseInt(val)
+  ## Mirrors negotiateServerOptions's "tsize" arm (options.nim:173-198). Uses
+  ## the REAL `parseBiggestInt` -- see the file-level B4 UNBLOCKED note above.
+  let clientTsize = parseBiggestInt(val)
   discard clientTsize >= 0
 
 # ---- Client-side (caught) targets: sxUnsat = bounded proof of no escape ----
@@ -193,8 +212,8 @@ suite "symex: validateAndParseOack arm twins never let ValueError escape":
     check r.status == sxUnsat
 
   test "tsize twin: ValueError is fully caught (sxUnsat)":
-    ## Twin uses `parseInt` (toolchain-gap substitution for the real arm's
-    ## `parseBiggestInt` -- see the file-level TOOLCHAIN GAP note).
+    ## Twin uses the REAL `parseBiggestInt` (B4 unblocked -- see the
+    ## file-level note).
     let r = symexFind(twinClientTsize, tRaisedExn("ValueError"))
     check r.status == sxUnsat
 
@@ -236,13 +255,13 @@ suite "symex: negotiateServerOptions arm twins raise ValueError on hostile input
     check r.raisedTypeId == "ValueError"
     check nimParseIntRaises(r.raisedWitness[0])
 
-  test "tsize twin: ValueError witness, validated against real parseInt":
-    ## Twin uses `parseInt` (toolchain-gap substitution for the real arm's
-    ## `parseBiggestInt` -- see the file-level TOOLCHAIN GAP note).
+  test "tsize twin: ValueError witness, validated against real parseBiggestInt":
+    ## Twin uses the REAL `parseBiggestInt` (B4 unblocked -- see the
+    ## file-level note).
     let r = symexFind(twinServerTsize, tRaisedExn("ValueError"))
     check r.status == sxRaised
     check r.raisedTypeId == "ValueError"
-    check nimParseIntRaises(r.raisedWitness[0])
+    check nimParseBiggestIntRaises(r.raisedWitness[0])
 
 suite "symex: negotiateServerOptions arm twins have no IndexError/FieldDefect path":
   test "blksize twin: no index/field-defect path":

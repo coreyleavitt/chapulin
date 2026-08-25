@@ -44,11 +44,41 @@ type
                           ## field answers "what did the client ask for," the
                           ## other two answer "what is in effect right now."
 
+  RejectInfo* = object
+    ## Cohesive payload for `onRejected` -- matches the convention every
+    ## other ServerCallbacks hook follows (a single struct, not loose
+    ## scalars; see TransferInfo above). Room to grow: a future field (e.g.
+    ## a reject-reason enum distinct from the wire `TftpErrorCode`) lands
+    ## here without another signature break.
+    clientHost*: string
+    clientPort*: int
+    code*: TftpErrorCode
+    msg*: string
+
   ServerCallbacks* = object
     onTransferStart*: proc(info: TransferInfo) {.closure.}
     onTransferProgress*: proc(info: TransferInfo) {.closure.}
     onTransferComplete*: proc(info: TransferInfo) {.closure.}
     onTransferError*: proc(info: TransferInfo, msg: string) {.closure.}
+    onRejected*: proc(info: RejectInfo) {.closure.}
+      ## RFC verification-harness-v2.md A4: fires when the accept loop
+      ## rejects an inbound request BEFORE a reqId is minted (no available
+      ## transfer port, host-access denial, or maxConcurrent) -- none of the
+      ## four hooks above apply, since each of those is keyed by a
+      ## TransferInfo/reqId that doesn't exist yet at this point. OPTIONAL:
+      ## nil (the default on every `ServerCallbacks()` a caller doesn't
+      ## populate) means zero behavior change -- every call site routes
+      ## through `rejectRequest` (below), which nil-guards it exactly like
+      ## the existing four hooks' nil-guard convention.
+      ##
+      ## Invoked through a try/except CatchableError wrapper (H2, `handoff.md`):
+      ## a throwing app callback here must not kill run()'s accept loop (a
+      ## single-threaded process-wide DoS) or fault handleRequest's future --
+      ## it degrades to a logged warning instead. A Defect (e.g.
+      ## NilAccessDefect) is NOT caught by that wrapper -- `except
+      ## CatchableError` structurally cannot catch a Defect -- and remains
+      ## the project's documented never-throw Defect-hazard boundary: a
+      ## Defect raised by an app callback is the app's own bug.
 
   TftpServer* = ref object
     config*: ServerConfig
@@ -699,6 +729,13 @@ proc allocateTransferTransport*(server: TftpServer,
   ## address to send to. With no port range configured, binds a single
   ## ephemeral port unconditionally (`bound` always true; an OSError there
   ## propagates uncaught, exactly as before this extraction).
+  ##
+  ## L9: nil-guarded exactly like `rejectRequest`'s -- `transferFactory` is
+  ## always populated by `newTftpServer`, but the field is a public `proc`
+  ## a caller can still overwrite with nil; treat that as "no transport
+  ## available" (bound = false) rather than calling a nil closure.
+  if server.transferFactory == nil:
+    return (Transport(), false)
   if config.hasPortRange():
     for port in config.portRangeStart .. config.portRangeEnd:
       try:
@@ -708,6 +745,44 @@ proc allocateTransferTransport*(server: TftpServer,
     return (Transport(), false)
   else:
     return (server.transferFactory(0), true)
+
+proc rejectRequest(server: TftpServer, clientHost: string, clientPort: int,
+                   code: TftpErrorCode, msg: string) {.async.} =
+  ## RFC verification-harness-v2.handoff.md D1: the single reject-site
+  ## primitive -- mint a one-shot transport via `server.transferFactory`
+  ## (routes through the SAME seam `allocateTransferTransport` uses, so a
+  ## Wire-backed session's rejection never opens a real OS socket), send
+  ## ERROR(code, msg), close it, then fire `onRejected`. Replaces what used
+  ## to be three near-verbatim copies of this block (reject sites 1/2/3).
+  ##
+  ## L1: `server.transferFactory` is nil-guarded -- an embedder that leaves
+  ## it nil (unusual; `newTftpServer` always sets a default, but the field is
+  ## a public `proc` a caller can still overwrite with nil) skips the ERROR
+  ## send but still fires `onRejected`, since the reject itself still
+  ## happened and is still observable.
+  if server.transferFactory != nil:
+    try:
+      let xfer = server.transferFactory(0)
+      await sendError(xfer, clientHost, clientPort, code, msg)
+      if xfer.close != nil: xfer.close()
+    except OSError, CatchableError:
+      discard
+  if server.callbacks.onRejected != nil:
+    # H2: wrapped so a throwing app callback cannot propagate out of this
+    # proc -- from site 1 (inside handleRequest's future) that would fault
+    # the future; from sites 2/3 (inside run()'s own `while` loop, called
+    # via `await server.rejectRequest(...)` with no enclosing try/except
+    # there) it would unwind run() itself, permanently stopping the
+    # listener -- a single-threaded-process DoS. A raising callback now
+    # degrades to a logged warning; the caller's return/continue after this
+    # call still runs normally either way. Cannot catch a Defect here (see
+    # RejectInfo's doc comment above) -- that remains the documented
+    # never-throw Defect-hazard boundary, not a gap introduced by this wrap.
+    try:
+      server.callbacks.onRejected(RejectInfo(clientHost: clientHost, clientPort: clientPort,
+                                             code: code, msg: msg))
+    except CatchableError as e:
+      server.logger.warn("onRejected callback raised: " & e.msg)
 
 proc handleRequest*(server: TftpServer, data: seq[byte],
                    clientHost: string, clientPort: int) {.async.} =
@@ -733,13 +808,11 @@ proc handleRequest*(server: TftpServer, data: seq[byte],
   if not bound:
     server.logger.error("No available ports in range " &
       $server.config.portRangeStart & ":" & $server.config.portRangeEnd)
-    try:
-      let errXfer = newUdpTransport(0)
-      await sendError(errXfer, clientHost, clientPort,
-                      errNotDefined, "Server has no available transfer ports")
-      if errXfer.close != nil: errXfer.close()
-    except OSError, CatchableError:
-      discard
+    let rejMsg = "Server has no available transfer ports"
+    # RFC verification-harness-v2.md A4 (reject site 1/3); handoff.md D1:
+    # routes through the shared rejectRequest helper (transferFactory reroute
+    # + onRejected signal), same as sites 2/3.
+    await server.rejectRequest(clientHost, clientPort, errNotDefined, rejMsg)
     return
 
   # Allocate a monotonic per-request id — unique within this server's lifetime.
@@ -884,23 +957,22 @@ proc run*(server: TftpServer, listener: UdpListener) {.async.} =
 
     if not checkHostAccess(server.config, clientHost):
       server.logger.warn("Access denied for " & clientHost)
-      try:
-        let xfer = newUdpTransport(0)
-        await sendError(xfer, clientHost, clientPort, errAccessViolation, "Access denied")
-        if xfer.close != nil: xfer.close()
-      except OSError, CatchableError:
-        discard
+      let rejMsg = "Access denied"
+      # RFC verification-harness-v2.md A4 (reject site 2/3); handoff.md D1:
+      # see site 1's comment -- same shared rejectRequest helper.
+      await server.rejectRequest(clientHost, clientPort, errAccessViolation, rejMsg)
       continue
 
     if server.activeTransfers >= server.config.maxConcurrent:
       server.logger.warn("Max concurrent transfers reached, rejecting " & clientHost)
-      try:
-        let xfer = newUdpTransport(0)
-        await sendError(xfer, clientHost, clientPort, errNotDefined,
-                        "Server busy, max concurrent transfers reached")
-        if xfer.close != nil: xfer.close()
-      except OSError, CatchableError:
-        discard
+      let rejMsg = "Server busy, max concurrent transfers reached"
+      # RFC verification-harness-v2.md A4 (reject site 3/3); handoff.md D1:
+      # see site 1's comment -- same shared rejectRequest helper. This is
+      # the site the RFC's anti-vacuity condition keys on: fires while
+      # server.activeTransfers == server.config.maxConcurrent (checked in the
+      # guard immediately above, still true here -- nothing between the
+      # check and this call touches activeTransfers).
+      await server.rejectRequest(clientHost, clientPort, errNotDefined, rejMsg)
       continue
 
     let hf = server.handleRequest(data, clientHost, clientPort)

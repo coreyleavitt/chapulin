@@ -575,6 +575,18 @@ proc startServer*(s: TftpSession, config: ServerConfig): ServerId =
                                                         windowsize: info.windowsize)),
                                         info.startedAt),
                            errorCode: info.errorCode, errorMsg: msg))
+      ,
+      onRejected: proc(info: RejectInfo) {.closure.} =
+        {.cast(gcsafe).}:
+          # RFC verification-harness-v2.md A4: fires before any reqId/
+          # TransferId exists, so -- unlike every callback above -- this
+          # enqueues with xfrId = NoTransfer; the rejected peer's address
+          # rides on the Event's own rejClientHost/rejClientPort fields
+          # instead. A session observes this as a structured evServerRejected
+          # Event, never a free-text evServerLog substring.
+          cS.enqueue(Event(xfrId: NoTransfer, srvId: cSrvId, kind: evServerRejected,
+                           rejClientHost: info.clientHost, rejClientPort: info.clientPort,
+                           rejCode: info.code, rejMsg: info.msg))
     )
 
     # --- Logger that feeds evServerLog ---

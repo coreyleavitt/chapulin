@@ -26,12 +26,11 @@ proc mkLog(msg: string): Event =
   ## M4: evTransferLog was removed (zero producers in src/); this helper now
   ## mints the one remaining log-kind event, evServerLog, so the eviction/
   ## dropped-count tests below still have a log-kind event to push.
+  ## M2 (code-review): evServerLog has no `snap` field -- it's a
+  ## structurally-owned field of the evTransfer* case arms only, not a
+  ## common field -- so this no longer sets one.
   Event(xfrId: NoTransfer, srvId: NoServer, kind: evServerLog,
-        sLevel: llInfo, sMessage: msg,
-        snap: TransferSnapshot(bytes: 0, total: none(int64),
-                               requested: TransferParams(blocksize: 512, windowsize: 1),
-                               effective: some(TransferParams(blocksize: 512, windowsize: 1)),
-                               direction: tdGet, mode: tmOctet, startedAt: 0.0))
+        sLevel: llInfo, sMessage: msg)
 
 proc mkStarted(id: TransferId): Event =
   Event(xfrId: id, srvId: NoServer, kind: evTransferStarted,
@@ -46,6 +45,17 @@ proc mkComplete(id: TransferId): Event =
                                requested: TransferParams(blocksize: 512, windowsize: 1),
                                effective: some(TransferParams(blocksize: 512, windowsize: 1)),
                                direction: tdGet, mode: tmOctet, startedAt: 0.0))
+
+proc mkRejected(host: string, port: int, code: TftpErrorCode, msg: string): Event =
+  ## M3 (code-review): a server-side accept-loop rejection -- fires before
+  ## any reqId/TransferId is minted (RFC verification-harness-v2.md A4), so
+  ## xfrId is always NoTransfer and the rejected peer's identity rides on
+  ## rejClientHost/rejClientPort instead. Mirrors the construction in
+  ## api.nim's onRejected callback (no snap field: `snap` is structurally
+  ## owned by the evTransfer* case arms only, so it isn't settable -- or
+  ## readable -- on evServerRejected at all, per M2).
+  Event(xfrId: NoTransfer, srvId: NoServer, kind: evServerRejected,
+        rejClientHost: host, rejClientPort: port, rejCode: code, rejMsg: msg)
 
 # ---------------------------------------------------------------------------
 # R2-M1 (code-review): `inEffect` -- the safe effective-or-requested accessor.
@@ -252,6 +262,61 @@ suite "EventQueue — H1: cap is a true absolute ceiling under protected-event s
       if ev.kind == evServerLog and ev.sLevel == llWarn:
         sawWarning = true
     check sawWarning   # the coalesced drop-count warning must have been surfaced
+
+# ---------------------------------------------------------------------------
+# M3 (code-review): evServerRejected is a terminal-class structured signal
+# (like evTransferError) and must be in ProtectedKinds -- preferred to
+# survive queue saturation, with a log-kind event evicted to make room for
+# it, rather than being routed into the droppable branch and silently
+# folded into the generic "dropped N events" warning under exactly the
+# sustained-maxConcurrent scenario the reject feature exists to observe.
+# ---------------------------------------------------------------------------
+suite "EventQueue — M3: evServerRejected is protected":
+
+  test "evServerRejected survives cap saturation: two log events are evicted to make room (one for itself, one for the pending drop-count warning), and rej* fields are retained":
+    var q = initEventQueue(cap = 3)
+    q.push(mkLog("a"))
+    q.push(mkLog("b"))
+    q.push(mkLog("c"))
+    check q.len == 3
+
+    q.push(mkRejected("203.0.113.9", 4021, errAccessViolation, "denied"))
+    check q.len <= 3   # H1: cap is never exceeded
+
+    var drained: seq[Event]
+    while true:
+      let ev = q.tryPopFirst()
+      if ev.isNone: break
+      drained.add ev.get
+
+    var sawRejected = false
+    for ev in drained:
+      if ev.kind == evServerRejected:
+        sawRejected = true
+        check ev.rejClientHost == "203.0.113.9"
+        check ev.rejClientPort == 4021
+        check ev.rejCode == errAccessViolation
+        check ev.rejMsg == "denied"
+    check sawRejected   # the reject event must have survived, not been dropped
+
+  test "flooding evServerRejected (a protected kind) never exceeds cap, and a dropped-count warning is emitted":
+    var q = initEventQueue(cap = 5)
+    for i in 1 .. 15:
+      q.push(mkRejected("198.51.100." & $i, 4000 + i, errAccessViolation, "denied " & $i))
+      check q.len <= 5   # load-bearing: true after EVERY push, not just at the end
+
+    var drained: seq[Event]
+    while true:
+      let ev = q.tryPopFirst()
+      if ev.isNone: break
+      drained.add ev.get
+
+    check drained.len <= 5
+    var sawWarning = false
+    for ev in drained:
+      if ev.kind == evServerLog and ev.sLevel == llWarn:
+        sawWarning = true
+    check sawWarning
 
 # ---------------------------------------------------------------------------
 # R2-L1 (code-review): the H1 invariant ("q.len <= cap holds after every

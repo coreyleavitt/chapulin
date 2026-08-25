@@ -146,6 +146,38 @@ proc readOptionsTwin(data: seq[byte], offset: int): seq[(string, string)] =
     result.add (key, val)
     pos = finalPos
 
+proc readOptionsOracle(data: seq[byte], offset: int): seq[(string, string)] =
+  ## Byte-for-byte faithful mirror of real `readOptions` (protocol.nim:113-123),
+  ## used ONLY by the concrete differential oracle (`decodeFullTwin`), NOT by
+  ## the symex membership proof (`decodeTwin`/`readOptionsTwin`). The symex
+  ## twin `readOptionsTwin` intentionally drops the "Option key without
+  ## value" raise arm and unconditionally breaks on an empty key -- a
+  ## disclosed, narrower-scope drift that is legitimate for the
+  ## region-membership proof it serves (documented on `readOptionsTwin`
+  ## itself). Reusing that same drifted twin from the CONCRETE oracle would
+  ## make ITS broader, undisclosed claim -- full `TftpPacket` equality
+  ## (including `oackOptions`/`options`) AND exact error-message equality,
+  ## over "arbitrary wire bytes" -- silently false for inputs it should
+  ## catch: an empty-key/non-empty-value OACK option (real yields
+  ## `("", val)`; the drifted twin drops it) and a truncated non-empty key
+  ## (real raises "Option key without value at offset N"; the drifted twin
+  ## falls through to `readCStringTwin` and raises the different message
+  ## "Unterminated string at offset N"). This reader restores exact
+  ## fidelity -- including the precise raise-message text -- so the
+  ## concrete oracle's full-equivalence claim is actually true, not just
+  ## plausible-looking on the uniform `byteSeqs()` generator (which
+  ## essentially never draws either falsifying shape).
+  var pos = offset
+  while pos < data.len:
+    let (key, nextPos) = readCStringTwin(data, pos)
+    if nextPos >= data.len and key.len > 0:
+      raise newException(TftpDecodeError, "Option key without value at offset " & $pos)
+    if key.len == 0 and nextPos >= data.len:
+      break
+    let (val, finalPos) = readCStringTwin(data, nextPos)
+    result.add (key, val)
+    pos = finalPos
+
 # ---- Unified decode twin: ONE proc, FOUR of five arms ----------------------
 
 proc decodeTwin(data: seq[byte]): TftpPacket =
@@ -312,9 +344,10 @@ suite "symex round-6 B7 -- walker/render version pins":
 # Structural equality for the variant packet. `options`/`oackOptions` ARE
 # compared here (unlike the symex-side scope) -- at ordinary concrete
 # runtime, `decodeFullTwin` below computes the real fold via
-# `readOptionsTwin`/`parseModeTwin`, so the plain differential oracle can
-# and does check every field, same as pre-B7's `decodeIntTwin` did; only
-# the SYMEX walk (BLOCKER B7-1/B7-2) stops short of modeling them.
+# `readOptionsOracle`/`parseModeTwin` (NOT the symex twin `readOptionsTwin`
+# -- see `readOptionsOracle`'s docstring), so the plain differential oracle
+# can and does check every field, exactly, same as pre-B7's `decodeIntTwin`
+# did; only the SYMEX walk (BLOCKER B7-1/B7-2) stops short of modeling them.
 proc `==`(a, b: TftpPacket): bool =
   if a.opcode != b.opcode: return false
   case a.opcode
@@ -330,9 +363,12 @@ proc decodeFullTwin(data: seq[byte]): TftpPacket =
   ## differential-oracle target, plain (unbounded, non-symex) runtime code.
   ## Reuses every helper twin above VERBATIM (a divergence here would indict
   ## those shared primitives, not a separate reimplementation) -- including
-  ## `parseModeTwin`/`readOptionsTwin`, which are safe to call here (this is
-  ## ordinary Nim, not a symex target; BLOCKER B7-1/B7-2 are symex-macro-
-  ## specific).
+  ## `parseModeTwin`, which is safe to call here (this is ordinary Nim, not
+  ## a symex target; BLOCKER B7-1/B7-2 are symex-macro-specific). Option
+  ## reading uses `readOptionsOracle`, NOT `readOptionsTwin` -- see
+  ## `readOptionsOracle`'s docstring for why the symex twin's disclosed,
+  ## narrower-scope drift is unacceptable for this proc's broader,
+  ## full-equivalence claim.
   if data.len < 2:
     raise newException(TftpDecodeError, "Packet too short: " & $data.len & " bytes")
   let wireOp = readU16Twin(data, 0)
@@ -346,7 +382,7 @@ proc decodeFullTwin(data: seq[byte]): TftpPacket =
       raise newException(TftpDecodeError, "Missing transfer mode")
     let (modeStr, afterMode) = readCStringTwin(data, afterFilename)
     let mode = parseModeTwin(modeStr)
-    let opts = readOptionsTwin(data, afterMode)
+    let opts = readOptionsOracle(data, afterMode)
     result = TftpPacket(opcode: op, filename: filename, mode: mode, options: opts)
   of opData:
     if data.len < 4:
@@ -366,7 +402,7 @@ proc decodeFullTwin(data: seq[byte]): TftpPacket =
     let (msg, _) = readCStringTwin(data, 4)
     result = TftpPacket(opcode: opError, errorCode: mappedCode, errorMsg: msg)
   of opOack:
-    let opts = readOptionsTwin(data, 2)
+    let opts = readOptionsOracle(data, 2)
     result = TftpPacket(opcode: opOack, oackOptions: opts)
 
 proc diffOracleCheck(bytes: seq[byte]): bool =
@@ -416,6 +452,8 @@ suite "differential oracle: decodeFullTwin(seq[byte]) === decode(seq[byte])":
       @[0'u8, 3],                                       # DATA too short
       @[0'u8, 4],                                       # ACK too short
       @[0'u8, 5],                                       # ERROR too short
+      @[0'u8, 6, 0, 'A'.byte, 0],       # OACK, empty option key then value "A" (H1)
+      @[0'u8, 6, 'k'.byte, 0],          # OACK, non-empty key, no value (H1)
     ]
     for v in vectors:
       check diffOracleCheck(v)

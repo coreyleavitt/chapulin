@@ -94,3 +94,70 @@ services:
         echo "PASS: PUT completed (exit $$?)"
         echo ""
         echo "=== ALL EXTERNAL CLIENT INTEROP TESTS PASSED ==="
+
+  # --- Capture point for RFC verification-harness-v2.md Part C, slice C3 ----
+  # (docs/rfc/verification-harness-v2.md §3.3/§5). Test-infra only, no src/
+  # change -- see Dockerfile.pcap's header comment for why this is the
+  # RFC's "tcpdump sidecar" option (not the "chapulin debug hook" option,
+  # which would be a second src/ change and is out of scope for this RFC).
+  #
+  # Both sidecars capture with a PLAIN `udp` filter -- no port clause.
+  # TFTP's request goes to a well-known port, but the server's DATA/ACK
+  # reply comes from a freshly allocated PER-TRANSFER ephemeral port; a
+  # port-filtered capture would silently drop everything after the initial
+  # RRQ/WRQ. See tests/interopcapture.nim's module doc comment for the full
+  # writeup (harvest side of this same finding) and for the
+  # `harvestPcapFile` manual entry point that turns a `.pcap` dropped in
+  # ./interop-captures/ into committed `tests/corpus/` seeds.
+  #
+  # Not verified live in the authoring session: this repo's local Docker
+  # engine is pinned to Windows containers, and these two Linux-only
+  # services (like tftp-server/interop-external-client above) cannot start
+  # there at all (`docker pull alpine` itself fails with "image operating
+  # system \"linux\" cannot be used on this platform"). Run under a
+  # Linux-container Docker engine, e.g.:
+  #   docker compose up --build tftp-server integration-client pcap-tftp-server
+  #   docker compose up --build our-server interop-external-client pcap-our-server
+  # then harvest each resulting ./interop-captures/*.pcap via:
+  #   nim c -r tests/interopcapture.nim ./interop-captures/direction1-tftp-server.pcap protocol.decode
+  #   nim c -r tests/interopcapture.nim ./interop-captures/direction2-our-server.pcap protocol.decode unverified
+  # (the second uses the `unverified` flag -- Direction 2's own compose
+  # script includes the always-PASS atftp-PUT leg, see docker-compose.yml's
+  # own "Test 5" comment above and tests/interopcapture.nim's
+  # `interopCaptureUnverifiedTaggedId` doc comment).
+
+  # Direction 1 capture: our client (integration-client) -> third-party
+  # tftp-server. Shares tftp-server's own network namespace (the same
+  # `network_mode: "service:X"` trick interop-external-client already uses
+  # below) so it sees tftp-server's real interface traffic -- a genuine
+  # Ethernet link over the default bridge network (pcap linktype 1,
+  # DLT_EN10MB).
+  pcap-tftp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.pcap
+    network_mode: "service:tftp-server"
+    depends_on:
+      - tftp-server
+    volumes:
+      - ./interop-captures:/captures
+    command:
+      - "timeout 90 tcpdump -i eth0 -w /captures/direction1-tftp-server.pcap udp || true"
+
+  # Direction 2 capture: third-party atftp client -> our server. atftp
+  # (interop-external-client) and our-server already share ONE network
+  # namespace (both declare `network_mode: "service:our-server"`), so their
+  # traffic crosses the LOOPBACK interface, not Ethernet -- pcap linktype 0
+  # (DLT_NULL/DLT_LOOPBACK). Includes the atftp-PUT leg (Test 5) -- harvest
+  # that leg with the `unverified` flag, per the always-PASS caveat above.
+  pcap-our-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.pcap
+    network_mode: "service:our-server"
+    depends_on:
+      - our-server
+    volumes:
+      - ./interop-captures:/captures
+    command:
+      - "timeout 90 tcpdump -i lo -w /captures/direction2-our-server.pcap udp || true"

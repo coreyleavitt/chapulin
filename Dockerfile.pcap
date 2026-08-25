@@ -1,0 +1,26 @@
+# Capture-point sidecar image for RFC verification-harness-v2.md Part C,
+# slice C3 (docs/rfc/verification-harness-v2.md §3.3/§5). Test-infra only --
+# no src/ change (the RFC's §4 hard constraint: A4 is the ONLY production
+# change in that whole RFC; a chapulin debug hook, the RFC's other named
+# capture option, would be a second src/ change and is declined here as a
+# wrong-spec escalation).
+#
+# alpine + tcpdump (both from Alpine's own official package repo -- no
+# third-party image tag) rather than an unverified pre-built "tcpdump in
+# docker" image off a registry: this repo's own toolchain image is the only
+# image pinned by digest-equivalent trust today, and this sidecar shouldn't
+# lower that bar for a two-package image.
+#
+# NOTE (honest disclosure): this Dockerfile has NOT been build/pull-verified
+# live in the authoring session -- the local Docker Desktop engine there is
+# pinned to Windows containers (`docker info --format '{{.OSType}}'` =>
+# `windows`), and even a plain `docker pull alpine` fails outright in that
+# mode ("image operating system \"linux\" cannot be used on this
+# platform"). This is a standard two-line Alpine Dockerfile using packages
+# that unquestionably exist in Alpine's official repos, so it should build
+# cleanly under any Linux-container Docker engine (a CI runner, WSL2 with
+# Docker Desktop switched to Linux containers, a Linux host) -- but treat
+# the FIRST real run as the actual verification, not this comment.
+FROM alpine:3.20
+RUN apk add --no-cache tcpdump
+ENTRYPOINT ["/bin/sh", "-c"]

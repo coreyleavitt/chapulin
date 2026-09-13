@@ -171,8 +171,18 @@ jobs:
         if: runner.os == 'macOS'
         run: true  # clang ships with Xcode; no GTK — macOS is CLI-only
 
-      - name: Install dependencies
-        run: nimble install -d -y
+      # Resolve deps with milpa (not nimble — see ci.yaml / scripts/ci.sh).
+      # Emits nim.cfg with the --path lines the nim c builds below read.
+      - name: Resolve dependencies (milpa)
+        shell: bash
+        run: |
+          set -euo pipefail
+          export MILPA_CACHE_DIR="$PWD/.milpa-cache"
+          pipx install "git+https://github.com/coreyleavitt/milpa.git#subdirectory=impls/python"
+          bindir="$(pipx environment --value PIPX_BIN_DIR)"
+          case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) bindir="$(cygpath -u "$bindir")";; esac
+          export PATH="$bindir:$PATH"
+          milpa -C . fetch
 
       - name: Build release binary (Linux — Clang + LTO)
         if: runner.os == 'Linux'

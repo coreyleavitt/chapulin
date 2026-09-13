@@ -7,9 +7,14 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Deps are resolved with MILPA, not nimble (nimble can't evaluate softlink's
+# .nimble and doesn't know the milpa-managed dev-deps). scripts/ci.sh installs
+# milpa, runs `milpa fetch`, then drives nim directly -- the local dev loop,
+# minus the Docker container (CI runs nim natively on each runner).
 jobs:
-  test:
+  build-test:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
@@ -22,39 +27,15 @@ jobs:
           nim-version: stable
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      # oyamel's GTK4 backend is the Linux GUI backend (the old GTK3 dep is
-      # gone). macOS has no oyamel backend yet, so it builds CLI-only (no GTK).
-      - name: Install GTK4 dev (Linux)
+      # oyamel's GTK4 backend (Linux GUI) + the headless GTK4 runtime smoke.
+      # Windows uses the Win32 backend; macOS is CLI-only.
+      - name: Install GTK4 dev + Xvfb (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev
+        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev xvfb dbus-x11
 
-      - name: Install dependencies
-        run: nimble install -d -y
-
-      - name: Run unit tests
-        run: nimble test
-
-      # GUI build gate — `nim c` (link), the backend define comes from the
-      # committed config.nims (oyamelWin32 on Windows, oyamelGtk4 on Linux).
-      # macOS is CLI-only: oyamel ships no Cocoa backend, so it does NOT build
-      # -d:withGui (see docs/rfc/gui-oyamel-port.md §6.0).
-      - name: Build (with GUI — Windows + Linux)
-        if: runner.os != 'macOS'
-        run: nim c --threads:on -d:withGui -d:release -o:chapulin src/chapulin.nim
-
-      - name: Build (CLI only — macOS)
-        if: runner.os == 'macOS'
-        run: nim c --threads:on -d:release -o:chapulin src/chapulin.nim
-
-      # GTK4 runtime smoke (Linux): prove the GUI actually instantiates on the
-      # real GTK4 backend, not just links. -d:chapulinGuiSmokeQuit opens the
-      # window, runs the pump, then self-quits (gui-oyamel-port §5 slice 4).
-      - name: GUI headless smoke (Linux/GTK4)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get install -y xvfb dbus-x11
-          nim c --threads:on -d:withGui -d:chapulinGuiSmokeQuit -o:chapulin-gui-smoke src/chapulin.nim
-          xvfb-run -a dbus-run-session -- ./chapulin-gui-smoke gui
+      - name: Build + test (milpa + nim)
+        shell: bash
+        run: bash scripts/ci.sh
 
   lint:
     runs-on: ubuntu-latest
@@ -67,8 +48,12 @@ jobs:
           nim-version: stable
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install dependencies
-        run: nimble install -d -y
-
-      - name: Check compilation (strict hints)
-        run: nim check --hints:on src/chapulin.nim
+      - name: milpa fetch + nim check (strict hints)
+        shell: bash
+        run: |
+          set -euo pipefail
+          export MILPA_CACHE_DIR="$PWD/.milpa-cache"
+          pipx install "git+https://github.com/coreyleavitt/milpa.git#subdirectory=impls/python"
+          export PATH="$(pipx environment --value PIPX_BIN_DIR):$PATH"
+          milpa -C . fetch
+          nim check --hints:on src/chapulin.nim

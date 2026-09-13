@@ -192,8 +192,8 @@ chapulin's facade is known to leak Nim `Defect`s (`FieldDefect`/`NilAccessDefect
 
 ### 6.1 oyamel enhancements to file (prerequisites for slice 2, not blockers for the port's shape)
 
-- **`readOnly` on `TextAreaData`** (`ES_READONLY` / `gtk_text_view_set_editable(false)`) — the one behavior the port cannot preserve today (NiGui's `editable = false`). Without it the logs are either user-editable or greyed-and-uncopyable. Interim for slice 2: accept an editable log and document it; target: the `readOnly` field.
-- **`appendText` at end (keeping the view tailed)** — the same backend call (`EM_REPLACESEL` at end / `gtk_text_buffer_insert` at end). Removes the O(n²)/scroll-reset problem the §4.4 capped-model only bounds. File alongside `readOnly`.
+- **`readOnly` on `TextAreaData`** (`ES_READONLY` / `gtk_text_view_set_editable(false)`) — the one behavior the port cannot preserve today (NiGui's `editable = false`). Without it the logs are either user-editable or greyed-and-uncopyable. ✅ **DONE** (no interim taken) — implemented in oyamel `736c937` (both backends); the log builds `textArea(readOnly = true)`. Verified: oyamel `t_widget_update` readOnly suite + native `t_textarea_readonly_append` round-trip.
+- **`appendText` at end (keeping the view tailed)** — the same backend call (`EM_REPLACESEL` at end / `gtk_text_buffer_insert` at end). Removes the O(n²)/scroll-reset problem the §4.4 capped-model only bounds. ✅ **DONE** — `app.appendText` in oyamel `736c937` (both backends); win32 brackets `EM_REPLACESEL` with `EM_SETREADONLY(0/1)` since it is a no-op on read-only EDITs. chapulin's `logLine` uses it (capped `Deque` rebuild only on 500-line overflow).
 
 ### 6.2 Smaller open items
 

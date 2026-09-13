@@ -14,7 +14,7 @@ requires "nim >= 2.0.0"
 # COMMIT (oyamel ships no tags; under heavy RFC-driven dev). This is the
 # nimble-resolved half of the dep swap — milpa.kdl carries the same pin for the
 # container dev-loop. See docs/rfc/gui-oyamel-port.md §4.1.
-requires "https://github.com/coreyleavitt/oyamel.git#35096e254f30325039fd6fe2eb9e55479723cada"
+requires "https://github.com/coreyleavitt/oyamel.git#736c937665373ffa27d55b000f20a2c9ae702d77"
 # oyamel's GTK4 backend (Linux) enforces a compile-time `requireSoftlink
 # "0.12.3"` floor (glib.nim). oyamel deliberately declares NO softlink require
 # of its own — that would floor Win32 consumers who never compile a line of it
@@ -41,6 +41,9 @@ task test, "Run unit tests":
   exec "nim c -r -d:chapulinTest tests/t_session.nim"
   # Desktop GUI pure layer (oyamel-free): status formatting + form validation.
   exec "nim c -r -d:chapulinTest tests/t_gui_pure.nim"
+  # Desktop GUI pump + client translation under oyamel's NoopBackend (headless,
+  # no backend define) driving a real transfer over the in-memory wire.
+  exec "nim c -r -d:chapulinTest tests/t_gui_pump.nim"
 
 task gui, "Build with GUI support":
   exec "nim c --threads:on -d:withGui -d:release -o:chapulin src/chapulin.nim"

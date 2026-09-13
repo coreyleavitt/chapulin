@@ -370,8 +370,8 @@ suite "RRQ option negotiation":
     # epochTime()), so allow a small tolerance for real elapsed time rather
     # than asserting exact equality.
     check mt.recvTimeoutsMs.len == 3
-    check mt.recvTimeoutsMs[0] == 10_000
-    check mt.recvTimeoutsMs[1] == 20_000
+    check abs(mt.recvTimeoutsMs[0] - (10_000)) <= 50  # wall-clock budget: 1ms shy of nominal on a hi-res clock
+    check abs(mt.recvTimeoutsMs[1] - (20_000)) <= 50  # wall-clock budget: 1ms shy of nominal on a hi-res clock
     check abs(mt.recvTimeoutsMs[2] - 20_000) <= 50
 
   test "OACK omitting timeout must not clobber the client's configured timeout (Fix A)":
@@ -405,8 +405,8 @@ suite "RRQ option negotiation":
     # xferConfig.timeout down to DefaultTimeout, this would read 5000
     # instead of the client's configured 30000.
     check mt.recvTimeoutsMs.len == 3
-    check mt.recvTimeoutsMs[0] == 30_000
-    check mt.recvTimeoutsMs[1] == 30_000
+    check abs(mt.recvTimeoutsMs[0] - (30_000)) <= 50  # wall-clock budget: 1ms shy of nominal on a hi-res clock
+    check abs(mt.recvTimeoutsMs[1] - (30_000)) <= 50  # wall-clock budget: 1ms shy of nominal on a hi-res clock
 
 suite "RRQ OACK timeout clamp (R2-3 fix a — engine seeds from xferConfig.timeout, not raw config.timeout)":
   test "OACK omitting timeout clamps an out-of-range HIGH client-configured timeout into range":
@@ -441,8 +441,8 @@ suite "RRQ OACK timeout clamp (R2-3 fix a — engine seeds from xferConfig.timeo
     # AFTER applyOack -- it must reflect the CLAMPED 255s (255_000ms), never
     # the raw 300_000ms (the pre-fix bug) and never 0.
     check mt.recvTimeoutsMs.len == 3
-    check mt.recvTimeoutsMs[0] == 255_000
-    check mt.recvTimeoutsMs[1] == 255_000
+    check abs(mt.recvTimeoutsMs[0] - (255_000)) <= 50  # wall-clock budget: 1ms shy of nominal on a hi-res clock
+    check abs(mt.recvTimeoutsMs[1] - (255_000)) <= 50  # wall-clock budget: 1ms shy of nominal on a hi-res clock
 
   test "a zero client-configured timeout clamps to MinTimeoutOpt and the handshake recv is actually awaited (R3-1)":
     # Client configures timeout=0, out of range on the LOW end (MinTimeoutOpt
@@ -473,8 +473,8 @@ suite "RRQ OACK timeout clamp (R2-3 fix a — engine seeds from xferConfig.timeo
     # recvTimeoutsMs stays empty and the transfer fails outright -- both of
     # which the checks below rule out.
     check mt.recvTimeoutsMs.len == 3
-    check mt.recvTimeoutsMs[0] == MinTimeoutOpt * 1000
-    check mt.recvTimeoutsMs[1] == MinTimeoutOpt * 1000
+    check abs(mt.recvTimeoutsMs[0] - (MinTimeoutOpt * 1000)) <= 50  # wall-clock budget: 1ms shy of nominal on a hi-res clock
+    check abs(mt.recvTimeoutsMs[1] - (MinTimeoutOpt * 1000)) <= 50  # wall-clock budget: 1ms shy of nominal on a hi-res clock
 
 suite "RRQ OACK validation -> ERROR(8)":
   test "unrequested-but-in-range OACK option is filtered, never applied":
@@ -1030,10 +1030,10 @@ suite "Public API path timeout clamp (R2-3 fix b — api.startTransfer can't inj
     # budget expire before transport.recv is even called, and the transfer
     # would fail rather than succeed).
     check mt.recvTimeoutsMs.len == 3
-    check mt.recvTimeoutsMs[0] == MinTimeoutOpt * 1000
+    check abs(mt.recvTimeoutsMs[0] - (MinTimeoutOpt * 1000)) <= 50  # wall-clock budget: 1ms shy of nominal on a hi-res clock
     # recvTimeoutsMs[1]: recvBlocks' first recv, post-applyOack -- must
     # reflect the clamped negotiated timeout, never 0.
-    check mt.recvTimeoutsMs[1] == MinTimeoutOpt * 1000
+    check abs(mt.recvTimeoutsMs[1] - (MinTimeoutOpt * 1000)) <= 50  # wall-clock budget: 1ms shy of nominal on a hi-res clock
 
   test "startTransfer clamps an out-of-range HIGH (300) requested timeout before it ever reaches the client engine":
     let mt = newMockTransport()
@@ -1056,5 +1056,5 @@ suite "Public API path timeout clamp (R2-3 fix b — api.startTransfer can't inj
 
     check result.success == true
     check mt.recvTimeoutsMs.len == 3
-    check mt.recvTimeoutsMs[0] == MaxTimeoutOpt * 1000
-    check mt.recvTimeoutsMs[1] == MaxTimeoutOpt * 1000
+    check abs(mt.recvTimeoutsMs[0] - (MaxTimeoutOpt * 1000)) <= 50  # wall-clock budget: 1ms shy of nominal on a hi-res clock
+    check abs(mt.recvTimeoutsMs[1] - (MaxTimeoutOpt * 1000)) <= 50  # wall-clock budget: 1ms shy of nominal on a hi-res clock

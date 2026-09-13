@@ -73,3 +73,54 @@ proc parseClientForm*(f: ClientForm): ClientFormResult =
   var req = newTransferRequest(host, port, remoteFile, localFile, direction)
   req.options.blocksize = blocksizeFor(f.blocksizeIndex)
   ClientFormResult(ok: true, req: req, err: "")
+
+# ---------------------------------------------------------------------------
+# Server form validation (RFC gui-oyamel-port.md §4.5/§4.6, slice 3)
+# ---------------------------------------------------------------------------
+
+proc writePolicyFor*(index: int): WritePolicy =
+  ## Map the write-policy comboBox's selectedIndex to a WritePolicy (NiGui
+  ## parity order: deny/create/overwrite/all). Out-of-range (including the -1
+  ## "no selection" default) falls back to the safe default, wpDeny.
+  case index
+  of 0: wpDeny
+  of 1: wpCreateOnly
+  of 2: wpOverwrite
+  of 3: wpCreateOrOverwrite
+  else: wpDeny
+
+type
+  ServerForm* = object
+    ## The server panel's inputs as a plain record, mirroring ClientForm.
+    rootDir*: string
+    portStr*: string
+    maxClientsStr*: string
+    writePolicyIndex*: int
+  ServerFormResult* = object
+    ok*: bool
+    rootDir*: string
+    port*: int
+    maxClients*: int
+    writePolicy*: WritePolicy
+    err*: string           ## "" iff ok
+
+proc parseServerForm*(f: ServerForm): ServerFormResult =
+  ## Validate the server form. Pure and display-free: no `dirExists` (that
+  ## touches the filesystem and stays in wireServer) and no `newServerConfig`
+  ## (that builds the real ServerConfig and stays in wireServer too). Notice
+  ## order matches the NiGui version so the parity checklist holds.
+  let rootDir = f.rootDir.strip()
+  if rootDir.len == 0:
+    return ServerFormResult(ok: false, err: "Please select a root directory.")
+  var port: int
+  try:
+    port = parseInt(f.portStr.strip())
+  except ValueError:
+    return ServerFormResult(ok: false, err: "Invalid port.")
+  var maxClients: int
+  try:
+    maxClients = parseInt(f.maxClientsStr.strip())
+  except ValueError:
+    return ServerFormResult(ok: false, err: "Invalid max clients.")
+  ServerFormResult(ok: true, rootDir: rootDir, port: port, maxClients: maxClients,
+                   writePolicy: writePolicyFor(f.writePolicyIndex), err: "")

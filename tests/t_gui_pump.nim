@@ -9,7 +9,7 @@
 ##   docker run --rm -v ${PWD}:C:\app ghcr.io/coreyleavitt/nim:2.2.10 \
 ##     nim c -r tests/t_gui_pump.nim
 
-import std/[unittest, os, asyncdispatch, options, strutils]
+import std/[unittest, os, asyncdispatch, options, strutils, times]
 import oyamel
 import ../src/chapulin/api except Event, EventKind
 import ../src/chapulin/server
@@ -17,6 +17,13 @@ import ../src/chapulin/server_config
 import ../src/chapulin/protocol
 import ./wireharness
 import ../gui/desktop/chapulin_gui
+# `api` excepts `Event`/`EventKind` (oyamel's names win unqualified — see
+# chapulin_gui.nim's own header comment). To build a raw chapulin `Event` for
+# `injectEvent` (server event translation suite, below) this imports
+# eventqueue with ZERO unqualified symbols (`import nil`) so `eventqueue.Event`
+# is reachable qualified with no risk of colliding with oyamel's bare `Event`
+# used everywhere else in this file (`clickStart`'s `Event(kind: ekClick, ...)`).
+from ../src/chapulin/eventqueue import nil
 
 # Build the GUI under NoopBackend and wire the client handlers, over a session
 # whose transport is the in-memory wire (client side). Returns everything the
@@ -166,3 +173,126 @@ suite "GUI pump — validation (no widgets touched by the facade)":
     check refs.clientSt.xferId == NoTransfer
     check not refs.clientSt.active
     check "Please enter a host address." in app.read(refs.client.log, text)
+
+# ---------------------------------------------------------------------------
+# Server panel — build under NoopBackend, wire against a session whose
+# startServer binds a REAL UDP socket on 127.0.0.1 (the session's default
+# listenerFactory — self-contained, no external daemon, no wireharness mock
+# needed for the lifecycle itself).
+# ---------------------------------------------------------------------------
+
+proc newServerHarness(session: TftpSession): (App[NoopBackend], GuiRefs) =
+  var app = newApp()
+  let refs = buildGui(app, session)
+  wireServer(app, refs, session)
+  (app, refs)
+
+proc fillServerForm(app: App[NoopBackend]; refs: GuiRefs;
+                    rootDir, portStr: string; writePolicyIndex: int;
+                    maxClientsStr = "10") =
+  app.update(refs.server.rootDir, text = rootDir)
+  app.update(refs.server.srvPort, text = portStr)
+  app.update(refs.server.wpCombo, selectedIndex = writePolicyIndex)
+  app.update(refs.server.maxClients, text = maxClientsStr)
+
+proc clickServerStart(app: App[NoopBackend]; refs: GuiRefs) =
+  var ev = Event(kind: ekClick, target: refs.server.startBtn.id)
+  app.dispatch(ev)
+
+proc clickServerStop(app: App[NoopBackend]; refs: GuiRefs) =
+  var ev = Event(kind: ekClick, target: refs.server.stopBtn.id)
+  app.dispatch(ev)
+
+proc pumpServerUntil(app: App[NoopBackend]; refs: GuiRefs; session: TftpSession;
+                     predicate: proc(): bool {.closure.}; timeoutSec = 3.0) =
+  ## Pump wall-clock-bounded (not step-bounded): the real listener's recv
+  ## uses a genuine timeout, so `stop()` only takes effect once that real
+  ## timeout elapses -- a step cap on a tight spin loop would either hit its
+  ## cap long before enough real time passed, or (if huge) needlessly thrash
+  ## CPU well past the real deadline. epochTime() is what actually gates it.
+  let deadline = epochTime() + timeoutSec
+  while not predicate() and epochTime() < deadline:
+    pumpOnce(app, refs, session)
+
+suite "GUI pump — server lifecycle (NoopBackend, real UDP listener)":
+  test "Start binds a real server (evServerStarted -> running status); Stop drains it":
+    let tmpDir = getTempDir() / "chapulin_t_gui_pump_server"
+    createDir(tmpDir)
+    defer: (try: removeDir(tmpDir) except CatchableError: discard)
+
+    let session = newSession()
+    let (app, refs) = newServerHarness(session)
+
+    fillServerForm(app, refs, tmpDir, "0", writePolicyIndex = 0)   # port 0 = OS-assigned
+    clickServerStart(app, refs)
+
+    pumpServerUntil(app, refs, session,
+      proc(): bool = "running" in app.read(refs.server.status, text))
+
+    check "running" in app.read(refs.server.status, text)
+    check app.read(refs.server.startBtn, enabled) == false
+    check app.read(refs.server.stopBtn, enabled) == true
+    check refs.serverSt.serverId != NoServer
+
+    clickServerStop(app, refs)
+    # Stop() flips stopBtn immediately (synchronous, no pump needed)...
+    check app.read(refs.server.stopBtn, enabled) == false
+    check "Stopping..." in app.read(refs.server.status, text)
+
+    # ...but the real evServerStopped only lands once the listener's own
+    # recv timeout elapses and the run loop actually exits.
+    pumpServerUntil(app, refs, session,
+      proc(): bool = "stopped" in app.read(refs.server.status, text), timeoutSec = 5.0)
+
+    check "stopped" in app.read(refs.server.status, text)
+    check app.read(refs.server.startBtn, enabled) == true
+    check app.read(refs.server.stopBtn, enabled) == false
+    check "Server stopped" in app.read(refs.server.log, text)
+
+suite "GUI pump — server event translation (injected events, deterministic)":
+  test "evServerLog and evTransfer* events translate onto the server log":
+    let tmpDir = getTempDir() / "chapulin_t_gui_pump_server_events"
+    createDir(tmpDir)
+    defer: (try: removeDir(tmpDir) except CatchableError: discard)
+
+    let session = newSession()
+    let (app, refs) = newServerHarness(session)
+
+    fillServerForm(app, refs, tmpDir, "0", writePolicyIndex = 0)
+    clickServerStart(app, refs)
+    pumpServerUntil(app, refs, session,
+      proc(): bool = "running" in app.read(refs.server.status, text))
+
+    let srvId = refs.serverSt.serverId
+    check srvId != NoServer
+
+    let params = TransferParams(blocksize: 512, windowsize: 1)
+    session.injectEvent(eventqueue.Event(kind: evServerLog, xfrId: NoTransfer,
+      srvId: srvId, sLevel: llWarn, sMessage: "disk almost full"))
+    session.injectEvent(eventqueue.Event(kind: evTransferStarted, xfrId: NoTransfer,
+      srvId: srvId, snap: TransferSnapshot(bytes: 0, total: some(2048'i64),
+        requested: params, effective: some(params), direction: tdGet,
+        mode: tmOctet, startedAt: epochTime()),
+      errorCode: none(TftpErrorCode), errorMsg: ""))
+    session.injectEvent(eventqueue.Event(kind: evTransferComplete, xfrId: NoTransfer,
+      srvId: srvId, snap: TransferSnapshot(bytes: 2048, total: some(2048'i64),
+        requested: params, effective: some(params), direction: tdGet,
+        mode: tmOctet, startedAt: epochTime()),
+      errorCode: none(TftpErrorCode), errorMsg: ""))
+    session.injectEvent(eventqueue.Event(kind: evTransferError, xfrId: NoTransfer,
+      srvId: srvId, snap: TransferSnapshot(bytes: 0, total: none(int64),
+        requested: params, effective: none(TransferParams), direction: tdPut,
+        mode: tmOctet, startedAt: epochTime()),
+      errorCode: none(TftpErrorCode), errorMsg: "disk full"))
+
+    pumpOnce(app, refs, session)
+
+    let logText = app.read(refs.server.log, text)
+    check "[WARN] disk almost full" in logText
+    check "Incoming transfer started (RRQ)" in logText
+    check "Transfer complete: " in logText
+    check "Transfer error: disk full" in logText
+
+    clickServerStop(app, refs)
+    pumpServerUntil(app, refs, session,
+      proc(): bool = "stopped" in app.read(refs.server.status, text), timeoutSec = 5.0)

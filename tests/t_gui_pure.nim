@@ -89,3 +89,58 @@ suite "gui_pure: parseClientForm (pure validation + request build)":
     let r = parseClientForm(f)
     check not r.ok
     check r.err == "Invalid port number."
+
+suite "gui_pure: writePolicyFor (comboBox index guard)":
+  test "each index maps to the parity write policy in order":
+    check writePolicyFor(0) == wpDeny
+    check writePolicyFor(1) == wpCreateOnly
+    check writePolicyFor(2) == wpOverwrite
+    check writePolicyFor(3) == wpCreateOrOverwrite
+
+  test "the -1 'no selection' default falls back to wpDeny":
+    check writePolicyFor(-1) == wpDeny
+
+  test "an out-of-range index falls back to wpDeny rather than IndexDefect-ing":
+    check writePolicyFor(99) == wpDeny
+
+suite "gui_pure: parseServerForm (pure validation)":
+  proc validForm(): ServerForm =
+    ServerForm(rootDir: "C:/tftproot", portStr: "69", maxClientsStr: "10",
+               writePolicyIndex: 0)
+
+  test "a valid form parses every field":
+    let r = parseServerForm(validForm())
+    check r.ok
+    check r.err == ""
+    check r.rootDir == "C:/tftproot"
+    check r.port == 69
+    check r.maxClients == 10
+    check r.writePolicy == wpDeny
+
+  test "empty root directory is rejected":
+    var f = validForm()
+    f.rootDir = "   "
+    let r = parseServerForm(f)
+    check not r.ok
+    check r.err == "Please select a root directory."
+
+  test "a non-numeric port is rejected":
+    var f = validForm()
+    f.portStr = "not-a-port"
+    let r = parseServerForm(f)
+    check not r.ok
+    check r.err == "Invalid port."
+
+  test "a non-numeric max clients is rejected":
+    var f = validForm()
+    f.maxClientsStr = "not-a-number"
+    let r = parseServerForm(f)
+    check not r.ok
+    check r.err == "Invalid max clients."
+
+  test "writePolicyIndex maps through to the parsed writePolicy":
+    var f = validForm()
+    f.writePolicyIndex = 3
+    let r = parseServerForm(f)
+    check r.ok
+    check r.writePolicy == wpCreateOrOverwrite

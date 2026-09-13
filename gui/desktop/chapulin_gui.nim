@@ -9,8 +9,10 @@
 ## Build gate (link, not `nim check`):  pwsh scripts/dev-test.ps1 -GuiBuild
 ##
 ## SLICE 2 (client): the client tab, the pump's client translation, the
-## validation split, and the read-only auto-tailing log. Server tab is a
-## placeholder until slice 3.
+## validation split, and the read-only auto-tailing log.
+##
+## SLICE 3 (server): the server tab, server lifecycle (start/stop), and the
+## server-side event translation (evServer*/evTransfer* on the server's log).
 
 import std/[times, options, deques, strutils, os]
 import oyamel
@@ -48,32 +50,56 @@ type
     startTime*: float
     logLines*: Deque[string]
 
+  ServerUi* = object
+    ## Typed widget handles for the server panel, mirroring ClientUi.
+    rootDir*, srvPort*, maxClients*: WidgetRef[wkTextBox]
+    wpCombo*: WidgetRef[wkComboBox]
+    startBtn*, stopBtn*, rootBrowseBtn*: WidgetRef[wkButton]
+    status*: WidgetRef[wkLabel]
+    log*: WidgetRef[wkTextArea]
+
+  ServerState* = ref object
+    ## Mutable per-panel state, mirroring ClientState. `serverId` is the
+    ## single active server this panel owns (NoServer = idle).
+    serverId*: ServerId
+    logLines*: Deque[string]
+
   GuiRefs* = object
     win*: WidgetId
     client*: ClientUi
     clientSt*: ClientState
-    serverTab*: WidgetId   ## slice 3 builds the server panel into this
+    server*: ServerUi
+    serverSt*: ServerState
 
 # ---------------------------------------------------------------------------
 # Log model — read-only, auto-tailing, capped (RFC §4.4)
 # ---------------------------------------------------------------------------
 
-proc logLine[B](app: App[B]; ui: ClientUi; st: ClientState; msg: string) =
-  ## Append one line to the client log. Uses oyamel's `appendText` (O(appended),
+proc appendLog[B](app: App[B]; log: WidgetRef[wkTextArea]; logLines: var Deque[string];
+                   msg: string) =
+  ## Append one line to a panel's log. Uses oyamel's `appendText` (O(appended),
   ## keeps the view tailed) on the normal path; only when the cap is exceeded
   ## does it trim + full-replace (a cold path for TFTP's short logs). The
-  ## backing Deque is the source of truth for that rebuild.
-  let firstLine = st.logLines.len == 0
-  st.logLines.addLast(msg)
-  if st.logLines.len > MaxLogLines:
-    while st.logLines.len > MaxLogLines: discard st.logLines.popFirst()
+  ## backing Deque is the source of truth for that rebuild. Shared by both the
+  ## client and server panels (`logLine`/`serverLogLine` below) — same model,
+  ## two independent Deques.
+  let firstLine = logLines.len == 0
+  logLines.addLast(msg)
+  if logLines.len > MaxLogLines:
+    while logLines.len > MaxLogLines: discard logLines.popFirst()
     var whole = ""
-    for i in 0 ..< st.logLines.len:
+    for i in 0 ..< logLines.len:
       if i > 0: whole.add '\n'
-      whole.add st.logLines[i]
-    app.update(ui.log, text = whole)
+      whole.add logLines[i]
+    app.update(log, text = whole)
   else:
-    app.appendText(ui.log, if firstLine: msg else: "\n" & msg)
+    app.appendText(log, if firstLine: msg else: "\n" & msg)
+
+proc logLine[B](app: App[B]; ui: ClientUi; st: ClientState; msg: string) =
+  appendLog(app, ui.log, st.logLines, msg)
+
+proc serverLogLine[B](app: App[B]; ui: ServerUi; st: ServerState; msg: string) =
+  appendLog(app, ui.log, st.logLines, msg)
 
 # ---------------------------------------------------------------------------
 # Client transfer state machine
@@ -107,6 +133,30 @@ proc notify[B](app: App[B]; win: WidgetId; ui: ClientUi; st: ClientState; msg: s
                   proc(res: MessageDialogResult) = discard)
 
 # ---------------------------------------------------------------------------
+# Server lifecycle state machine
+# ---------------------------------------------------------------------------
+
+proc setServerRunning[B](app: App[B]; ui: ServerUi; st: ServerState; running: bool) =
+  ## Start/Stop enable-disable pair, mirroring setTransferring.
+  app.update(ui.startBtn, enabled = not running)
+  app.update(ui.stopBtn, enabled = running)
+
+proc readServerForm[B](app: App[B]; ui: ServerUi): ServerForm =
+  ## Impure half of the validation split (§4.5): the widget reads. The pure
+  ## parseServerForm (gui_pure) does the validation.
+  ServerForm(
+    rootDir: app.read(ui.rootDir, text),
+    portStr: app.read(ui.srvPort, text),
+    maxClientsStr: app.read(ui.maxClients, text),
+    writePolicyIndex: app.read(ui.wpCombo, selectedIndex))
+
+proc serverNotify[B](app: App[B]; win: WidgetId; ui: ServerUi; st: ServerState; msg: string) =
+  ## A validation/error notice on the server panel, mirroring `notify`.
+  serverLogLine(app, ui, st, msg)
+  app.showMessage(win, MessageConfig(text: msg, icon: miWarning, buttons: mbOk),
+                  proc(res: MessageDialogResult) = discard)
+
+# ---------------------------------------------------------------------------
 # Client event translation (pump target)
 # ---------------------------------------------------------------------------
 
@@ -133,7 +183,48 @@ proc onClientEvent*[B](app: App[B]; ui: ClientUi; st: ClientState; ev: auto) =
     logLine(app, ui, st, "Error: " & sanitizeForDisplay(ev.errorMsg))
     setTransferring(app, ui, st, false)
   else:
-    discard   # server-side kinds — handled by onServerEvent (slice 3)
+    discard   # server-side kinds — handled by onServerEvent
+
+# ---------------------------------------------------------------------------
+# Server event translation (pump target)
+# ---------------------------------------------------------------------------
+
+proc onServerEvent*[B](app: App[B]; ui: ServerUi; st: ServerState; ev: auto) =
+  ## Translate one server-routed event to widget updates. `snap`/`errorMsg`
+  ## are read only inside their own evTransfer* arms (Defect-safe — RFC §4.8):
+  ## `ev.snap` is a compile error on any evServer* kind, so there is no way to
+  ## accidentally read it off-arm.
+  case ev.kind
+  of evServerStarted:
+    app.update(ui.status, text = "Server running on " & ev.boundAddr & ":" & $ev.boundPort)
+  of evServerStartFailed:
+    # Mirrors onClientEvent's evTransferError: a pump-fired failure gets a
+    # log line + status update, never a modal dialog (dialogs are reserved
+    # for SYNCHRONOUS validation notices, which have a WidgetId to anchor on
+    # — onServerEvent, like onClientEvent, does not take one).
+    serverLogLine(app, ui, st, "Server failed to start: " & sanitizeForDisplay(ev.startErr))
+    setServerRunning(app, ui, st, false)
+    app.update(ui.status, text = "Server stopped")
+  of evServerStopped:
+    setServerRunning(app, ui, st, false)
+    app.update(ui.status, text = "Server stopped")
+    serverLogLine(app, ui, st, "Server stopped")
+  of evServerLog:
+    serverLogLine(app, ui, st, "[" & $ev.sLevel & "] " & sanitizeForDisplay(ev.sMessage))
+  of evServerRejected:
+    discard   # already surfaced via evServerLog at warn (NiGui parity) — handled
+              # explicitly, never folded into a blanket else
+  of evTransferStarted:
+    serverLogLine(app, ui, st, "Incoming transfer started (" &
+      (if ev.snap.direction == tdGet: "RRQ" else: "WRQ") & ")")
+  of evTransferProgress:
+    let f = fraction(ev.snap.bytes, ev.snap.total)
+    serverLogLine(app, ui, st, "Transfer progress: " & formatBytes(ev.snap.bytes) &
+      (if f.isSome: " (" & $(int(f.get * 100.0)) & "%)" else: ""))
+  of evTransferComplete:
+    serverLogLine(app, ui, st, "Transfer complete: " & formatBytes(ev.snap.bytes))
+  of evTransferError:
+    serverLogLine(app, ui, st, "Transfer error: " & sanitizeForDisplay(ev.errorMsg))
 
 # ---------------------------------------------------------------------------
 # Build + wire
@@ -178,19 +269,45 @@ proc buildGui*[B](app: App[B]; session: TftpSession): GuiRefs =
             label(text = "Ready") as statusLbl
             textArea(readOnly = true, expand = emFill) as logArea
         tab(title = "Server") as serverTab:
-          label(text = "Server panel — slice 3")   # replaced in slice 3
+          vbox(spacing = 6, expand = emFill):
+            # NB: `as` binding names are suffixed (srv…/wpCombo) — a bare name
+            # like `local` or `log` collides with an imported stdlib symbol
+            # (std/times.local, std/math.log) and mistypes the build tuple field.
+            hbox(spacing = 6):
+              label(text = "Root dir:", minSize = (LabelWidth, 0))
+              textBox(expand = emFill) as srvRootBox
+              button(text = "Browse...") as srvRootBrowseBtn
+            hbox(spacing = 6):
+              label(text = "Port:", minSize = (LabelWidth, 0))
+              textBox(text = "69", size = (65, 0)) as srvPortBox
+              label(text = "Write policy:")
+              comboBox(items = @["deny", "create", "overwrite", "all"],
+                       selectedIndex = 0) as wpCombo
+              label(text = "Max:")
+              textBox(text = "10", size = (40, 0)) as srvMaxBox
+            hbox(spacing = 6):
+              button(text = "Start Server", expand = emFill) as srvStartBtn
+              button(text = "Stop", enabled = false) as srvStopBtn
+            label(text = "Server stopped") as srvStatusLbl
+            textArea(readOnly = true, expand = emFill) as srvLogArea
   discard ui.tabs
   let client = ClientUi(
     host: ui.hostBox, port: ui.portBox, remote: ui.remoteBox, local: ui.localBox,
     dirCombo: ui.dirCombo, bsCombo: ui.bsCombo,
     startBtn: ui.startBtn, cancelBtn: ui.cancelBtn, browseBtn: ui.browseBtn,
     prog: ui.progBar, status: ui.statusLbl, log: ui.logArea)
+  let server = ServerUi(
+    rootDir: ui.srvRootBox, srvPort: ui.srvPortBox, maxClients: ui.srvMaxBox,
+    wpCombo: ui.wpCombo,
+    startBtn: ui.srvStartBtn, stopBtn: ui.srvStopBtn, rootBrowseBtn: ui.srvRootBrowseBtn,
+    status: ui.srvStatusLbl, log: ui.srvLogArea)
   GuiRefs(
     win: ui.winId.id,
     client: client,
     clientSt: ClientState(xferId: NoTransfer, active: false,
                           logLines: initDeque[string]()),
-    serverTab: ui.serverTab.id)
+    server: server,
+    serverSt: ServerState(serverId: NoServer, logLines: initDeque[string]()))
 
 proc wireClient*[B](app: App[B]; refs: GuiRefs; session: TftpSession) =
   ## Register the client handlers after the build, when every `as` binding is in
@@ -233,6 +350,46 @@ proc wireClient*[B](app: App[B]; refs: GuiRefs; session: TftpSession) =
       session.cancel(st.xferId)
       logLine(app, ui, st, "Cancelling transfer..."))
 
+proc wireServer*[B](app: App[B]; refs: GuiRefs; session: TftpSession) =
+  ## Register the server handlers after the build, when every `as` binding is
+  ## in scope (§4.2). Handlers capture app/ui/session/st. Mirrors wireClient's
+  ## shape: a browse callback, a Start handler (validate → check root dir
+  ## exists → build ServerConfig → start), and a Stop handler.
+  let ui = refs.server
+  let st = refs.serverSt
+  let win = refs.win
+
+  app.on(ui.rootBrowseBtn, ekClick, proc(event: var oyamel.Event) =
+    let cfg = FileDialogConfig(kind: fdkFolder, title: "Select TFTP root directory")
+    app.showFileDialog(win, cfg, proc(res: FileDialogResult) =
+      if not res.cancelled and res.paths.len > 0:
+        app.update(ui.rootDir, text = res.paths[0])))
+
+  app.on(ui.startBtn, ekClick, proc(event: var oyamel.Event) =
+    let parsed = parseServerForm(readServerForm(app, ui))
+    if not parsed.ok:
+      serverNotify(app, win, ui, st, parsed.err); return
+    # IMPURE checks, deliberately outside gui_pure's parseServerForm (§4.5):
+    # dirExists touches the filesystem; newServerConfig builds the real
+    # ServerConfig (its own bounds validation is the single shared authority —
+    # RFC conformance-closure D7 — never re-derived here).
+    if not dirExists(parsed.rootDir):
+      serverNotify(app, win, ui, st, "Directory not found: " & parsed.rootDir); return
+    let outcome = newServerConfig(rootDir = parsed.rootDir, listenPort = parsed.port,
+                                   writePolicy = parsed.writePolicy,
+                                   maxConcurrent = parsed.maxClients)
+    if not outcome.ok:
+      serverNotify(app, win, ui, st, outcome.rejectReason); return
+    setServerRunning(app, ui, st, true)
+    serverLogLine(app, ui, st, "Starting server...")
+    st.serverId = session.startServer(outcome.config))
+
+  app.on(ui.stopBtn, ekClick, proc(event: var oyamel.Event) =
+    if st.serverId != NoServer:
+      session.stop(st.serverId)
+      app.update(ui.stopBtn, enabled = false)
+      app.update(ui.status, text = "Stopping..."))
+
 # ---------------------------------------------------------------------------
 # The pump (load-bearing) — route first, then translate (RFC §4.3)
 # ---------------------------------------------------------------------------
@@ -247,7 +404,7 @@ proc pumpOnce*[B](app: App[B]; refs: GuiRefs; session: TftpSession) =
     for ev in session.poll(0):
       any = true
       if ev.srvId != NoServer:
-        discard   # server-side — slice 3 (onServerEvent)
+        onServerEvent(app, refs.server, refs.serverSt, ev)
       elif ev.xfrId == refs.clientSt.xferId:
         onClientEvent(app, refs.client, refs.clientSt, ev)
       # else: stale client event (e.g. post-cancel) — dropped, as today
@@ -279,6 +436,7 @@ when defined(oyamelWin32) or defined(oyamelGtk4):
 
     let refs = buildGui(app, session)
     wireClient(app, refs, session)
+    wireServer(app, refs, session)
 
     # ekClose lifecycle (§4.7): close() flips flags; drain() pumps poll() until
     # transfers/servers release their transports or the 500 ms deadline elapses.

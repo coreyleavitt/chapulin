@@ -2,26 +2,6 @@
 version 1
 strategy "maxver"
 
-dep "NiGui" {
-    source {
-        kind "git"
-        url (url)"https://github.com/coreyleavitt/NiGui"
-        ref "master"
-    }
-    identity "dag-sha256:e7423b5680c11ec5517e339f433eba0dbee6234740a1b2eeba948b16c82f11dd"
-    version "0.2.8"
-    declared_version_source "nimble"
-    src_dir "src"
-    requires
-    provenance {
-        origin "observed"
-        kind "git"
-        url "https://github.com/coreyleavitt/NiGui.git"
-        ref "master"
-        commit_sha "76dbaf06286680717495ced0ee347ee25ca835eb"
-    }
-}
-
 dep "nelli" {
     source {
         kind "git"
@@ -42,14 +22,34 @@ dep "nelli" {
     }
 }
 
+dep "oyamel" {
+    source {
+        kind "git"
+        url (url)"https://github.com/coreyleavitt/oyamel"
+        ref "35096e254f30325039fd6fe2eb9e55479723cada"
+    }
+    identity "dag-sha256:6dcf66c57df52c18ad0936f5c2810c4607cf98fffdc4668176e7abccffd0287b"
+    version "0.1.0"
+    declared_version_source "nimble"
+    src_dir "src"
+    requires
+    provenance {
+        origin "observed"
+        kind "git"
+        url "https://github.com/coreyleavitt/oyamel.git"
+        ref "35096e254f30325039fd6fe2eb9e55479723cada"
+        commit_sha "35096e254f30325039fd6fe2eb9e55479723cada"
+    }
+}
+
 dep "softlink" {
     source {
         kind "git"
         url (url)"https://github.com/coreyleavitt/softlink"
-        ref "v0.11.1"
+        ref "v0.12.3"
     }
-    identity "dag-sha256:2f1a4cfba684ff907927d09b504bae854d5d41253344bd5d5e72aa16a74fa764"
-    version "0.11.1"
+    identity "dag-sha256:d5fadf4f1a8834b1311fef3813c9a7f19efadb0640ab84efbea8cff5e1d3e807"
+    version "0.12.3"
     declared_version_source "nimble"
     src_dir "src"
     requires
@@ -57,8 +57,8 @@ dep "softlink" {
         origin "observed"
         kind "git"
         url "https://github.com/coreyleavitt/softlink.git"
-        ref "v0.11.1"
-        commit_sha "321b13c0c70de340d646876affe0ca8939a5c8f3"
+        ref "v0.12.3"
+        commit_sha "a467a8ce846993aee10153a160f9d663f3d68c12"
     }
 }
 

@@ -22,13 +22,11 @@ jobs:
           nim-version: stable
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install GTK3 dev (Linux)
+      # oyamel's GTK4 backend is the Linux GUI backend (the old GTK3 dep is
+      # gone). macOS has no oyamel backend yet, so it builds CLI-only (no GTK).
+      - name: Install GTK4 dev (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev
-
-      - name: Install GTK3 dev (macOS)
-        if: runner.os == 'macOS'
-        run: brew install gtk+3
+        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev
 
       - name: Install dependencies
         run: nimble install -d -y
@@ -36,8 +34,17 @@ jobs:
       - name: Run unit tests
         run: nimble test
 
-      - name: Build (with GUI)
+      # GUI build gate — `nim c` (link), the backend define comes from the
+      # committed config.nims (oyamelWin32 on Windows, oyamelGtk4 on Linux).
+      # macOS is CLI-only: oyamel ships no Cocoa backend, so it does NOT build
+      # -d:withGui (see docs/rfc/gui-oyamel-port.md §6.0).
+      - name: Build (with GUI — Windows + Linux)
+        if: runner.os != 'macOS'
         run: nim c --threads:on -d:withGui -d:release -o:chapulin src/chapulin.nim
+
+      - name: Build (CLI only — macOS)
+        if: runner.os == 'macOS'
+        run: nim c --threads:on -d:release -o:chapulin src/chapulin.nim
 
   lint:
     runs-on: ubuntu-latest

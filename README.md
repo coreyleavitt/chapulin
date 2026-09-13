@@ -39,10 +39,14 @@ nimble install
 nimble build
 ```
 
-With GUI support:
+With GUI support (Windows + Linux):
 ```
 nim c --threads:on -d:withGui -d:release -o:chapulin src/chapulin.nim
 ```
+The GUI uses the [oyamel](https://github.com/coreyleavitt/oyamel) toolkit —
+Win32 on Windows, GTK4 on Linux (`libgtk-4-dev`). The backend is selected
+automatically by `config.nims`. macOS is CLI-only for now (oyamel has no Cocoa
+backend yet); build it without `-d:withGui`.
 
 ### Docker
 
@@ -101,7 +105,7 @@ chapulin gui
 
 ## GUI
 
-Launch with `chapulin gui` (requires build with `-d:withGui`). Client and server in one window with tabbed panels.
+Launch with `chapulin gui` (requires build with `-d:withGui`; Windows and Linux). Client and server in one window with tabbed panels.
 
 ## RFC compliance
 

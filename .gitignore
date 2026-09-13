@@ -47,6 +47,9 @@ _deps/
 # would have silently dropped it from every commit with no error.
 /nim.cfg
 .milpa-cache/
+# GUI link-gate output (scripts/dev-test.ps1 -GuiBuild) — a built binary the
+# host can run, not a source artifact.
+_gui_gate/
 
 # Claude
 .claude/

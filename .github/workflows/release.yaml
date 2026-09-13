@@ -161,13 +161,15 @@ jobs:
           nim-version: stable
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install LLVM/Clang + GTK3 (Linux)
+      # Linux GUI backend is oyamel/GTK4. macOS builds CLI-only (no oyamel
+      # Cocoa backend yet) so it needs no GTK at all — see gui-oyamel-port §6.0.
+      - name: Install LLVM/Clang + GTK4 (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y clang lld libgtk-3-dev
+        run: sudo apt-get update && sudo apt-get install -y clang lld libgtk-4-dev
 
-      - name: Install GTK3 (macOS)
+      - name: Install LLVM/Clang (macOS)
         if: runner.os == 'macOS'
-        run: brew install gtk+3
+        run: true  # clang ships with Xcode; no GTK — macOS is CLI-only
 
       - name: Install dependencies
         run: nimble install -d -y
@@ -185,11 +187,12 @@ jobs:
           -o:${{ matrix.binary }}
           src/chapulin.nim
 
-      - name: Build release binary (macOS — Clang + LTO)
+      # macOS: CLI-only (no -d:withGui) — oyamel has no Cocoa backend yet.
+      - name: Build release binary (macOS — Clang + LTO, CLI only)
         if: runner.os == 'macOS'
         run: >
           nim c
-          -d:release -d:withGui
+          -d:release
           --threads:on
           --cc:clang
           --passC:"-flto -O2"

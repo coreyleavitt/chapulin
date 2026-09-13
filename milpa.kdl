@@ -8,7 +8,16 @@ src_dir "src"
 kind "application"
 
 deps {
-    "NiGui" git=(url)"https://github.com/coreyleavitt/NiGui.git" ref="master"
+    // oyamel — Corey's cross-platform (Win32 + GTK4) native GUI toolkit,
+    // the maintained successor to the frozen toolkit chapulin used before.
+    // Drives the desktop GUI
+    // (gui/desktop/chapulin_gui.nim). Pinned BY COMMIT: oyamel is under heavy
+    // RFC-driven dev and ships no tags — never track a branch (see
+    // docs/rfc/gui-oyamel-port.md §6.2 "pin cadence"). oyamel.nimble declares
+    // NO softlink require (GTK4-only, enforced in-code at glib.nim), so a
+    // Win32 consumer inherits no floor; the GTK4 floor is met by the softlink
+    // 0.12.3 pin below.
+    "oyamel" git=(url)"https://github.com/coreyleavitt/oyamel.git" ref="35096e254f30325039fd6fe2eb9e55479723cada"
 }
 
 // Test-only: property-based testing of the pure layers (protocol codec,
@@ -29,6 +38,12 @@ dev-deps {
     // (our own) is pinned to v0.11.1, the version nim-z3 main now requires.
     // (Supersedes the 2026-08-04 "shims are redundant" removal: redundant under
     // pure-git resolution, but required once the deps landed in tianguis.)
+    //
+    // softlink BUMPED v0.11.1 -> v0.12.3 (gui-oyamel-port slice 0): oyamel's
+    // GTK4 backend enforces a compile-time `requireSoftlink "0.12.3"` floor
+    // (glib.nim). Safe for the z3 stack: z3.nimble declares NO softlink
+    // requirement (softlink is resolved purely here), so 0.11.1 was chapulin's
+    // own choice and nim-z3 main works against 0.12.3.
     "z3" git=(url)"https://github.com/coreyleavitt/nim-z3.git" ref="main"
-    "softlink" git=(url)"https://github.com/coreyleavitt/softlink.git" ref="v0.11.1"
+    "softlink" git=(url)"https://github.com/coreyleavitt/softlink.git" ref="v0.12.3"
 }

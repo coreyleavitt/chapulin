@@ -23,7 +23,8 @@
 # guard below recovers the comma-string case; the space case can't be recovered
 # positionally, so it's documented, not caught.
 
-param([string[]]$Only, [string]$Image, [int]$Soak, [switch]$CorpusReport, [string]$CorpusReportTarget)
+param([string[]]$Only, [string]$Image, [int]$Soak, [switch]$CorpusReport, [string]$CorpusReportTarget,
+      [switch]$GuiBuild, [ValidateSet('win32','gtk4')][string]$GuiBackend = 'win32')
 
 $ErrorActionPreference = "Stop"
 
@@ -83,6 +84,40 @@ if ($CorpusReport) {
   $exitCode = Invoke-NimContainer -ProjectRoot $proj -NimFile "tests\coveragereport.nim" -Image $Image `
     -NimArgs @('c', '-r', '--hints:off', '--colors:off') `
     -EnvVars $envVars
+  exit $exitCode
+}
+
+# -GuiBuild: the GUI LINK gate (gui-oyamel-port RFC §7 tier 2). The desktop GUI
+# is outside the suite loop's compile set (like the CLI), so it needs its own
+# gate -- and it must LINK, not just `nim check`: only `nim c` exercises the
+# /SUBSYSTEM/manifest/passL("comctl32.lib") layer and gcsafe-of-stored-closures.
+# A DISTINCT mode, not a suite, so -- same rationale as -Soak/-CorpusReport --
+# it never shares the suite loop's compile+run/exit-a-failure-list contract.
+# Reuses Invoke-NimContainer via -NimArgs (a `nim c` of src/chapulin.nim, no
+# `-r`, no -d:chapulinTest). The backend define comes from config.nims for
+# win32; gtk4 must be requested explicitly (config.nims only auto-selects it on
+# Linux) and builds in oyamel's GTK4-on-Windows image. Output goes to a
+# gitignored binary INSIDE the bind mount so the host can run it (RFC §7 tier 3
+# host-run checklist). Local-opt-in ONLY: the default `pwsh scripts/dev-test.ps1`
+# never triggers this -- the whole block is skipped.
+if ($GuiBuild) {
+  $defines =
+    if ($GuiBackend -eq 'gtk4') { @('-d:oyamelGtk4') }
+    else { @('-d:oyamelWin32', '-d:oyamelShowConsole') }
+  $img =
+    if ($Image) { $Image }
+    elseif ($GuiBackend -eq 'gtk4') { 'oyamel-gtk4-win:latest' }
+    else { 'oyamel-win32:latest' }
+  $outBin = "_gui_gate/chapulin_gui_${GuiBackend}.exe"
+  New-Item -ItemType Directory -Force -Path (Join-Path $proj "_gui_gate") | Out-Null
+  Write-Host "==> GUI link gate: nim c -d:withGui $($defines -join ' ') src/chapulin.nim (image: $img)" -ForegroundColor Cyan
+  $nimArgs = @('c', '--threads:on', '--hints:off', '--colors:off', '-d:withGui') + $defines + @("-o:$outBin")
+  $exitCode = Invoke-NimContainer -ProjectRoot $proj -NimFile "src\chapulin.nim" -Image $img -NimArgs $nimArgs
+  if ($exitCode -eq 0) {
+    Write-Host "GUI link gate PASSED ($GuiBackend) -> $outBin" -ForegroundColor Green
+  } else {
+    Write-Host "GUI link gate FAILED ($GuiBackend)" -ForegroundColor Red
+  }
   exit $exitCode
 }
 

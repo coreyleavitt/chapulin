@@ -2557,7 +2557,7 @@ suite "TftpSession — RFC conformance-closure D5: negotiated timeout is applied
     # assigned after (rather than before) this wait, it would read 5000
     # (DefaultTimeout*1000) instead of the operator's negotiated 20000.
     check w.bRecvTimeoutsMs.len >= 1
-    check w.bRecvTimeoutsMs[0] == 20_000
+    check abs(w.bRecvTimeoutsMs[0] - 20_000) <= 50  # wall-clock budget: 1ms shy of nominal on a hi-res clock
 
     s.stop(srvId)
     for step in 0 .. 200_000:

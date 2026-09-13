@@ -128,7 +128,8 @@ $tests = if ($Only) { $Only } else {
     "t_blocksource", "t_blocksource_demo", "t_eventqueue", "t_format", "t_corpus", "t_hostile",
     "t_pumpsession", "t_asynccheck_tripwire", "t_defect_canary", "t_wireregistry",
     "t_listenerbridge", "t_a1b_smoke", "t_a2_facade_stateful", "t_a4_maxconcurrent",
-    "t_soak_encoder", "t_interop_capture", "t_corpus_minimize", "t_coverage_report")
+    "t_soak_encoder", "t_interop_capture", "t_corpus_minimize", "t_coverage_report",
+    "t_gui_pure")
 }
 
 $failed = @()

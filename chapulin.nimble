@@ -39,6 +39,8 @@ task test, "Run unit tests":
   exec "nim c -r -d:chapulinTest tests/t_props_server.nim"
   exec "nim c -r -d:chapulinTest tests/t_wireharness.nim"
   exec "nim c -r -d:chapulinTest tests/t_session.nim"
+  # Desktop GUI pure layer (oyamel-free): status formatting + form validation.
+  exec "nim c -r -d:chapulinTest tests/t_gui_pure.nim"
 
 task gui, "Build with GUI support":
   exec "nim c --threads:on -d:withGui -d:release -o:chapulin src/chapulin.nim"

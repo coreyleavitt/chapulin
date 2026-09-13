@@ -1,6 +1,6 @@
 ## chapulin desktop GUI — oyamel (Win32 + GTK4).
 ##
-## Ported from the frozen NiGui GUI (git history keeps the original). Client and
+## Ported from the frozen predecessor GUI (git history keeps the original). Client and
 ## server panels live in a real tabContainer; a single 50 ms timer pumps
 ## `session.poll(0)` and translates the chapulin event stream to widget updates
 ## on the UI thread (`-d:oyamelAsync` OFF — the pump is the whole integration).
@@ -127,7 +127,7 @@ proc notify[B](app: App[B]; win: WidgetId; ui: ClientUi; st: ClientState; msg: s
   ## A validation/error notice. showMessage is deferred to a later loop turn
   ## (safe from the pump) and its callback carries no decision. ALSO logged: a
   ## showMessage whose backend dialog fails reports as cancelled — the log line
-  ## is the durable record the blocking NiGui `alert` never had (§4.5).
+  ## is the durable record the blocking predecessor `alert` never had (§4.5).
   logLine(app, ui, st, msg)
   app.showMessage(win, MessageConfig(text: msg, icon: miWarning, buttons: mbOk),
                   proc(res: MessageDialogResult) = discard)
@@ -212,7 +212,7 @@ proc onServerEvent*[B](app: App[B]; ui: ServerUi; st: ServerState; ev: auto) =
   of evServerLog:
     serverLogLine(app, ui, st, "[" & $ev.sLevel & "] " & sanitizeForDisplay(ev.sMessage))
   of evServerRejected:
-    discard   # already surfaced via evServerLog at warn (NiGui parity) — handled
+    discard   # already surfaced via evServerLog at warn (predecessor parity) — handled
               # explicitly, never folded into a blanket else
   of evTransferStarted:
     serverLogLine(app, ui, st, "Incoming transfer started (" &
@@ -317,7 +317,7 @@ proc wireClient*[B](app: App[B]; refs: GuiRefs; session: TftpSession) =
   let win = refs.win
 
   app.on(ui.browseBtn, ekClick, proc(event: var oyamel.Event) =
-    # NiGui's blocking dialog becomes oyamel's completion callback. GET → save
+    # predecessor's blocking dialog becomes oyamel's completion callback. GET → save
     # dialog, PUT → open dialog (direction read off the combo).
     let isGet = app.read(ui.dirCombo, selectedIndex) == 0
     let cfg = FileDialogConfig(
@@ -447,6 +447,16 @@ when defined(oyamelWin32) or defined(oyamelGtk4):
 
     # The load-bearing pump: one 50 ms UI-thread timer. -d:oyamelAsync OFF.
     discard app.setInterval(50, proc() = pumpOnce(app, refs, session))
+
+    # Headless launch-smoke hook (-d:chapulinGuiSmokeQuit): open the window,
+    # let the pump fire a few times, then quit — so a GTK4/Win32 build can be
+    # run non-interactively in CI/a container (GTK4 has no WM_CLOSE-from-outside
+    # equivalent). Never defined in a shipping build. GUI-file only, no src/ diff.
+    when defined(chapulinGuiSmokeQuit):
+      discard app.setTimeout(1500, proc() =
+        session.close()
+        session.drain(timeoutMs = 500)
+        app.quit())
 
     # Defect safety (§4.8): a throwing handler/pump re-raises out of run(),
     # skipping shutdown(); chapulin's facade can leak Nim Defects past

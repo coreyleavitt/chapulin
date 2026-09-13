@@ -24,7 +24,7 @@
 # positionally, so it's documented, not caught.
 
 param([string[]]$Only, [string]$Image, [int]$Soak, [switch]$CorpusReport, [string]$CorpusReportTarget,
-      [switch]$GuiBuild, [ValidateSet('win32','gtk4')][string]$GuiBackend = 'win32')
+      [switch]$GuiBuild, [ValidateSet('win32','gtk4','gtk4-linux')][string]$GuiBackend = 'win32')
 
 $ErrorActionPreference = "Stop"
 
@@ -101,6 +101,32 @@ if ($CorpusReport) {
 # host-run checklist). Local-opt-in ONLY: the default `pwsh scripts/dev-test.ps1`
 # never triggers this -- the whole block is skipped.
 if ($GuiBuild) {
+  # gtk4-linux: the REAL Linux/GTK4 gate -- compiles AND runs the GUI headless
+  # (Xvfb + dbus) in oyamel's Linux podman image, proving chapulin's widget tree
+  # instantiates on the actual GTK4 backend at runtime, not just links. Uses the
+  # -d:chapulinGuiSmokeQuit hook (chapulin_gui.nim) so the window opens, the pump
+  # fires, then it self-quits -- wrapped in `timeout` so a wake-path hang fails
+  # the gate instead of hanging it (mirrors oyamel's own tests/_fgw_gtk4.sh).
+  # podman needs --network=none here (netavark/nftables can't set up a network
+  # in this environment) and the mount/workdir use POSIX paths (/app).
+  if ($GuiBackend -eq 'gtk4-linux') {
+    $img = if ($Image) { $Image } else { 'localhost/oyamel-gtk4' }
+    Write-Host "==> GTK4 Linux gate (compile + headless run): $img" -ForegroundColor Cyan
+    $sh = 'set -u; ' +
+      'nim c --threads:on --hints:off -d:withGui -d:oyamelGtk4 -d:chapulinGuiSmokeQuit -o:/tmp/chap_gtk4 src/chapulin.nim >/tmp/build.log 2>&1; ' +
+      'b=$?; echo BUILD_EXIT=$b; if [ $b -ne 0 ]; then tail -25 /tmp/build.log; exit $b; fi; ' +
+      'Xvfb :99 -screen 0 1024x768x24 >/tmp/xvfb.log 2>&1 & sleep 2; export DISPLAY=:99; ' +
+      'timeout 60 dbus-run-session -- /tmp/chap_gtk4 gui >/tmp/run.log 2>&1; r=$?; echo RUN_EXIT=$r; ' +
+      'echo "--- run.log ---"; cat /tmp/run.log; exit $r'
+    podman run --rm --network=none -v "${proj}:/app" -w /app $img sh -c $sh | Out-Host
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -eq 0) {
+      Write-Host "GTK4 Linux gate PASSED (compile + headless run, exit 0)" -ForegroundColor Green
+    } else {
+      Write-Host "GTK4 Linux gate FAILED (exit $exitCode)" -ForegroundColor Red
+    }
+    exit $exitCode
+  }
   $defines =
     if ($GuiBackend -eq 'gtk4') { @('-d:oyamelGtk4') }
     else { @('-d:oyamelWin32', '-d:oyamelShowConsole') }

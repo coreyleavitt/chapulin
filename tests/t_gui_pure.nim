@@ -10,11 +10,11 @@ import std/[unittest, options]
 import ../src/chapulin/api
 import ../gui/desktop/gui_pure
 
-suite "gui_pure: progressText (client status line, NiGui parity)":
+suite "gui_pure: progressText (client status line, predecessor parity)":
   test "mid-transfer with known total: bytes / total (pct) | speed":
     let snap = TransferSnapshot(bytes: 512, total: some(1024'i64))
     # "0." B/s (not "0") is formatSpeed(0.0)'s ffDecimal-0 output -- matched here
-    # because parity means reproducing the NiGui status string exactly.
+    # because parity means reproducing the predecessor status string exactly.
     check progressText(snap, 0.0) == "512 B / 1.0 KB (50%) | 0. B/s"
 
   test "unknown total omits the ' / total (pct)' segment":

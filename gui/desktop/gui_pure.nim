@@ -11,7 +11,7 @@ import std/[strutils, options]
 import ../../src/chapulin/api
 
 const Blocksizes* = [512, 1024, 1468, 4096, 8192]
-  ## The client block-size combo, in order (NiGui parity).
+  ## The client block-size combo, in order (predecessor parity).
 
 proc blocksizeFor*(index: int): int =
   ## Map a comboBox selectedIndex to a block size, guarding the -1 "no
@@ -21,7 +21,7 @@ proc blocksizeFor*(index: int): int =
   if index >= 0 and index < Blocksizes.len: Blocksizes[index] else: Blocksizes[0]
 
 proc progressText*(snap: TransferSnapshot; elapsed: float): string =
-  ## The client status line, matching the NiGui format for parity:
+  ## The client status line, matching the predecessor format for parity:
   ##   "<bytes>[ / <total> (<pct>%)] | <speed>"
   ## Pure: no widget access, no oyamel. `snap.total.get(0)` is belt-and-
   ## suspenders (the segment is only built when `fraction` isSome, which implies
@@ -54,7 +54,7 @@ proc parseClientForm*(f: ClientForm): ClientFormResult =
   ## Validate the form and build a TransferRequest. Pure and display-free:
   ## returns an error message, never shows a dialog. The PUT `fileExists` check
   ## stays in the caller (it touches the filesystem). Notice order matches the
-  ## NiGui version so the parity checklist holds.
+  ## predecessor version so the parity checklist holds.
   let host = f.host.strip()
   let remoteFile = f.remoteFile.strip()
   let localFile = f.localFile.strip()
@@ -79,7 +79,7 @@ proc parseClientForm*(f: ClientForm): ClientFormResult =
 # ---------------------------------------------------------------------------
 
 proc writePolicyFor*(index: int): WritePolicy =
-  ## Map the write-policy comboBox's selectedIndex to a WritePolicy (NiGui
+  ## Map the write-policy comboBox's selectedIndex to a WritePolicy (predecessor
   ## parity order: deny/create/overwrite/all). Out-of-range (including the -1
   ## "no selection" default) falls back to the safe default, wpDeny.
   case index
@@ -108,7 +108,7 @@ proc parseServerForm*(f: ServerForm): ServerFormResult =
   ## Validate the server form. Pure and display-free: no `dirExists` (that
   ## touches the filesystem and stays in wireServer) and no `newServerConfig`
   ## (that builds the real ServerConfig and stays in wireServer too). Notice
-  ## order matches the NiGui version so the parity checklist holds.
+  ## order matches the predecessor version so the parity checklist holds.
   let rootDir = f.rootDir.strip()
   if rootDir.len == 0:
     return ServerFormResult(ok: false, err: "Please select a root directory.")

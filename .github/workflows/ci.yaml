@@ -46,6 +46,16 @@ jobs:
         if: runner.os == 'macOS'
         run: nim c --threads:on -d:release -o:chapulin src/chapulin.nim
 
+      # GTK4 runtime smoke (Linux): prove the GUI actually instantiates on the
+      # real GTK4 backend, not just links. -d:chapulinGuiSmokeQuit opens the
+      # window, runs the pump, then self-quits (gui-oyamel-port §5 slice 4).
+      - name: GUI headless smoke (Linux/GTK4)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y xvfb dbus-x11
+          nim c --threads:on -d:withGui -d:chapulinGuiSmokeQuit -o:chapulin-gui-smoke src/chapulin.nim
+          xvfb-run -a dbus-run-session -- ./chapulin-gui-smoke gui
+
   lint:
     runs-on: ubuntu-latest
     steps:

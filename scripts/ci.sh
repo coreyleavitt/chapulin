@@ -28,11 +28,15 @@ if ! command -v milpa >/dev/null 2>&1; then
 fi
 
 echo "==> milpa lock + fetch (resolve deps into _deps/, emit nim.cfg)"
-# Re-lock per-OS rather than trusting the committed milpa.lock: milpa's content
-# hashes depend on the checkout's line endings (git autocrlf), so a lock made on
-# one OS diverges on another (FETCH-PROVENANCE-DIVERGENCE). Regenerating here
-# makes lock + fetch self-consistent on whatever runner this is. (Upstream milpa
-# should normalize line endings in its content-addressing; tracked separately.)
+# Generate a FRESH lock per-OS: milpa's content hashes depend on the checkout's
+# line endings (git autocrlf), so the committed milpa.lock (made on Windows,
+# CRLF) diverges on Linux/macOS (FETCH-PROVENANCE-DIVERGENCE) -- and `milpa lock`
+# validates against the existing lock, so it diverges too. Removing it first lets
+# milpa build a self-consistent lock for whatever runner this is. (The committed
+# lock stays in the repo; this rm is only on the ephemeral runner. Upstream milpa
+# should normalize line endings so a committed lock is cross-OS portable --
+# tracked separately.)
+rm -f milpa.lock
 milpa -C . lock  || { echo "FATAL: milpa lock failed";  exit 1; }
 milpa -C . fetch || { echo "FATAL: milpa fetch failed"; exit 1; }
 

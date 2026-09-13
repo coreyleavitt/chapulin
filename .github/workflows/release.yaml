@@ -182,7 +182,8 @@ jobs:
           bindir="$(pipx environment --value PIPX_BIN_DIR)"
           case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) bindir="$(cygpath -u "$bindir")";; esac
           export PATH="$bindir:$PATH"
-          milpa -C . lock    # re-lock per-OS: committed lock's hashes are line-ending-specific
+          rm -f milpa.lock   # committed lock's hashes are line-ending-specific; regenerate fresh
+          milpa -C . lock
           milpa -C . fetch
 
       - name: Build release binary (Linux — Clang + LTO)

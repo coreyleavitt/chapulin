@@ -27,8 +27,14 @@ if ! command -v milpa >/dev/null 2>&1; then
   export PATH="$bindir:$PATH"
 fi
 
-echo "==> milpa fetch (resolve deps into _deps/, emit nim.cfg)"
-milpa -C . fetch
+echo "==> milpa lock + fetch (resolve deps into _deps/, emit nim.cfg)"
+# Re-lock per-OS rather than trusting the committed milpa.lock: milpa's content
+# hashes depend on the checkout's line endings (git autocrlf), so a lock made on
+# one OS diverges on another (FETCH-PROVENANCE-DIVERGENCE). Regenerating here
+# makes lock + fetch self-consistent on whatever runner this is. (Upstream milpa
+# should normalize line endings in its content-addressing; tracked separately.)
+milpa -C . lock  || { echo "FATAL: milpa lock failed";  exit 1; }
+milpa -C . fetch || { echo "FATAL: milpa fetch failed"; exit 1; }
 
 OS="$(uname -s)"
 echo "==> OS: $OS"

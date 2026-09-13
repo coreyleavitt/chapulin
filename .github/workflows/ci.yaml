@@ -55,5 +55,6 @@ jobs:
           export MILPA_CACHE_DIR="$PWD/.milpa-cache"
           pipx install "git+https://github.com/coreyleavitt/milpa.git#subdirectory=impls/python"
           export PATH="$(pipx environment --value PIPX_BIN_DIR):$PATH"
+          milpa -C . lock    # re-lock per-OS: committed lock's hashes are line-ending-specific
           milpa -C . fetch
           nim check --hints:on src/chapulin.nim

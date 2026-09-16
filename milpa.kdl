@@ -17,7 +17,7 @@ deps {
     // NO softlink require (GTK4-only, enforced in-code at glib.nim), so a
     // Win32 consumer inherits no floor; the GTK4 floor is met by the softlink
     // 0.12.3 pin below.
-    "oyamel" git=(url)"https://github.com/coreyleavitt/oyamel.git" ref="736c937665373ffa27d55b000f20a2c9ae702d77"
+    "oyamel" git=(url)"https://github.com/coreyleavitt/oyamel.git" ref="e70f5e2656dd364513dff8bdd9c3325852a492ac"
 }
 
 // Test-only: property-based testing of the pure layers (protocol codec,

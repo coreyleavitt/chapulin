@@ -26,9 +26,9 @@ dep "oyamel" {
     source {
         kind "git"
         url (url)"https://github.com/coreyleavitt/oyamel"
-        ref "736c937665373ffa27d55b000f20a2c9ae702d77"
+        ref "e70f5e2656dd364513dff8bdd9c3325852a492ac"
     }
-    identity "dag-sha256:30028eb82a5c21c034d48460c96a502e60c006712935498226ac2f4d66aeac50"
+    identity "dag-sha256:3c20ae5ada5f5026d929512b39b8e04793f3a576e9718023abe871b1aefd2352"
     version "0.1.0"
     declared_version_source "nimble"
     src_dir "src"
@@ -37,8 +37,8 @@ dep "oyamel" {
         origin "observed"
         kind "git"
         url "https://github.com/coreyleavitt/oyamel.git"
-        ref "736c937665373ffa27d55b000f20a2c9ae702d77"
-        commit_sha "736c937665373ffa27d55b000f20a2c9ae702d77"
+        ref "e70f5e2656dd364513dff8bdd9c3325852a492ac"
+        commit_sha "e70f5e2656dd364513dff8bdd9c3325852a492ac"
     }
 }
 
